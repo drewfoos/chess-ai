@@ -37,6 +37,8 @@ venv/
 
 # Training data
 *.gz
+*.npz
+data/
 checkpoints/
 runs/
 
