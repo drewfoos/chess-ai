@@ -216,3 +216,66 @@ TEST_F(MCTSTest, SearchFindsObviousCapture) {
     Move capture_queen(D4, E5, FLAG_CAPTURE);
     EXPECT_EQ(result.best_move, capture_queen);
 }
+
+TEST_F(MCTSTest, DirichletNoiseModifiesPriors) {
+    Position pos;
+    pos.set_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+
+    mcts::RandomEvaluator eval;
+    mcts::SearchParams params;
+    params.num_iterations = 50;
+    params.add_noise = true;
+
+    mcts::Search search_with_noise(eval, params);
+    mcts::SearchResult result1 = search_with_noise.run(pos);
+
+    // With noise, priors are perturbed — hard to test deterministically,
+    // but we can verify the search still returns a valid legal move
+    EXPECT_FALSE(result1.best_move.is_none());
+
+    Move moves[MAX_MOVES];
+    int num_moves = generate_legal_moves(pos, moves);
+    bool found = false;
+    for (int i = 0; i < num_moves; i++) {
+        if (moves[i] == result1.best_move) { found = true; break; }
+    }
+    EXPECT_TRUE(found);
+}
+
+TEST_F(MCTSTest, TemperatureZeroSelectsMostVisited) {
+    mcts::SearchResult result;
+    result.moves = {
+        Move(E2, E4, FLAG_DOUBLE_PUSH),
+        Move(D2, D4, FLAG_DOUBLE_PUSH),
+        Move(G1, F3, FLAG_QUIET)
+    };
+    result.visit_counts = { 10, 50, 5 };
+
+    Move selected = mcts::Search::select_move_with_temperature(result, 0.0f);
+    EXPECT_EQ(selected, Move(D2, D4, FLAG_DOUBLE_PUSH));
+}
+
+TEST_F(MCTSTest, TemperatureOneDistributesProportionally) {
+    mcts::SearchResult result;
+    result.moves = {
+        Move(E2, E4, FLAG_DOUBLE_PUSH),
+        Move(D2, D4, FLAG_DOUBLE_PUSH),
+        Move(G1, F3, FLAG_QUIET)
+    };
+    result.visit_counts = { 100, 100, 100 }; // Equal visits
+
+    // With equal visits at any temperature, all moves are equally likely
+    // Run many trials — each move should appear ~1/3 of the time
+    int counts[3] = {0, 0, 0};
+    for (int trial = 0; trial < 3000; trial++) {
+        Move m = mcts::Search::select_move_with_temperature(result, 1.0f);
+        for (int i = 0; i < 3; i++) {
+            if (m == result.moves[i]) { counts[i]++; break; }
+        }
+    }
+    // Each should be roughly 1000 ± 100
+    for (int i = 0; i < 3; i++) {
+        EXPECT_GT(counts[i], 800);
+        EXPECT_LT(counts[i], 1200);
+    }
+}

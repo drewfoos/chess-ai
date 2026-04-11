@@ -224,4 +224,48 @@ SearchResult Search::run(const Position& pos) {
     return result;
 }
 
+Move Search::select_move_with_temperature(const SearchResult& result, float temperature) {
+    if (result.moves.empty()) return Move::none();
+
+    // Temperature ≈ 0: greedy selection
+    if (temperature < 0.01f) {
+        int best_idx = 0;
+        for (int i = 1; i < static_cast<int>(result.visit_counts.size()); i++) {
+            if (result.visit_counts[i] > result.visit_counts[best_idx]) {
+                best_idx = i;
+            }
+        }
+        return result.moves[best_idx];
+    }
+
+    // Temperature-based sampling: π(a) = N(a)^(1/τ) / Σ N(b)^(1/τ)
+    int num_moves = static_cast<int>(result.moves.size());
+    std::vector<float> probs(num_moves);
+    float inv_temp = 1.0f / temperature;
+
+    float sum = 0.0f;
+    for (int i = 0; i < num_moves; i++) {
+        probs[i] = std::pow(static_cast<float>(result.visit_counts[i]), inv_temp);
+        sum += probs[i];
+    }
+
+    if (sum <= 0.0f) {
+        // Fallback: uniform random
+        std::random_device rd;
+        std::mt19937 gen(rd());
+        std::uniform_int_distribution<int> dist(0, num_moves - 1);
+        return result.moves[dist(gen)];
+    }
+
+    for (int i = 0; i < num_moves; i++) {
+        probs[i] /= sum;
+    }
+
+    // Sample from the distribution
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::discrete_distribution<int> dist(probs.begin(), probs.end());
+    return result.moves[dist(gen)];
+}
+
 } // namespace mcts

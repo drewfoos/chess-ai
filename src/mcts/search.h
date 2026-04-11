@@ -53,6 +53,11 @@ public:
 
     SearchResult run(const Position& pos);
 
+    // Temperature-based move selection for self-play
+    // temperature = 1.0: proportional to visit counts
+    // temperature → 0: greedy (pick most visited)
+    static Move select_move_with_temperature(const SearchResult& result, float temperature);
+
 private:
     Evaluator& evaluator_;
     SearchParams params_;
