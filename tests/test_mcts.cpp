@@ -306,18 +306,19 @@ TEST_F(MCTSTest, SearchHandlesStalemate) {
     Move moves[MAX_MOVES];
     int num_moves = generate_legal_moves(pos, moves);
 
-    if (num_moves == 0 && !pos.in_check()) {
-        mcts::RandomEvaluator eval;
-        mcts::SearchParams params;
-        params.num_iterations = 100;
-        params.add_noise = false;
+    ASSERT_EQ(num_moves, 0);
+    ASSERT_FALSE(pos.in_check());
 
-        mcts::Search search(eval, params);
-        mcts::SearchResult result = search.run(pos);
+    mcts::RandomEvaluator eval;
+    mcts::SearchParams params;
+    params.num_iterations = 100;
+    params.add_noise = false;
 
-        EXPECT_TRUE(result.best_move.is_none());
-        EXPECT_FLOAT_EQ(result.root_value, 0.0f);
-    }
+    mcts::Search search(eval, params);
+    mcts::SearchResult result = search.run(pos);
+
+    EXPECT_TRUE(result.best_move.is_none());
+    EXPECT_FLOAT_EQ(result.root_value, 0.0f);
 }
 
 TEST_F(MCTSTest, SearchWithOneMove) {
@@ -329,17 +330,17 @@ TEST_F(MCTSTest, SearchWithOneMove) {
     Move moves[MAX_MOVES];
     int num_moves = generate_legal_moves(pos, moves);
 
-    if (num_moves == 1) {
-        mcts::RandomEvaluator eval;
-        mcts::SearchParams params;
-        params.num_iterations = 50;
-        params.add_noise = false;
+    ASSERT_EQ(num_moves, 1);
 
-        mcts::Search search(eval, params);
-        mcts::SearchResult result = search.run(pos);
+    mcts::RandomEvaluator eval;
+    mcts::SearchParams params;
+    params.num_iterations = 50;
+    params.add_noise = false;
 
-        EXPECT_EQ(result.best_move, moves[0]);
-    }
+    mcts::Search search(eval, params);
+    mcts::SearchResult result = search.run(pos);
+
+    EXPECT_EQ(result.best_move, moves[0]);
 }
 
 TEST_F(MCTSTest, SearchVisitCountsConsistency) {
