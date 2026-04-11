@@ -13,6 +13,7 @@ add_library(chess_core
     src/mcts/node.cpp
     src/mcts/search.cpp
     src/neural/policy_map.cpp
+    src/neural/encoder.cpp
 )
 target_include_directories(chess_core PUBLIC src)
 
