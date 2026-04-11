@@ -1,0 +1,436 @@
+import pytest
+from torch.utils.data import DataLoader
+from training.config import NetworkConfig
+from training.encoder import (
+    move_to_index,
+    index_to_move,
+    POLICY_SIZE,
+    mirror_move,
+)
+
+
+def test_network_config_defaults():
+    cfg = NetworkConfig()
+    assert cfg.num_blocks == 10
+    assert cfg.num_filters == 128
+    assert cfg.se_ratio == 4
+    assert cfg.input_planes == 112
+    assert cfg.policy_size == 1858
+    assert cfg.value_size == 3
+
+
+def test_network_config_custom():
+    cfg = NetworkConfig(num_blocks=20, num_filters=256)
+    assert cfg.num_blocks == 20
+    assert cfg.num_filters == 256
+    assert cfg.input_planes == 112  # Unchanged default
+
+
+def test_policy_size():
+    assert POLICY_SIZE == 1858
+
+
+def test_move_encoding_roundtrip_e2e4():
+    # e2e4: from=E2(12), to=E4(28), promo=None
+    # From white's perspective, this is a pawn double push
+    # E2 is file=4, rank=1 → square index 12
+    # E4 is file=4, rank=3 → square index 28
+    # Direction: North (index 0), distance 2
+    idx = move_to_index(12, 28, None)
+    assert idx is not None
+    from_sq, to_sq, promo = index_to_move(idx)
+    assert from_sq == 12
+    assert to_sq == 28
+    assert promo is None
+
+
+def test_move_encoding_knight():
+    # Ng1-f3: from=G1(6), to=F3(21)
+    # Knight move: delta = (21-6) = 15 → (-1, +2) in (file, rank)
+    idx = move_to_index(6, 21, None)
+    assert idx is not None
+    from_sq, to_sq, promo = index_to_move(idx)
+    assert from_sq == 6
+    assert to_sq == 21
+    assert promo is None
+
+
+def test_move_encoding_queen_promotion():
+    # e7e8=Q: from=E7(52), to=E8(60), promo=queen
+    # Queen promotion uses the normal queen-move encoding (N, distance 1)
+    idx = move_to_index(52, 60, None)  # No promo flag for queen promo
+    assert idx is not None
+    from_sq, to_sq, promo = index_to_move(idx)
+    assert from_sq == 52
+    assert to_sq == 60
+
+
+def test_move_encoding_underpromotion():
+    # e7e8=N: from=E7(52), to=E8(60), promo='n'
+    idx = move_to_index(52, 60, 'n')
+    assert idx is not None
+    from_sq, to_sq, promo = index_to_move(idx)
+    assert from_sq == 52
+    assert to_sq == 60
+    assert promo == 'n'
+
+
+def test_move_encoding_capture_underpromotion():
+    # e7d8=R: from=E7(52), to=D8(59), promo='r'
+    idx = move_to_index(52, 59, 'r')
+    assert idx is not None
+    from_sq, to_sq, promo = index_to_move(idx)
+    assert from_sq == 52
+    assert to_sq == 59
+    assert promo == 'r'
+
+
+def test_all_indices_unique():
+    # Collect all valid move indices and ensure no duplicates
+    seen = set()
+    for idx in range(POLICY_SIZE):
+        from_sq, to_sq, promo = index_to_move(idx)
+        key = (from_sq, to_sq, promo)
+        assert key not in seen, f"Duplicate move at index {idx}: {key}"
+        seen.add(key)
+
+
+def test_mirror_move():
+    # E2(12) mirrored = E7(52) — flip rank: rank 1 → rank 6
+    assert mirror_move(12) == 52
+    # A1(0) mirrored = A8(56)
+    assert mirror_move(0) == 56
+    # H8(63) mirrored = H1(7)
+    assert mirror_move(63) == 7
+
+
+import numpy as np
+from training.encoder import encode_position
+
+
+def test_encode_starting_position_shape():
+    planes = encode_position("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1")
+    assert planes.shape == (112, 8, 8)
+    assert planes.dtype == np.float32
+
+
+def test_encode_starting_position_white_pawns():
+    planes = encode_position("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1")
+    # White to move, so "our" pieces = white
+    # Plane 0 = our pawns. White pawns on rank 1 (index 1 in 0-indexed)
+    # In the tensor: planes[0] should have 1s on rank 1 (row index 1)
+    pawn_plane = planes[0]
+    assert pawn_plane.sum() == 8  # 8 white pawns
+    # All on rank 1
+    for file in range(8):
+        assert pawn_plane[1, file] == 1.0
+
+
+def test_encode_starting_position_opponent_pawns():
+    planes = encode_position("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1")
+    # Plane 6 = opponent pawns (black). Black pawns on rank 6
+    opp_pawn_plane = planes[6]
+    assert opp_pawn_plane.sum() == 8
+    for file in range(8):
+        assert opp_pawn_plane[6, file] == 1.0
+
+
+def test_encode_black_to_move_flips():
+    # Same position but black to move — board should be flipped
+    planes = encode_position("rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq - 0 1")
+    # Black to move: "our" pieces = black, board flipped vertically
+    # Black pawns were on rank 6, after flip they're on rank 1
+    our_pawn_plane = planes[0]
+    assert our_pawn_plane.sum() == 8
+    for file in range(8):
+        assert our_pawn_plane[1, file] == 1.0
+
+
+def test_encode_castling_planes():
+    planes = encode_position("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1")
+    # Constant planes start at index 104
+    # Plane 106 = our kingside castling (K for white) → all 1s
+    assert planes[106].sum() == 64  # All 1s
+    # Plane 107 = our queenside castling (Q for white) → all 1s
+    assert planes[107].sum() == 64
+
+
+def test_encode_no_castling():
+    planes = encode_position("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w - - 0 1")
+    # No castling rights → planes 106-109 all zeros
+    for i in range(106, 110):
+        assert planes[i].sum() == 0
+
+
+def test_encode_color_plane():
+    # White to move: color plane (104) = all 1s
+    planes_w = encode_position("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1")
+    assert planes_w[104].sum() == 64
+
+    # Black to move: color plane (104) = all 0s
+    planes_b = encode_position("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR b KQkq - 0 1")
+    assert planes_b[104].sum() == 0
+
+
+def test_encode_bias_plane():
+    planes = encode_position("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1")
+    # Plane 111 = all-ones bias
+    assert planes[111].sum() == 64
+
+
+import torch
+from training.model import ChessNetwork
+
+
+def test_model_output_shapes():
+    cfg = NetworkConfig(num_blocks=2, num_filters=32)  # Small for testing
+    model = ChessNetwork(cfg)
+    x = torch.randn(4, 112, 8, 8)  # Batch of 4
+    policy, value = model(x)
+    assert policy.shape == (4, 1858)
+    assert value.shape == (4, 3)
+
+
+def test_model_policy_logits():
+    cfg = NetworkConfig(num_blocks=2, num_filters=32)
+    model = ChessNetwork(cfg)
+    x = torch.randn(1, 112, 8, 8)
+    policy, _ = model(x)
+    # Policy should be raw logits (not softmaxed) — can be any real number
+    assert policy.dtype == torch.float32
+
+
+def test_model_value_probabilities():
+    cfg = NetworkConfig(num_blocks=2, num_filters=32)
+    model = ChessNetwork(cfg)
+    x = torch.randn(1, 112, 8, 8)
+    _, value = model(x)
+    # Value head should output probabilities that sum to 1 (WDL softmax)
+    assert torch.allclose(value.sum(dim=1), torch.tensor([1.0]), atol=1e-5)
+    # All values non-negative
+    assert (value >= 0).all()
+
+
+def test_model_default_config():
+    cfg = NetworkConfig()  # 10 blocks, 128 filters
+    model = ChessNetwork(cfg)
+    # Count parameters — with policy FC (80*64 → 1858) the dominant cost is the policy head (~9.5M)
+    # Total is ~13M for default config (10 blocks, 128 filters, policy_conv_filters=80)
+    total_params = sum(p.numel() for p in model.parameters())
+    assert total_params > 1_000_000  # At least 1M
+    assert total_params < 20_000_000  # Less than 20M
+
+
+def test_model_batch_independence():
+    cfg = NetworkConfig(num_blocks=2, num_filters=32)
+    model = ChessNetwork(cfg)
+    model.eval()
+    x = torch.randn(2, 112, 8, 8)
+    policy_batch, value_batch = model(x)
+    policy_0, value_0 = model(x[0:1])
+    policy_1, value_1 = model(x[1:2])
+    assert torch.allclose(policy_batch[0], policy_0[0], atol=1e-5)
+    assert torch.allclose(value_batch[0], value_0[0], atol=1e-5)
+
+
+import tempfile
+import os
+from training.generate_data import generate_synthetic_data
+from training.dataset import ChessDataset
+
+
+def test_generate_synthetic_data():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = os.path.join(tmpdir, "test_data.npz")
+        generate_synthetic_data(path, num_positions=50)
+
+        with np.load(path) as data:
+            assert data['planes'].shape == (50, 112, 8, 8)
+            assert data['policies'].shape == (50, 1858)
+            assert data['values'].shape == (50, 3)
+
+            # Policies should be valid probability distributions
+            policy_sums = data['policies'].sum(axis=1)
+            np.testing.assert_allclose(policy_sums, 1.0, atol=1e-5)
+
+            # Values should be valid WDL distributions
+            value_sums = data['values'].sum(axis=1)
+            np.testing.assert_allclose(value_sums, 1.0, atol=1e-5)
+
+
+def test_chess_dataset():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = os.path.join(tmpdir, "test_data.npz")
+        generate_synthetic_data(path, num_positions=20)
+
+        dataset = ChessDataset([path])
+        assert len(dataset) == 20
+
+        planes, policy, value = dataset[0]
+        assert planes.shape == (112, 8, 8)
+        assert policy.shape == (1858,)
+        assert value.shape == (3,)
+        assert isinstance(planes, torch.Tensor)
+
+
+def test_chess_dataset_multiple_files():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path1 = os.path.join(tmpdir, "data1.npz")
+        path2 = os.path.join(tmpdir, "data2.npz")
+        generate_synthetic_data(path1, num_positions=10)
+        generate_synthetic_data(path2, num_positions=15)
+
+        dataset = ChessDataset([path1, path2])
+        assert len(dataset) == 25
+
+
+from training.train import train_step, create_optimizer
+
+
+def test_train_step_reduces_loss():
+    cfg = NetworkConfig(num_blocks=2, num_filters=32)
+    model = ChessNetwork(cfg)
+    optimizer = create_optimizer(model)
+
+    # Create a batch of synthetic data
+    batch_size = 8
+    planes = torch.randn(batch_size, 112, 8, 8)
+    policies = torch.softmax(torch.randn(batch_size, 1858), dim=1)
+    values = torch.zeros(batch_size, 3)
+    values[:, 0] = 1.0  # All wins
+
+    # Run multiple steps and check loss decreases
+    losses = []
+    for _ in range(10):
+        loss = train_step(model, optimizer, planes, policies, values)
+        losses.append(loss)
+
+    # Loss should decrease over 10 steps
+    assert losses[-1] < losses[0]
+
+
+def test_train_step_loss_components():
+    cfg = NetworkConfig(num_blocks=2, num_filters=32)
+    model = ChessNetwork(cfg)
+    optimizer = create_optimizer(model)
+
+    planes = torch.randn(4, 112, 8, 8)
+    policies = torch.softmax(torch.randn(4, 1858), dim=1)
+    values = torch.zeros(4, 3)
+    values[:, 1] = 1.0  # All draws
+
+    loss = train_step(model, optimizer, planes, policies, values)
+    # Loss should be a positive number
+    assert loss > 0
+    assert not np.isnan(loss)
+    assert not np.isinf(loss)
+
+
+from training.export import export_torchscript
+
+
+def test_export_torchscript():
+    cfg = NetworkConfig(num_blocks=2, num_filters=32)
+    model = ChessNetwork(cfg)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = os.path.join(tmpdir, "model.pt")
+        export_torchscript(model, path)
+
+        # Load the exported model
+        loaded = torch.jit.load(path)
+
+        # Verify it produces the same output
+        model.eval()
+        x = torch.randn(1, 112, 8, 8)
+        with torch.no_grad():
+            orig_policy, orig_value = model(x)
+            loaded_policy, loaded_value = loaded(x)
+
+        assert torch.allclose(orig_policy, loaded_policy, atol=1e-5)
+        assert torch.allclose(orig_value, loaded_value, atol=1e-5)
+
+
+def test_export_torchscript_gpu():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+
+    cfg = NetworkConfig(num_blocks=2, num_filters=32)
+    model = ChessNetwork(cfg).cuda()
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = os.path.join(tmpdir, "model_gpu.pt")
+        export_torchscript(model, path, device='cpu')  # Always export as CPU
+
+        # Load on CPU and verify
+        loaded = torch.jit.load(path)
+        x = torch.randn(1, 112, 8, 8)
+        model_cpu = model.cpu()
+        model_cpu.eval()
+        with torch.no_grad():
+            orig_policy, orig_value = model_cpu(x)
+            loaded_policy, loaded_value = loaded(x)
+
+        assert torch.allclose(orig_policy, loaded_policy, atol=1e-5)
+        assert torch.allclose(orig_value, loaded_value, atol=1e-5)
+
+
+def test_end_to_end_pipeline():
+    """Full pipeline: generate data → train → export → verify."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # 1. Generate synthetic data
+        data_path = os.path.join(tmpdir, "train.npz")
+        generate_synthetic_data(data_path, num_positions=64)
+
+        # 2. Load into dataset
+        dataset = ChessDataset([data_path])
+        loader = DataLoader(dataset, batch_size=16, shuffle=True)
+
+        # 3. Create model (tiny for speed)
+        cfg = NetworkConfig(num_blocks=1, num_filters=16)
+        model = ChessNetwork(cfg)
+        optimizer = create_optimizer(model, lr=1e-3)
+
+        # 4. Train for a few steps
+        model.train()
+        losses = []
+        for planes, policies, values in loader:
+            loss = train_step(model, optimizer, planes, policies, values)
+            losses.append(loss)
+
+        assert len(losses) > 0
+        assert all(not np.isnan(l) for l in losses)
+
+        # 5. Export to TorchScript
+        export_path = os.path.join(tmpdir, "model.pt")
+        export_torchscript(model, export_path)
+        assert os.path.exists(export_path)
+
+        # 6. Load exported model and verify
+        loaded = torch.jit.load(export_path)
+        model.eval()
+        x = torch.randn(1, 112, 8, 8)
+        with torch.no_grad():
+            orig_p, orig_v = model(x)
+            load_p, load_v = loaded(x)
+        assert torch.allclose(orig_p, load_p, atol=1e-5)
+        assert torch.allclose(orig_v, load_v, atol=1e-5)
+
+
+def test_gpu_training():
+    """Verify training works on GPU."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+
+    cfg = NetworkConfig(num_blocks=2, num_filters=32)
+    model = ChessNetwork(cfg).cuda()
+    optimizer = create_optimizer(model)
+
+    planes = torch.randn(4, 112, 8, 8).cuda()
+    policies = torch.softmax(torch.randn(4, 1858), dim=1).cuda()
+    values = torch.zeros(4, 3).cuda()
+    values[:, 0] = 1.0
+
+    loss = train_step(model, optimizer, planes, policies, values)
+    assert loss > 0
+    assert not np.isnan(loss)

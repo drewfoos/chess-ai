@@ -12,6 +12,31 @@ Nothing yet.
 
 ---
 
+## [0.3.0] - 2026-04-11
+
+**Neural Network & Training Pipeline — Plan 3 complete.**
+
+### Added
+- Neural network architecture: SE-ResNet with 10 residual blocks, 128 filters, ~13M params (`training/model.py`)
+- Squeeze-and-Excitation blocks: Leela-style with multiplicative weights and additive biases
+- Policy head: 1×1 conv → 80 channels → FC → 1858 move logits
+- WDL value head: 1×1 conv → 32 channels → FC(128) → FC(3) → softmax
+- Position encoder: FEN → 112×8×8 tensor with board flipping for black (`training/encoder.py`)
+- Move encoder: 1858-dim policy index ↔ chess move mapping, Leela-style 64×73 (`training/encoder.py`)
+- Training loop: policy cross-entropy + value cross-entropy + AdamW weight decay (`training/train.py`)
+- TorchScript export for C++ inference via torch.jit.trace (`training/export.py`)
+- Synthetic data generator for pipeline testing (`training/generate_data.py`)
+- Chess training dataset loader for .npz files (`training/dataset.py`)
+- NetworkConfig dataclass for model hyperparameters (`training/config.py`)
+- Training test suite: 32 tests covering encoding, model, training, export, end-to-end pipeline
+
+### Validated
+- End-to-end pipeline: generate synthetic data → train → export TorchScript → reload and verify
+- GPU training on RTX 3080 (CUDA 12.6)
+- Loss decreases over training steps (policy CE + value CE)
+
+---
+
 ## [0.2.0] - 2026-04-11
 
 **MCTS Search Engine — Plan 2 complete.** Merged via [PR #2](https://github.com/drewfoos/chess-ai/pull/2).
