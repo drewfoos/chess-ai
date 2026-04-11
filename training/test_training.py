@@ -205,10 +205,13 @@ def test_model_value_probabilities():
     model = ChessNetwork(cfg)
     x = torch.randn(1, 112, 8, 8)
     _, value = model(x)
-    # Value head should output probabilities that sum to 1 (WDL softmax)
-    assert torch.allclose(value.sum(dim=1), torch.tensor([1.0]), atol=1e-5)
-    # All values non-negative
-    assert (value >= 0).all()
+    # Value head now returns raw logits (not probabilities)
+    assert value.shape == (1, 3)
+    assert value.dtype == torch.float32
+    # Logits can be any real number — verify softmax produces valid probs
+    probs = torch.softmax(value, dim=1)
+    assert torch.allclose(probs.sum(dim=1), torch.tensor([1.0]), atol=1e-5)
+    assert (probs >= 0).all()
 
 
 def test_model_default_config():
@@ -337,18 +340,19 @@ def test_export_torchscript():
         path = os.path.join(tmpdir, "model.pt")
         export_torchscript(model, path)
 
-        # Load the exported model
         loaded = torch.jit.load(path)
 
-        # Verify it produces the same output
         model.eval()
         x = torch.randn(1, 112, 8, 8)
         with torch.no_grad():
-            orig_policy, orig_value = model(x)
-            loaded_policy, loaded_value = loaded(x)
+            orig_policy, orig_value_logits = model(x)
+            loaded_policy, loaded_value_probs = loaded(x)
 
+        # Policy logits should match exactly
         assert torch.allclose(orig_policy, loaded_policy, atol=1e-5)
-        assert torch.allclose(orig_value, loaded_value, atol=1e-5)
+        # Exported model applies softmax to value head
+        orig_value_probs = torch.softmax(orig_value_logits, dim=1)
+        assert torch.allclose(orig_value_probs, loaded_value_probs, atol=1e-5)
 
 
 def test_export_torchscript_gpu():
@@ -360,19 +364,19 @@ def test_export_torchscript_gpu():
 
     with tempfile.TemporaryDirectory() as tmpdir:
         path = os.path.join(tmpdir, "model_gpu.pt")
-        export_torchscript(model, path, device='cpu')  # Always export as CPU
+        export_torchscript(model, path, device='cpu')
 
-        # Load on CPU and verify
         loaded = torch.jit.load(path)
         x = torch.randn(1, 112, 8, 8)
         model_cpu = model.cpu()
         model_cpu.eval()
         with torch.no_grad():
-            orig_policy, orig_value = model_cpu(x)
-            loaded_policy, loaded_value = loaded(x)
+            orig_policy, orig_value_logits = model_cpu(x)
+            loaded_policy, loaded_value_probs = loaded(x)
 
         assert torch.allclose(orig_policy, loaded_policy, atol=1e-5)
-        assert torch.allclose(orig_value, loaded_value, atol=1e-5)
+        orig_value_probs = torch.softmax(orig_value_logits, dim=1)
+        assert torch.allclose(orig_value_probs, loaded_value_probs, atol=1e-5)
 
 
 def test_end_to_end_pipeline():
@@ -411,10 +415,11 @@ def test_end_to_end_pipeline():
         model.eval()
         x = torch.randn(1, 112, 8, 8)
         with torch.no_grad():
-            orig_p, orig_v = model(x)
-            load_p, load_v = loaded(x)
+            orig_p, orig_v_logits = model(x)
+            load_p, load_v_probs = loaded(x)
         assert torch.allclose(orig_p, load_p, atol=1e-5)
-        assert torch.allclose(orig_v, load_v, atol=1e-5)
+        orig_v_probs = torch.softmax(orig_v_logits, dim=1)
+        assert torch.allclose(orig_v_probs, load_v_probs, atol=1e-5)
 
 
 def test_gpu_training():

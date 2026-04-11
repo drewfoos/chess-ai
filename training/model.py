@@ -103,6 +103,6 @@ class ChessNetwork(nn.Module):
         v = F.relu(self.value_bn(self.value_conv(x)))
         v = v.reshape(v.size(0), -1)
         v = F.relu(self.value_fc1(v))
-        v = F.softmax(self.value_fc2(v), dim=1)  # WDL probabilities
+        v = self.value_fc2(v)  # Raw WDL logits (softmax applied in loss / at inference)
 
         return p, v

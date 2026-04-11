@@ -26,31 +26,30 @@ from training.dataset import ChessDataset
 
 def compute_loss(
     policy_logits: torch.Tensor,
-    value_pred: torch.Tensor,
+    value_logits: torch.Tensor,
     policy_target: torch.Tensor,
     value_target: torch.Tensor,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Compute combined policy + value loss.
 
     Args:
         policy_logits: Raw logits from policy head (B, 1858)
-        value_pred: WDL probabilities from value head (B, 3)
+        value_logits: Raw logits from value head (B, 3)
         policy_target: MCTS visit distribution target (B, 1858)
         value_target: WDL target (B, 3)
 
     Returns:
-        Scalar loss tensor.
+        (total_loss, policy_loss, value_loss) tuple.
     """
     # Policy loss: cross-entropy with soft targets
-    # = -sum(target * log_softmax(logits))
     log_probs = F.log_softmax(policy_logits, dim=1)
     policy_loss = -(policy_target * log_probs).sum(dim=1).mean()
 
-    # Value loss: cross-entropy between WDL distributions
-    # value_pred is already softmaxed, so use -sum(target * log(pred))
-    value_loss = -(value_target * torch.log(value_pred + 1e-8)).sum(dim=1).mean()
+    # Value loss: cross-entropy with soft WDL targets
+    value_log_probs = F.log_softmax(value_logits, dim=1)
+    value_loss = -(value_target * value_log_probs).sum(dim=1).mean()
 
-    return policy_loss + value_loss
+    return policy_loss + value_loss, policy_loss, value_loss
 
 
 def create_optimizer(model: ChessNetwork, lr: float = 1e-3, weight_decay: float = 1e-4):
@@ -69,8 +68,8 @@ def train_step(
     model.train()
     optimizer.zero_grad()
 
-    policy_logits, value_pred = model(planes)
-    loss = compute_loss(policy_logits, value_pred, policy_target, value_target)
+    policy_logits, value_logits = model(planes)
+    loss, _, _ = compute_loss(policy_logits, value_logits, policy_target, value_target)
 
     loss.backward()
     optimizer.step()

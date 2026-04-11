@@ -12,6 +12,19 @@ from training.config import NetworkConfig
 from training.model import ChessNetwork
 
 
+class _ExportWrapper(torch.nn.Module):
+    """Wraps ChessNetwork to apply softmax to value head for inference."""
+
+    def __init__(self, model: ChessNetwork):
+        super().__init__()
+        self.model = model
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        policy_logits, value_logits = self.model(x)
+        value_probs = torch.softmax(value_logits, dim=1)
+        return policy_logits, value_probs
+
+
 def export_torchscript(
     model: ChessNetwork,
     output_path: str,
@@ -19,18 +32,18 @@ def export_torchscript(
 ):
     """Export a ChessNetwork to TorchScript via tracing.
 
-    Args:
-        model: Trained ChessNetwork instance.
-        output_path: Path to save the .pt TorchScript file.
-        device: Device to export on ('cpu' recommended for portability).
+    The exported model applies softmax to the value head output,
+    so it returns (policy_logits, value_probabilities).
     """
     model = model.to(device)
     model.eval()
 
-    # Trace with example input
+    wrapper = _ExportWrapper(model)
+    wrapper.eval()
+
     example = torch.randn(1, model.config.input_planes, 8, 8, device=device)
     with torch.no_grad():
-        traced = torch.jit.trace(model, example)
+        traced = torch.jit.trace(wrapper, example)
 
     traced.save(output_path)
     print(f"Exported TorchScript model to {output_path}")
