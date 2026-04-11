@@ -5,7 +5,7 @@ Architecture (matching Leela Chess Zero):
     → Initial Conv(3×3, filters) + BN + ReLU
     → N × ResidualBlock(3×3 conv + BN + ReLU + 3×3 conv + BN + SE + skip + ReLU)
     → Policy Head: Conv(1×1, 80) + BN + ReLU + Flatten + FC(5120 → 1858)
-    → Value Head: Conv(1×1, 32) + BN + ReLU + Flatten + FC(2048 → 128) + ReLU + FC(128 → 3) + Softmax
+    → Value Head: Conv(1×1, 32) + BN + ReLU + Flatten + FC(2048 → 128) + ReLU + FC(128 → 3)
 """
 
 import torch

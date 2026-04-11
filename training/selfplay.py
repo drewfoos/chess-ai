@@ -235,7 +235,7 @@ def training_loop(
             for g in range(window_start, gen + 1)
         ]
         dataset = ChessDataset(npz_paths)
-        dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+        dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=True)
 
         # 3. Train for train_epochs epochs
         model.train()
