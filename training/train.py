@@ -54,8 +54,8 @@ def compute_loss(
 
 
 def create_optimizer(model: ChessNetwork, lr: float = 1e-3, weight_decay: float = 1e-4):
-    """Create Adam optimizer with L2 weight decay."""
-    return torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+    """Create AdamW optimizer with decoupled weight decay."""
+    return torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
 
 
 def train_step(
