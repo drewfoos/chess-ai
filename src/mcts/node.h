@@ -3,6 +3,7 @@
 #include <vector>
 #include <memory>
 #include <cmath>
+#include <cassert>
 
 namespace mcts {
 
@@ -14,8 +15,8 @@ public:
     // Tree structure
     bool is_leaf() const { return children_.empty(); }
     int num_children() const { return static_cast<int>(children_.size()); }
-    Node* child(int i) { return children_[i].get(); }
-    const Node* child(int i) const { return children_[i].get(); }
+    Node* child(int i) { assert(i >= 0 && i < num_children()); return children_[i].get(); }
+    const Node* child(int i) const { assert(i >= 0 && i < num_children()); return children_[i].get(); }
     Node* parent() const { return parent_; }
 
     // Statistics

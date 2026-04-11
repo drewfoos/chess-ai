@@ -1,5 +1,4 @@
 #include "mcts/node.h"
-#include <algorithm>
 #include <cassert>
 #include <limits>
 
