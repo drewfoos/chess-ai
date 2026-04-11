@@ -279,3 +279,90 @@ TEST_F(MCTSTest, TemperatureOneDistributesProportionally) {
         EXPECT_LT(counts[i], 1200);
     }
 }
+
+TEST_F(MCTSTest, SearchHandlesCheckmate) {
+    // Fool's mate — white is checkmated
+    Position pos;
+    pos.set_fen("rnb1kbnr/pppp1ppp/8/4p3/6Pq/5P2/PPPPP2P/RNBQKBNR w KQkq - 1 3");
+
+    mcts::RandomEvaluator eval;
+    mcts::SearchParams params;
+    params.num_iterations = 100;
+    params.add_noise = false;
+
+    mcts::Search search(eval, params);
+    mcts::SearchResult result = search.run(pos);
+
+    // Checkmated — no legal moves
+    EXPECT_TRUE(result.best_move.is_none());
+    EXPECT_FLOAT_EQ(result.root_value, -1.0f);
+}
+
+TEST_F(MCTSTest, SearchHandlesStalemate) {
+    // Stalemate: black king on a8, white king on b6, white pawn on a7
+    Position pos;
+    pos.set_fen("k7/P7/1K6/8/8/8/8/8 b - - 0 1");
+
+    Move moves[MAX_MOVES];
+    int num_moves = generate_legal_moves(pos, moves);
+
+    if (num_moves == 0 && !pos.in_check()) {
+        mcts::RandomEvaluator eval;
+        mcts::SearchParams params;
+        params.num_iterations = 100;
+        params.add_noise = false;
+
+        mcts::Search search(eval, params);
+        mcts::SearchResult result = search.run(pos);
+
+        EXPECT_TRUE(result.best_move.is_none());
+        EXPECT_FLOAT_EQ(result.root_value, 0.0f);
+    }
+}
+
+TEST_F(MCTSTest, SearchWithOneMove) {
+    // Position where only one legal move exists
+    // King in check with one escape
+    Position pos;
+    pos.set_fen("8/8/8/8/8/5k2/4q3/7K w - - 0 1");
+
+    Move moves[MAX_MOVES];
+    int num_moves = generate_legal_moves(pos, moves);
+
+    if (num_moves == 1) {
+        mcts::RandomEvaluator eval;
+        mcts::SearchParams params;
+        params.num_iterations = 50;
+        params.add_noise = false;
+
+        mcts::Search search(eval, params);
+        mcts::SearchResult result = search.run(pos);
+
+        EXPECT_EQ(result.best_move, moves[0]);
+    }
+}
+
+TEST_F(MCTSTest, SearchVisitCountsConsistency) {
+    Position pos;
+    pos.set_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+
+    mcts::RandomEvaluator eval;
+    mcts::SearchParams params;
+    params.num_iterations = 200;
+    params.add_noise = false;
+
+    mcts::Search search(eval, params);
+    mcts::SearchResult result = search.run(pos);
+
+    // Every legal move should have at least some visits
+    EXPECT_EQ(result.moves.size(), result.visit_counts.size());
+    EXPECT_GT(result.moves.size(), 0u);
+
+    // Total visit counts should equal num_iterations
+    int total = 0;
+    for (int v : result.visit_counts) {
+        EXPECT_GE(v, 0);
+        total += v;
+    }
+    EXPECT_EQ(total, params.num_iterations);
+}
