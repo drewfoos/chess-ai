@@ -230,3 +230,54 @@ def test_model_batch_independence():
     policy_1, value_1 = model(x[1:2])
     assert torch.allclose(policy_batch[0], policy_0[0], atol=1e-5)
     assert torch.allclose(value_batch[0], value_0[0], atol=1e-5)
+
+
+import tempfile
+import os
+from training.generate_data import generate_synthetic_data
+from training.dataset import ChessDataset
+
+
+def test_generate_synthetic_data():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = os.path.join(tmpdir, "test_data.npz")
+        generate_synthetic_data(path, num_positions=50)
+
+        with np.load(path) as data:
+            assert data['planes'].shape == (50, 112, 8, 8)
+            assert data['policies'].shape == (50, 1858)
+            assert data['values'].shape == (50, 3)
+
+            # Policies should be valid probability distributions
+            policy_sums = data['policies'].sum(axis=1)
+            np.testing.assert_allclose(policy_sums, 1.0, atol=1e-5)
+
+            # Values should be valid WDL distributions
+            value_sums = data['values'].sum(axis=1)
+            np.testing.assert_allclose(value_sums, 1.0, atol=1e-5)
+
+
+def test_chess_dataset():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = os.path.join(tmpdir, "test_data.npz")
+        generate_synthetic_data(path, num_positions=20)
+
+        dataset = ChessDataset([path])
+        assert len(dataset) == 20
+
+        planes, policy, value = dataset[0]
+        assert planes.shape == (112, 8, 8)
+        assert policy.shape == (1858,)
+        assert value.shape == (3,)
+        assert isinstance(planes, torch.Tensor)
+
+
+def test_chess_dataset_multiple_files():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path1 = os.path.join(tmpdir, "data1.npz")
+        path2 = os.path.join(tmpdir, "data2.npz")
+        generate_synthetic_data(path1, num_positions=10)
+        generate_synthetic_data(path2, num_positions=15)
+
+        dataset = ChessDataset([path1, path2])
+        assert len(dataset) == 25
