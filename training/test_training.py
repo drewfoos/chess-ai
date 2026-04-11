@@ -683,3 +683,31 @@ def test_play_game_max_moves():
 
     record = play_game(mcts, sp_cfg)
     assert len(record.planes) <= 10
+
+
+def test_training_loop_one_generation():
+    """Full RL loop: generate -> train -> checkpoint for 1 generation."""
+    from training.selfplay import training_loop
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        training_loop(
+            generations=1,
+            games_per_gen=2,
+            train_epochs=2,
+            batch_size=8,
+            num_simulations=10,
+            blocks=1,
+            filters=16,
+            output_dir=tmpdir,
+            device='cpu',
+            max_moves=20,
+            resign_threshold=-1.0,  # Never resign
+        )
+
+        # Verify checkpoint was saved
+        checkpoint_path = os.path.join(tmpdir, "checkpoints", "model_gen_1.pt")
+        assert os.path.exists(checkpoint_path)
+
+        # Verify training data was saved
+        data_path = os.path.join(tmpdir, "data", "gen_001.npz")
+        assert os.path.exists(data_path)
