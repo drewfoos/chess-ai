@@ -11,6 +11,7 @@ add_library(chess_core
     src/core/position.cpp
     src/core/movegen.cpp
     src/mcts/node.cpp
+    src/mcts/search.cpp
 )
 target_include_directories(chess_core PUBLIC src)
 

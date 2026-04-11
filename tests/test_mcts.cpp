@@ -1,6 +1,9 @@
 #include <gtest/gtest.h>
 #include "mcts/node.h"
+#include "mcts/search.h"
 #include "core/attacks.h"
+#include "core/position.h"
+#include "core/movegen.h"
 
 class MCTSTest : public ::testing::Test {
 protected:
@@ -104,4 +107,63 @@ TEST_F(MCTSTest, BestMoveReturnsMostVisited) {
     for (int i = 0; i < 5; i++) root.child(2)->update(0.6f);
 
     EXPECT_EQ(root.best_move(), Move(D2, D4, FLAG_DOUBLE_PUSH));
+}
+
+TEST_F(MCTSTest, RandomEvaluatorReturnsUniformPolicy) {
+    Position pos;
+    pos.set_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+
+    Move moves[MAX_MOVES];
+    int num_moves = generate_legal_moves(pos, moves);
+
+    mcts::RandomEvaluator eval;
+    mcts::EvalResult result = eval.evaluate(pos, moves, num_moves);
+
+    EXPECT_EQ(static_cast<int>(result.policy.size()), num_moves);
+
+    // All priors should be equal (uniform)
+    float expected_prior = 1.0f / num_moves;
+    for (int i = 0; i < num_moves; i++) {
+        EXPECT_NEAR(result.policy[i], expected_prior, 1e-5f);
+    }
+
+    // Value should be in [-1, 1]
+    EXPECT_GE(result.value, -1.0f);
+    EXPECT_LE(result.value, 1.0f);
+}
+
+TEST_F(MCTSTest, RandomEvaluatorCheckmateValue) {
+    // Scholar's mate position — black is checkmated
+    Position pos;
+    pos.set_fen("rnb1kbnr/pppp1ppp/8/4p3/6Pq/5P2/PPPPP2P/RNBQKBNR w KQkq - 1 3");
+
+    Move moves[MAX_MOVES];
+    int num_moves = generate_legal_moves(pos, moves);
+
+    // No legal moves and in check = checkmate
+    EXPECT_EQ(num_moves, 0);
+    EXPECT_TRUE(pos.in_check());
+
+    mcts::RandomEvaluator eval;
+    mcts::EvalResult result = eval.evaluate(pos, moves, num_moves);
+
+    // Side to move is checkmated — value = -1 (loss)
+    EXPECT_FLOAT_EQ(result.value, -1.0f);
+    EXPECT_TRUE(result.policy.empty());
+}
+
+TEST_F(MCTSTest, RandomEvaluatorStalemateValue) {
+    // Stalemate position
+    Position pos;
+    pos.set_fen("k7/8/1K6/8/8/8/8/8 b - - 0 1");
+
+    Move moves[MAX_MOVES];
+    int num_moves = generate_legal_moves(pos, moves);
+
+    // If stalemate, value = 0
+    if (num_moves == 0 && !pos.in_check()) {
+        mcts::RandomEvaluator eval;
+        mcts::EvalResult result = eval.evaluate(pos, moves, num_moves);
+        EXPECT_FLOAT_EQ(result.value, 0.0f);
+    }
 }
