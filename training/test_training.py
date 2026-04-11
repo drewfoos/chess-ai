@@ -323,3 +323,52 @@ def test_train_step_loss_components():
     assert loss > 0
     assert not np.isnan(loss)
     assert not np.isinf(loss)
+
+
+from training.export import export_torchscript
+
+
+def test_export_torchscript():
+    cfg = NetworkConfig(num_blocks=2, num_filters=32)
+    model = ChessNetwork(cfg)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = os.path.join(tmpdir, "model.pt")
+        export_torchscript(model, path)
+
+        # Load the exported model
+        loaded = torch.jit.load(path)
+
+        # Verify it produces the same output
+        model.eval()
+        x = torch.randn(1, 112, 8, 8)
+        with torch.no_grad():
+            orig_policy, orig_value = model(x)
+            loaded_policy, loaded_value = loaded(x)
+
+        assert torch.allclose(orig_policy, loaded_policy, atol=1e-5)
+        assert torch.allclose(orig_value, loaded_value, atol=1e-5)
+
+
+def test_export_torchscript_gpu():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+
+    cfg = NetworkConfig(num_blocks=2, num_filters=32)
+    model = ChessNetwork(cfg).cuda()
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = os.path.join(tmpdir, "model_gpu.pt")
+        export_torchscript(model, path, device='cpu')  # Always export as CPU
+
+        # Load on CPU and verify
+        loaded = torch.jit.load(path)
+        x = torch.randn(1, 112, 8, 8)
+        model_cpu = model.cpu()
+        model_cpu.eval()
+        with torch.no_grad():
+            orig_policy, orig_value = model_cpu(x)
+            loaded_policy, loaded_value = loaded(x)
+
+        assert torch.allclose(orig_policy, loaded_policy, atol=1e-5)
+        assert torch.allclose(orig_value, loaded_value, atol=1e-5)
