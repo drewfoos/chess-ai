@@ -1,0 +1,46 @@
+# Build
+build/
+out/
+cmake-build-*/
+*.obj
+*.exe
+*.pdb
+*.ilk
+*.lib
+*.dll
+*.exp
+
+# IDE
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+CMakeSettings.json
+compile_commands.json
+
+# Claude
+.claude/
+CLAUDE.md
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+.venv/
+venv/
+*.pt
+*.onnx
+*.pth
+
+# Training data
+*.gz
+checkpoints/
+runs/
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
