@@ -175,3 +175,58 @@ def test_encode_bias_plane():
     planes = encode_position("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1")
     # Plane 111 = all-ones bias
     assert planes[111].sum() == 64
+
+
+import torch
+from training.model import ChessNetwork
+
+
+def test_model_output_shapes():
+    cfg = NetworkConfig(num_blocks=2, num_filters=32)  # Small for testing
+    model = ChessNetwork(cfg)
+    x = torch.randn(4, 112, 8, 8)  # Batch of 4
+    policy, value = model(x)
+    assert policy.shape == (4, 1858)
+    assert value.shape == (4, 3)
+
+
+def test_model_policy_logits():
+    cfg = NetworkConfig(num_blocks=2, num_filters=32)
+    model = ChessNetwork(cfg)
+    x = torch.randn(1, 112, 8, 8)
+    policy, _ = model(x)
+    # Policy should be raw logits (not softmaxed) — can be any real number
+    assert policy.dtype == torch.float32
+
+
+def test_model_value_probabilities():
+    cfg = NetworkConfig(num_blocks=2, num_filters=32)
+    model = ChessNetwork(cfg)
+    x = torch.randn(1, 112, 8, 8)
+    _, value = model(x)
+    # Value head should output probabilities that sum to 1 (WDL softmax)
+    assert torch.allclose(value.sum(dim=1), torch.tensor([1.0]), atol=1e-5)
+    # All values non-negative
+    assert (value >= 0).all()
+
+
+def test_model_default_config():
+    cfg = NetworkConfig()  # 10 blocks, 128 filters
+    model = ChessNetwork(cfg)
+    # Count parameters — with policy FC (80*64 → 1858) the dominant cost is the policy head (~9.5M)
+    # Total is ~13M for default config (10 blocks, 128 filters, policy_conv_filters=80)
+    total_params = sum(p.numel() for p in model.parameters())
+    assert total_params > 1_000_000  # At least 1M
+    assert total_params < 20_000_000  # Less than 20M
+
+
+def test_model_batch_independence():
+    cfg = NetworkConfig(num_blocks=2, num_filters=32)
+    model = ChessNetwork(cfg)
+    model.eval()
+    x = torch.randn(2, 112, 8, 8)
+    policy_batch, value_batch = model(x)
+    policy_0, value_0 = model(x[0:1])
+    policy_1, value_1 = model(x[1:2])
+    assert torch.allclose(policy_batch[0], policy_0[0], atol=1e-5)
+    assert torch.allclose(value_batch[0], value_0[0], atol=1e-5)
