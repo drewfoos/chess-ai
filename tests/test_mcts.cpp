@@ -167,3 +167,52 @@ TEST_F(MCTSTest, RandomEvaluatorStalemateValue) {
         EXPECT_FLOAT_EQ(result.value, 0.0f);
     }
 }
+
+TEST_F(MCTSTest, SearchReturnsLegalMove) {
+    Position pos;
+    pos.set_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+
+    mcts::RandomEvaluator eval;
+    mcts::SearchParams params;
+    params.num_iterations = 100;
+    params.add_noise = false;
+
+    mcts::Search search(eval, params);
+    mcts::SearchResult result = search.run(pos);
+
+    // Must return a legal move
+    EXPECT_FALSE(result.best_move.is_none());
+
+    // Verify it's actually legal
+    Move moves[MAX_MOVES];
+    int num_moves = generate_legal_moves(pos, moves);
+    bool found = false;
+    for (int i = 0; i < num_moves; i++) {
+        if (moves[i] == result.best_move) { found = true; break; }
+    }
+    EXPECT_TRUE(found);
+
+    // Visit counts should sum to num_iterations
+    int total_visits = 0;
+    for (int v : result.visit_counts) total_visits += v;
+    EXPECT_EQ(total_visits, params.num_iterations);
+}
+
+TEST_F(MCTSTest, SearchFindsObviousCapture) {
+    // White queen can take undefended black queen
+    Position pos;
+    pos.set_fen("rnb1kbnr/pppppppp/8/4q3/3Q4/8/PPPPPPPP/RNB1KBNR w KQkq - 0 1");
+
+    mcts::RandomEvaluator eval;
+    mcts::SearchParams params;
+    params.num_iterations = 400;
+    params.add_noise = false;
+
+    mcts::Search search(eval, params);
+    mcts::SearchResult result = search.run(pos);
+
+    // With enough iterations, MCTS should strongly prefer capturing the queen
+    // Qd4xe5 — d4=27, e5=36
+    Move capture_queen(D4, E5, FLAG_CAPTURE);
+    EXPECT_EQ(result.best_move, capture_queen);
+}
