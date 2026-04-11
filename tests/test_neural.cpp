@@ -131,6 +131,36 @@ TEST_F(NeuralTest, Encoder_BlackToMoveFlips) {
         EXPECT_FLOAT_EQ(buf[0 * 64 + 1 * 8 + f], 1.0f);
 }
 
+TEST_F(NeuralTest, Encoder_BlackToMoveFlipsAsymmetric) {
+    Position pos;
+    pos.set_fen("8/p7/8/8/8/8/P7/8 b - - 0 1");
+    float buf[neural::TENSOR_SIZE] = {};
+    neural::encode_position(pos, buf);
+    // Black pawn on A7 (rank 6) flipped to rank 1, file 0 → our pawn plane 0
+    EXPECT_FLOAT_EQ(buf[0 * 64 + 1 * 8 + 0], 1.0f);
+    // White pawn on A2 (rank 1) flipped to rank 6, file 0 → opponent pawn plane 6
+    EXPECT_FLOAT_EQ(buf[6 * 64 + 6 * 8 + 0], 1.0f);
+}
+
+TEST_F(NeuralTest, Encoder_PartialCastling) {
+    Position pos;
+    pos.set_fen("r3k3/8/8/8/8/8/8/4K2R w K - 0 1");
+    float buf[neural::TENSOR_SIZE] = {};
+    neural::encode_position(pos, buf);
+    // White to move, only WHITE_OO → plane 106 filled, 107-109 zero
+    float sum106 = 0, sum107 = 0, sum108 = 0, sum109 = 0;
+    for (int i = 0; i < 64; i++) {
+        sum106 += buf[106 * 64 + i];
+        sum107 += buf[107 * 64 + i];
+        sum108 += buf[108 * 64 + i];
+        sum109 += buf[109 * 64 + i];
+    }
+    EXPECT_FLOAT_EQ(sum106, 64.0f);
+    EXPECT_FLOAT_EQ(sum107, 0.0f);
+    EXPECT_FLOAT_EQ(sum108, 0.0f);
+    EXPECT_FLOAT_EQ(sum109, 0.0f);
+}
+
 TEST_F(NeuralTest, Encoder_ColorPlaneWhite) {
     Position pos;
     pos.set_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");

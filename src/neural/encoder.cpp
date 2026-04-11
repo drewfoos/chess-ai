@@ -24,9 +24,9 @@ void encode_position(const Position& pos, float* output) {
         // Flip square for black to move
         int actual_sq;
         if (!is_white) {
-            int file = sq & 7;
-            int rank = sq >> 3;
-            actual_sq = (7 - rank) * 8 + file;
+            int sq_file = sq & 7;
+            int sq_rank = sq >> 3;
+            actual_sq = (7 - sq_rank) * 8 + sq_file;
         } else {
             actual_sq = sq;
         }
