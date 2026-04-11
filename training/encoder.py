@@ -237,3 +237,91 @@ def encode_position(fen: str) -> np.ndarray:
     planes[111] = 1.0
 
     return planes
+
+
+def encode_board(board) -> np.ndarray:
+    """Encode a python-chess Board as a 112x8x8 float32 tensor with position history.
+
+    Unlike encode_position(fen), this uses the board's move stack to fill
+    8 time steps with actual history positions instead of repeating the current one.
+
+    Args:
+        board: A python-chess Board object with move history.
+
+    Returns:
+        np.ndarray of shape (112, 8, 8), dtype float32.
+    """
+    import chess
+
+    is_white = (board.turn == chess.WHITE)
+    planes = np.zeros((112, 8, 8), dtype=np.float32)
+
+    # We need to encode 8 time steps: current position + 7 history positions.
+    # Walk backwards through the move stack to reconstruct earlier positions.
+    # We work on a copy so we don't mutate the original board.
+    history_board = board.copy()
+    for t in range(8):
+        step_planes = np.zeros((13, 8, 8), dtype=np.float32)
+
+        # Encode pieces on the board
+        for sq in range(64):
+            piece = history_board.piece_at(sq)
+            if piece is None:
+                continue
+            piece_is_white = (piece.color == chess.WHITE)
+            piece_type = piece.piece_type - 1  # chess.PAWN=1..KING=6 -> 0..5
+
+            # Flip square if side-to-move is Black (always orient from STM perspective)
+            actual_sq = sq if is_white else mirror_move(sq)
+            r, f = rank_of(actual_sq), file_of(actual_sq)
+
+            if piece_is_white == is_white:
+                step_planes[piece_type, r, f] = 1.0  # Our piece
+            else:
+                step_planes[6 + piece_type, r, f] = 1.0  # Opponent piece
+
+        # Repetition plane (plane 12): 1 if position has occurred at least twice
+        if history_board.is_repetition(2):
+            step_planes[12] = 1.0
+
+        planes[t * 13:(t + 1) * 13] = step_planes
+
+        # Step back one move for the next time step
+        if history_board.move_stack:
+            history_board.pop()
+        # If no more history, remaining time steps will repeat this earliest position
+
+    # Constant planes (104-111)
+    if is_white:
+        planes[104] = 1.0  # Color to move
+
+    # Total move count (normalized)
+    planes[105] = board.fullmove_number / 200.0
+
+    # Castling rights (from side-to-move perspective)
+    if is_white:
+        if board.has_kingside_castling_rights(chess.WHITE):
+            planes[106] = 1.0
+        if board.has_queenside_castling_rights(chess.WHITE):
+            planes[107] = 1.0
+        if board.has_kingside_castling_rights(chess.BLACK):
+            planes[108] = 1.0
+        if board.has_queenside_castling_rights(chess.BLACK):
+            planes[109] = 1.0
+    else:
+        if board.has_kingside_castling_rights(chess.BLACK):
+            planes[106] = 1.0
+        if board.has_queenside_castling_rights(chess.BLACK):
+            planes[107] = 1.0
+        if board.has_kingside_castling_rights(chess.WHITE):
+            planes[108] = 1.0
+        if board.has_queenside_castling_rights(chess.WHITE):
+            planes[109] = 1.0
+
+    # Halfmove clock (normalized)
+    planes[110] = board.halfmove_clock / 100.0
+
+    # All-ones bias
+    planes[111] = 1.0
+
+    return planes

@@ -205,10 +205,13 @@ def test_model_value_probabilities():
     model = ChessNetwork(cfg)
     x = torch.randn(1, 112, 8, 8)
     _, value = model(x)
-    # Value head should output probabilities that sum to 1 (WDL softmax)
-    assert torch.allclose(value.sum(dim=1), torch.tensor([1.0]), atol=1e-5)
-    # All values non-negative
-    assert (value >= 0).all()
+    # Value head now returns raw logits (not probabilities)
+    assert value.shape == (1, 3)
+    assert value.dtype == torch.float32
+    # Logits can be any real number — verify softmax produces valid probs
+    probs = torch.softmax(value, dim=1)
+    assert torch.allclose(probs.sum(dim=1), torch.tensor([1.0]), atol=1e-5)
+    assert (probs >= 0).all()
 
 
 def test_model_default_config():
@@ -337,18 +340,19 @@ def test_export_torchscript():
         path = os.path.join(tmpdir, "model.pt")
         export_torchscript(model, path)
 
-        # Load the exported model
         loaded = torch.jit.load(path)
 
-        # Verify it produces the same output
         model.eval()
         x = torch.randn(1, 112, 8, 8)
         with torch.no_grad():
-            orig_policy, orig_value = model(x)
-            loaded_policy, loaded_value = loaded(x)
+            orig_policy, orig_value_logits = model(x)
+            loaded_policy, loaded_value_probs = loaded(x)
 
+        # Policy logits should match exactly
         assert torch.allclose(orig_policy, loaded_policy, atol=1e-5)
-        assert torch.allclose(orig_value, loaded_value, atol=1e-5)
+        # Exported model applies softmax to value head
+        orig_value_probs = torch.softmax(orig_value_logits, dim=1)
+        assert torch.allclose(orig_value_probs, loaded_value_probs, atol=1e-5)
 
 
 def test_export_torchscript_gpu():
@@ -360,19 +364,19 @@ def test_export_torchscript_gpu():
 
     with tempfile.TemporaryDirectory() as tmpdir:
         path = os.path.join(tmpdir, "model_gpu.pt")
-        export_torchscript(model, path, device='cpu')  # Always export as CPU
+        export_torchscript(model, path, device='cpu')
 
-        # Load on CPU and verify
         loaded = torch.jit.load(path)
         x = torch.randn(1, 112, 8, 8)
         model_cpu = model.cpu()
         model_cpu.eval()
         with torch.no_grad():
-            orig_policy, orig_value = model_cpu(x)
-            loaded_policy, loaded_value = loaded(x)
+            orig_policy, orig_value_logits = model_cpu(x)
+            loaded_policy, loaded_value_probs = loaded(x)
 
         assert torch.allclose(orig_policy, loaded_policy, atol=1e-5)
-        assert torch.allclose(orig_value, loaded_value, atol=1e-5)
+        orig_value_probs = torch.softmax(orig_value_logits, dim=1)
+        assert torch.allclose(orig_value_probs, loaded_value_probs, atol=1e-5)
 
 
 def test_end_to_end_pipeline():
@@ -411,10 +415,11 @@ def test_end_to_end_pipeline():
         model.eval()
         x = torch.randn(1, 112, 8, 8)
         with torch.no_grad():
-            orig_p, orig_v = model(x)
-            load_p, load_v = loaded(x)
+            orig_p, orig_v_logits = model(x)
+            load_p, load_v_probs = loaded(x)
         assert torch.allclose(orig_p, load_p, atol=1e-5)
-        assert torch.allclose(orig_v, load_v, atol=1e-5)
+        orig_v_probs = torch.softmax(orig_v_logits, dim=1)
+        assert torch.allclose(orig_v_probs, load_v_probs, atol=1e-5)
 
 
 def test_gpu_training():
@@ -434,3 +439,367 @@ def test_gpu_training():
     loss = train_step(model, optimizer, planes, policies, values)
     assert loss > 0
     assert not np.isnan(loss)
+
+
+import chess
+from training.encoder import encode_board
+
+
+def test_encode_board_shape():
+    """encode_board produces the correct tensor shape."""
+    board = chess.Board()
+    planes = encode_board(board)
+    assert planes.shape == (112, 8, 8)
+    assert planes.dtype == np.float32
+
+
+def test_encode_board_starting_matches_fen():
+    """Starting position via encode_board matches encode_position for time step 0."""
+    board = chess.Board()
+    from_board = encode_board(board)
+    from_fen = encode_position(board.fen())
+    # All 8 time steps are identical (no history) so entire tensor matches
+    np.testing.assert_array_equal(from_board, from_fen)
+
+
+def test_encode_board_history_differs():
+    """After moves, earlier time steps show different positions."""
+    board = chess.Board()
+    board.push_san("e4")
+    board.push_san("e5")
+    board.push_san("Nf3")
+    planes = encode_board(board)
+    # Time step 0 (current: after 1.e4 e5 2.Nf3) differs from
+    # time step 1 (position after 1.e4 e5)
+    step0 = planes[0:13]
+    step1 = planes[13:26]
+    assert not np.array_equal(step0, step1)
+
+
+def test_encode_board_black_to_move_flips():
+    """Board is flipped when Black is to move."""
+    board = chess.Board()
+    board.push_san("e4")  # Now Black to move
+    planes = encode_board(board)
+    # Color plane (104) should be 0 (Black to move)
+    assert planes[104].sum() == 0
+    # "Our" pawns (plane 0) should be Black's pawns, flipped to rank 1
+    our_pawns = planes[0]
+    assert our_pawns.sum() == 8
+    for file in range(8):
+        assert our_pawns[1, file] == 1.0
+
+
+def test_encode_board_repetition_plane():
+    """Repetition plane is set when position repeats."""
+    board = chess.Board()
+    # Play moves that repeat: Nf3 Nf6 Ng1 Ng8 (back to start)
+    board.push_san("Nf3")
+    board.push_san("Nf6")
+    board.push_san("Ng1")
+    board.push_san("Ng8")
+    # Now the starting position has occurred twice
+    planes = encode_board(board)
+    # Repetition plane (index 12 within time step 0) should be 1
+    assert planes[12].sum() == 64  # All ones = repetition detected
+
+
+from training.mcts import Node, MCTS, MCTSConfig, chess_move_to_policy_index
+
+
+def test_node_initial_state():
+    """New node has zero visits and no children."""
+    node = Node(prior=0.5)
+    assert node.visit_count == 0
+    assert node.total_value == 0.0
+    assert node.prior == 0.5
+    assert len(node.children) == 0
+
+
+def test_node_value():
+    """Node value is average of backpropagated values."""
+    node = Node(prior=0.1)
+    node.visit_count = 4
+    node.total_value = 2.0
+    assert node.value() == 0.5
+
+
+def test_node_puct_prefers_high_prior():
+    """PUCT formula prefers unvisited children with higher prior."""
+    parent = Node(prior=1.0)
+    parent.visit_count = 10
+    child_high = Node(prior=0.9)
+    child_low = Node(prior=0.1)
+    parent.children = {chess.Move.from_uci("e2e4"): child_high,
+                       chess.Move.from_uci("a2a3"): child_low}
+    c_puct = 2.5
+    score_high = child_high.puct_score(parent.visit_count, c_puct)
+    score_low = child_low.puct_score(parent.visit_count, c_puct)
+    assert score_high > score_low
+
+
+def test_mcts_returns_legal_move():
+    """MCTS search returns a legal move from the starting position."""
+    cfg = NetworkConfig(num_blocks=1, num_filters=16)
+    model = ChessNetwork(cfg)
+    model.eval()
+    mcts_cfg = MCTSConfig(num_simulations=20)
+    mcts = MCTS(model, mcts_cfg)
+    board = chess.Board()
+    result = mcts.search(board)
+    assert result.best_move in board.legal_moves
+
+
+def test_mcts_policy_target_shape():
+    """Search result includes a 1858-dim policy target."""
+    cfg = NetworkConfig(num_blocks=1, num_filters=16)
+    model = ChessNetwork(cfg)
+    model.eval()
+    mcts_cfg = MCTSConfig(num_simulations=20)
+    mcts = MCTS(model, mcts_cfg)
+    board = chess.Board()
+    result = mcts.search(board)
+    assert result.policy_target.shape == (1858,)
+    np.testing.assert_allclose(result.policy_target.sum(), 1.0, atol=1e-5)
+
+
+def test_mcts_policy_target_only_legal():
+    """Policy target has nonzero values only for legal moves."""
+    cfg = NetworkConfig(num_blocks=1, num_filters=16)
+    model = ChessNetwork(cfg)
+    model.eval()
+    mcts_cfg = MCTSConfig(num_simulations=50)
+    mcts = MCTS(model, mcts_cfg)
+    board = chess.Board()
+    result = mcts.search(board)
+    legal_indices = set()
+    for move in board.legal_moves:
+        idx = chess_move_to_policy_index(move, board.turn)
+        if idx is not None:
+            legal_indices.add(idx)
+    for i in range(1858):
+        if result.policy_target[i] > 0:
+            assert i in legal_indices, f"Nonzero policy at index {i} but not legal"
+
+
+def test_mcts_terminal_position():
+    """MCTS handles checkmate position without crashing."""
+    cfg = NetworkConfig(num_blocks=1, num_filters=16)
+    model = ChessNetwork(cfg)
+    model.eval()
+    mcts_cfg = MCTSConfig(num_simulations=10)
+    mcts = MCTS(model, mcts_cfg)
+    board = chess.Board("rnbqkbnr/pppp1ppp/4p3/8/6P1/5P2/PPPPP2P/RNBQKBNR b KQkq - 0 2")
+    board.push_san("Qh4#")
+    assert board.is_checkmate()
+    result = mcts.search(board)
+    assert result.best_move is None
+
+
+def test_chess_move_to_policy_index_roundtrip():
+    """chess_move_to_policy_index produces valid indices that roundtrip."""
+    board = chess.Board()
+    for move in board.legal_moves:
+        idx = chess_move_to_policy_index(move, board.turn)
+        assert idx is not None, f"Move {move} has no policy index"
+        assert 0 <= idx < 1858
+
+
+from torch.optim.lr_scheduler import MultiStepLR
+
+
+def test_lr_scheduler_reduces_lr():
+    """MultiStepLR reduces learning rate at milestones."""
+    cfg = NetworkConfig(num_blocks=1, num_filters=16)
+    model = ChessNetwork(cfg)
+    optimizer = create_optimizer(model, lr=0.1)
+    scheduler = MultiStepLR(optimizer, milestones=[2, 4], gamma=0.1)
+
+    lrs = []
+    for epoch in range(6):
+        lrs.append(optimizer.param_groups[0]['lr'])
+        scheduler.step()
+
+    # Before milestone 2: lr = 0.1
+    assert abs(lrs[0] - 0.1) < 1e-6
+    assert abs(lrs[1] - 0.1) < 1e-6
+    # After milestone 2: lr = 0.01
+    assert abs(lrs[2] - 0.01) < 1e-6
+    assert abs(lrs[3] - 0.01) < 1e-6
+    # After milestone 4: lr = 0.001
+    assert abs(lrs[4] - 0.001) < 1e-6
+    assert abs(lrs[5] - 0.001) < 1e-6
+
+
+# ── Self-Play Tests ──────────────────────────────────────────────────────────
+
+from training.selfplay import SelfPlayConfig, play_game, GameRecord, generate_games
+
+
+def test_play_game_produces_record():
+    """play_game returns a GameRecord with positions, policies, and result."""
+    cfg = NetworkConfig(num_blocks=1, num_filters=16)
+    model = ChessNetwork(cfg)
+    model.eval()
+    mcts_cfg = MCTSConfig(num_simulations=10)
+    mcts = MCTS(model, mcts_cfg)
+    sp_cfg = SelfPlayConfig(max_moves=20, resign_threshold=-1.0)  # Never resign
+
+    record = play_game(mcts, sp_cfg)
+
+    assert isinstance(record, GameRecord)
+    assert len(record.planes) > 0
+    assert len(record.planes) == len(record.policies)
+    assert len(record.planes) == len(record.values)
+    assert record.planes[0].shape == (112, 8, 8)
+    assert record.policies[0].shape == (1858,)
+    assert record.values[0].shape == (3,)
+
+
+def test_play_game_wdl_labels():
+    """Game result assigns correct WDL labels."""
+    cfg = NetworkConfig(num_blocks=1, num_filters=16)
+    model = ChessNetwork(cfg)
+    model.eval()
+    mcts_cfg = MCTSConfig(num_simulations=10)
+    mcts = MCTS(model, mcts_cfg)
+    sp_cfg = SelfPlayConfig(max_moves=20, resign_threshold=-1.0)
+
+    record = play_game(mcts, sp_cfg)
+
+    for v in record.values:
+        np.testing.assert_allclose(v.sum(), 1.0, atol=1e-5)
+        assert (v >= 0).all()
+
+
+def test_play_game_max_moves():
+    """Game terminates when max_moves is reached."""
+    cfg = NetworkConfig(num_blocks=1, num_filters=16)
+    model = ChessNetwork(cfg)
+    model.eval()
+    mcts_cfg = MCTSConfig(num_simulations=5)
+    mcts = MCTS(model, mcts_cfg)
+    sp_cfg = SelfPlayConfig(max_moves=10, resign_threshold=-1.0)
+
+    record = play_game(mcts, sp_cfg)
+    assert len(record.planes) <= 10
+
+
+def test_training_loop_one_generation():
+    """Full RL loop: generate -> train -> checkpoint for 1 generation."""
+    from training.selfplay import training_loop
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        training_loop(
+            generations=1,
+            games_per_gen=2,
+            train_epochs=2,
+            batch_size=8,
+            num_simulations=10,
+            blocks=1,
+            filters=16,
+            output_dir=tmpdir,
+            device='cpu',
+            max_moves=20,
+            resign_threshold=-1.0,  # Never resign
+        )
+
+        # Verify checkpoint was saved
+        checkpoint_path = os.path.join(tmpdir, "checkpoints", "model_gen_1.pt")
+        assert os.path.exists(checkpoint_path)
+
+        # Verify training data was saved
+        data_path = os.path.join(tmpdir, "data", "gen_001.npz")
+        assert os.path.exists(data_path)
+
+
+# ── Integration Smoke Tests ──────────────────────────────────────────────────
+
+def test_selfplay_to_training_integration():
+    """End-to-end: self-play -> train -> verify loss is finite."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # 1. Create model
+        cfg = NetworkConfig(num_blocks=1, num_filters=16)
+        model = ChessNetwork(cfg)
+        model.eval()
+
+        # 2. Generate self-play data
+        mcts_cfg = MCTSConfig(num_simulations=10)
+        sp_cfg = SelfPlayConfig(max_moves=20, resign_threshold=-1.0)
+        data_path = os.path.join(tmpdir, "selfplay.npz")
+        num_positions = generate_games(
+            model, num_games=3, output_path=data_path,
+            mcts_config=mcts_cfg, selfplay_config=sp_cfg,
+        )
+        assert num_positions > 0
+
+        # 3. Load into ChessDataset
+        dataset = ChessDataset([data_path])
+        assert len(dataset) == num_positions
+        loader = DataLoader(dataset, batch_size=8, shuffle=True, drop_last=True)
+
+        # 4. Train for 2 epochs
+        optimizer = create_optimizer(model, lr=1e-3)
+        losses = []
+        for epoch in range(2):
+            for planes, policies, values in loader:
+                loss = train_step(model, optimizer, planes, policies, values)
+                losses.append(loss)
+
+        # Verify loss is finite and positive
+        assert len(losses) > 0
+        assert all(not np.isnan(l) for l in losses)
+        assert all(not np.isinf(l) for l in losses)
+        assert all(l > 0 for l in losses)
+
+
+def test_selfplay_npz_format():
+    """Self-play .npz has correct format for ChessDataset."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        cfg = NetworkConfig(num_blocks=1, num_filters=16)
+        model = ChessNetwork(cfg)
+        model.eval()
+
+        mcts_cfg = MCTSConfig(num_simulations=10)
+        sp_cfg = SelfPlayConfig(max_moves=15, resign_threshold=-1.0)
+        data_path = os.path.join(tmpdir, "test.npz")
+        generate_games(model, num_games=2, output_path=data_path,
+                       mcts_config=mcts_cfg, selfplay_config=sp_cfg)
+
+        with np.load(data_path) as data:
+            assert 'planes' in data
+            assert 'policies' in data
+            assert 'values' in data
+            n = data['planes'].shape[0]
+            assert data['planes'].shape == (n, 112, 8, 8)
+            assert data['policies'].shape == (n, 1858)
+            assert data['values'].shape == (n, 3)
+            # Policy targets should sum to ~1
+            np.testing.assert_allclose(
+                data['policies'].sum(axis=1), 1.0, atol=1e-5
+            )
+            # WDL targets should sum to 1
+            np.testing.assert_allclose(
+                data['values'].sum(axis=1), 1.0, atol=1e-5
+            )
+
+
+def test_selfplay_gpu():
+    """Self-play works on GPU."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        cfg = NetworkConfig(num_blocks=1, num_filters=16)
+        model = ChessNetwork(cfg).cuda()
+        model.eval()
+
+        mcts_cfg = MCTSConfig(num_simulations=10)
+        sp_cfg = SelfPlayConfig(max_moves=10, resign_threshold=-1.0)
+        data_path = os.path.join(tmpdir, "gpu_selfplay.npz")
+        num_positions = generate_games(
+            model, num_games=2, output_path=data_path,
+            mcts_config=mcts_cfg, selfplay_config=sp_cfg,
+            device='cuda',
+        )
+        assert num_positions > 0
