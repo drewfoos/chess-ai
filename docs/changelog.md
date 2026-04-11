@@ -8,6 +8,14 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 
 ## [Unreleased]
 
+Nothing yet.
+
+---
+
+## [0.2.0] - 2026-04-11
+
+**MCTS Search Engine — Plan 2 complete.** Merged via [PR #2](https://github.com/drewfoos/chess-ai/pull/2).
+
 ### Added
 - MCTS tree search: `Node` struct with visit count, value, prior, children (`src/mcts/node.h/cpp`)
 - MCTS search loop: select (PUCT) → expand → evaluate → backpropagate (`src/mcts/search.h/cpp`)
@@ -18,6 +26,10 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 - First Play Urgency (FPU) reduction at root and non-root nodes
 - CLI `search` command: `chess_engine search [fen] [iterations]`
 - MCTS test suite: 19 tests covering node operations, PUCT, search, and edge cases
+
+### Validated
+- Solves back rank mate, knight forks, Scholar's mate, free captures
+- Correctly handles checkmate, stalemate, single legal move positions
 
 ---
 
