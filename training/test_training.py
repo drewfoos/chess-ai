@@ -1,4 +1,5 @@
 import pytest
+from torch.utils.data import DataLoader
 from training.config import NetworkConfig
 from training.encoder import (
     move_to_index,
@@ -372,3 +373,64 @@ def test_export_torchscript_gpu():
 
         assert torch.allclose(orig_policy, loaded_policy, atol=1e-5)
         assert torch.allclose(orig_value, loaded_value, atol=1e-5)
+
+
+def test_end_to_end_pipeline():
+    """Full pipeline: generate data → train → export → verify."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # 1. Generate synthetic data
+        data_path = os.path.join(tmpdir, "train.npz")
+        generate_synthetic_data(data_path, num_positions=64)
+
+        # 2. Load into dataset
+        dataset = ChessDataset([data_path])
+        loader = DataLoader(dataset, batch_size=16, shuffle=True)
+
+        # 3. Create model (tiny for speed)
+        cfg = NetworkConfig(num_blocks=1, num_filters=16)
+        model = ChessNetwork(cfg)
+        optimizer = create_optimizer(model, lr=1e-3)
+
+        # 4. Train for a few steps
+        model.train()
+        losses = []
+        for planes, policies, values in loader:
+            loss = train_step(model, optimizer, planes, policies, values)
+            losses.append(loss)
+
+        assert len(losses) > 0
+        assert all(not np.isnan(l) for l in losses)
+
+        # 5. Export to TorchScript
+        export_path = os.path.join(tmpdir, "model.pt")
+        export_torchscript(model, export_path)
+        assert os.path.exists(export_path)
+
+        # 6. Load exported model and verify
+        loaded = torch.jit.load(export_path)
+        model.eval()
+        x = torch.randn(1, 112, 8, 8)
+        with torch.no_grad():
+            orig_p, orig_v = model(x)
+            load_p, load_v = loaded(x)
+        assert torch.allclose(orig_p, load_p, atol=1e-5)
+        assert torch.allclose(orig_v, load_v, atol=1e-5)
+
+
+def test_gpu_training():
+    """Verify training works on GPU."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+
+    cfg = NetworkConfig(num_blocks=2, num_filters=32)
+    model = ChessNetwork(cfg).cuda()
+    optimizer = create_optimizer(model)
+
+    planes = torch.randn(4, 112, 8, 8).cuda()
+    policies = torch.softmax(torch.randn(4, 1858), dim=1).cuda()
+    values = torch.zeros(4, 3).cuda()
+    values[:, 0] = 1.0
+
+    loss = train_step(model, optimizer, planes, policies, values)
+    assert loss > 0
+    assert not np.isnan(loss)

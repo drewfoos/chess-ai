@@ -94,10 +94,14 @@ Residual CNN with policy and value heads, trained on self-play data.
 
 ```
 training/
+├── config.py        NetworkConfig dataclass for model hyperparameters
+├── encoder.py       Position encoder (FEN → 112×8×8) and move index mapping
 ├── model.py         Network architecture (residual tower + SE + heads)
-├── dataset.py       Training data loading from .gz files
-├── train.py         Training loop (policy CE + value MSE loss)
-└── export.py        Export to TorchScript for C++ inference
+├── dataset.py       Training data loading from .npz files
+├── train.py         Training loop (policy CE + value CE loss (WDL))
+├── export.py        Export to TorchScript for C++ inference
+├── generate_data.py Synthetic data generator for pipeline testing
+└── test_training.py Training test suite (~32 tests)
 ```
 
 **Network architecture:**
@@ -113,7 +117,9 @@ Residual Tower: 10 blocks × (3×3 conv → BN → ReLU → 3×3 conv → BN →
   └── Value Head: 1×1 conv → BN → ReLU → flatten → FC 128 → ReLU → FC 3 → softmax (WDL)
 ```
 
-**Starting config:** 10 blocks, 128 filters (~1.5M params). Scale to 20 blocks, 256 filters after pipeline validation.
+**Starting config:** 10 blocks, 128 filters (~13M params). Scale to 20 blocks, 256 filters after pipeline validation.
+
+**Implementation status:** Complete. Network architecture, encoder, training loop, and TorchScript export all working. Uses synthetic data for validation; real self-play data comes in Plan 4.
 
 **Training data format (per position):**
 ```
@@ -221,7 +227,7 @@ Training pipeline ──→ Metrics file ──→ Flask server ──→ WebSoc
 │  2. TRAINING                                     │
 │     Load training data into PyTorch              │
 │     Sample batches from sliding window           │
-│     Minimize: policy CE + value MSE + L2 reg     │
+│     Minimize: policy CE + value CE + L2 reg      │
 │     Run 1000–2000 gradient steps                 │
 │              │                                   │
 │              ▼                                   │
@@ -256,10 +262,14 @@ chess-ai/
 │   ├── selfplay/               Game generation (Plan 4)
 │   └── main.cpp                CLI entry point
 ├── training/                   Python/PyTorch (Plan 3)
+│   ├── config.py
+│   ├── encoder.py
 │   ├── model.py
 │   ├── dataset.py
 │   ├── train.py
-│   └── export.py
+│   ├── export.py
+│   ├── generate_data.py
+│   └── test_training.py
 ├── visualization/              Dashboard (Plan 6)
 │   ├── server/
 │   └── client/

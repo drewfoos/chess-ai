@@ -69,4 +69,4 @@ if __name__ == '__main__':
     import os
     os.makedirs(os.path.dirname(args.output) or '.', exist_ok=True)
     generate_synthetic_data(args.output, args.num_positions)
-    print(f"Generated {args.num_positions} positions → {args.output}")
+    print(f"Generated {args.num_positions} positions -> {args.output}")

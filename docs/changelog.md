@@ -8,7 +8,16 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 
 ## [Unreleased]
 
-Nothing yet.
+### Added
+- Neural network architecture: residual tower with SE layers, policy and WDL value heads (`training/model.py`)
+- Position encoder: FEN → 112×8×8 tensor with board flipping for black (`training/encoder.py`)
+- Move encoder: 1858-dim policy index ↔ chess move mapping (`training/encoder.py`)
+- Training loop: policy cross-entropy + value cross-entropy + L2 regularization (`training/train.py`)
+- TorchScript export for C++ inference (`training/export.py`)
+- Synthetic data generator for pipeline testing (`training/generate_data.py`)
+- Chess training dataset loader for .npz files (`training/dataset.py`)
+- NetworkConfig dataclass for model hyperparameters (`training/config.py`)
+- Training test suite: ~30 tests covering encoding, model, training, export, end-to-end
 
 ---
 
