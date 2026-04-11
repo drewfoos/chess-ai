@@ -502,3 +502,29 @@ def test_encode_board_repetition_plane():
     planes = encode_board(board)
     # Repetition plane (index 12 within time step 0) should be 1
     assert planes[12].sum() == 64  # All ones = repetition detected
+
+
+from torch.optim.lr_scheduler import MultiStepLR
+
+
+def test_lr_scheduler_reduces_lr():
+    """MultiStepLR reduces learning rate at milestones."""
+    cfg = NetworkConfig(num_blocks=1, num_filters=16)
+    model = ChessNetwork(cfg)
+    optimizer = create_optimizer(model, lr=0.1)
+    scheduler = MultiStepLR(optimizer, milestones=[2, 4], gamma=0.1)
+
+    lrs = []
+    for epoch in range(6):
+        lrs.append(optimizer.param_groups[0]['lr'])
+        scheduler.step()
+
+    # Before milestone 2: lr = 0.1
+    assert abs(lrs[0] - 0.1) < 1e-6
+    assert abs(lrs[1] - 0.1) < 1e-6
+    # After milestone 2: lr = 0.01
+    assert abs(lrs[2] - 0.01) < 1e-6
+    assert abs(lrs[3] - 0.01) < 1e-6
+    # After milestone 4: lr = 0.001
+    assert abs(lrs[4] - 0.001) < 1e-6
+    assert abs(lrs[5] - 0.001) < 1e-6

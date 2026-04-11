@@ -17,6 +17,7 @@ import time
 import numpy as np
 import torch
 import torch.nn.functional as F
+from torch.optim.lr_scheduler import MultiStepLR
 from torch.utils.data import DataLoader
 
 from training.config import NetworkConfig
@@ -84,6 +85,8 @@ def train(
     batch_size: int = 256,
     lr: float = 1e-3,
     weight_decay: float = 1e-4,
+    lr_milestones: list[int] | None = None,
+    lr_gamma: float = 0.1,
     checkpoint_dir: str = 'checkpoints',
     device: str = 'auto',
 ):
@@ -105,10 +108,17 @@ def train(
 
     optimizer = create_optimizer(model, lr=lr, weight_decay=weight_decay)
 
+    scheduler = None
+    if lr_milestones:
+        scheduler = MultiStepLR(optimizer, milestones=lr_milestones, gamma=lr_gamma)
+        print(f"LR schedule: milestones={lr_milestones}, gamma={lr_gamma}")
+
     os.makedirs(checkpoint_dir, exist_ok=True)
 
     for epoch in range(epochs):
         epoch_loss = 0.0
+        epoch_policy_loss = 0.0
+        epoch_value_loss = 0.0
         num_batches = 0
         start = time.time()
 
@@ -117,13 +127,35 @@ def train(
             policies = policies.to(device)
             values = values.to(device)
 
-            loss = train_step(model, optimizer, planes, policies, values)
-            epoch_loss += loss
+            model.train()
+            optimizer.zero_grad()
+
+            policy_logits, value_logits = model(planes)
+            loss, p_loss, v_loss = compute_loss(
+                policy_logits, value_logits, policies, values
+            )
+
+            loss.backward()
+            optimizer.step()
+
+            epoch_loss += loss.item()
+            epoch_policy_loss += p_loss.item()
+            epoch_value_loss += v_loss.item()
             num_batches += 1
+
+        if scheduler:
+            scheduler.step()
 
         elapsed = time.time() - start
         avg_loss = epoch_loss / max(num_batches, 1)
-        print(f"Epoch {epoch + 1}/{epochs} | Loss: {avg_loss:.4f} | Time: {elapsed:.1f}s")
+        avg_p = epoch_policy_loss / max(num_batches, 1)
+        avg_v = epoch_value_loss / max(num_batches, 1)
+        current_lr = optimizer.param_groups[0]['lr']
+        print(
+            f"Epoch {epoch + 1}/{epochs} | "
+            f"Loss: {avg_loss:.4f} (policy: {avg_p:.4f}, value: {avg_v:.4f}) | "
+            f"LR: {current_lr:.6f} | Time: {elapsed:.1f}s"
+        )
 
         # Save checkpoint every 5 epochs
         if (epoch + 1) % 5 == 0 or epoch == epochs - 1:
