@@ -86,6 +86,8 @@ Result: visit distribution over root children → best move
 - Virtual loss: 1 (for multi-threaded search)
 - Dirichlet noise: alpha = 0.3, epsilon = 0.25 (root only)
 
+**Implementation status:** Complete with stub evaluator. Uses `RandomEvaluator` (uniform policy + material value) until neural network is available (Plan 3/5).
+
 ### 3. Neural Network & Training (Python/PyTorch) — Plan 3
 
 Residual CNN with policy and value heads, trained on self-play data.
