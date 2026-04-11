@@ -629,3 +629,57 @@ def test_lr_scheduler_reduces_lr():
     # After milestone 4: lr = 0.001
     assert abs(lrs[4] - 0.001) < 1e-6
     assert abs(lrs[5] - 0.001) < 1e-6
+
+
+# ── Self-Play Tests ──────────────────────────────────────────────────────────
+
+from training.selfplay import SelfPlayConfig, play_game, GameRecord
+
+
+def test_play_game_produces_record():
+    """play_game returns a GameRecord with positions, policies, and result."""
+    cfg = NetworkConfig(num_blocks=1, num_filters=16)
+    model = ChessNetwork(cfg)
+    model.eval()
+    mcts_cfg = MCTSConfig(num_simulations=10)
+    mcts = MCTS(model, mcts_cfg)
+    sp_cfg = SelfPlayConfig(max_moves=20, resign_threshold=-1.0)  # Never resign
+
+    record = play_game(mcts, sp_cfg)
+
+    assert isinstance(record, GameRecord)
+    assert len(record.planes) > 0
+    assert len(record.planes) == len(record.policies)
+    assert len(record.planes) == len(record.values)
+    assert record.planes[0].shape == (112, 8, 8)
+    assert record.policies[0].shape == (1858,)
+    assert record.values[0].shape == (3,)
+
+
+def test_play_game_wdl_labels():
+    """Game result assigns correct WDL labels."""
+    cfg = NetworkConfig(num_blocks=1, num_filters=16)
+    model = ChessNetwork(cfg)
+    model.eval()
+    mcts_cfg = MCTSConfig(num_simulations=10)
+    mcts = MCTS(model, mcts_cfg)
+    sp_cfg = SelfPlayConfig(max_moves=20, resign_threshold=-1.0)
+
+    record = play_game(mcts, sp_cfg)
+
+    for v in record.values:
+        np.testing.assert_allclose(v.sum(), 1.0, atol=1e-5)
+        assert (v >= 0).all()
+
+
+def test_play_game_max_moves():
+    """Game terminates when max_moves is reached."""
+    cfg = NetworkConfig(num_blocks=1, num_filters=16)
+    model = ChessNetwork(cfg)
+    model.eval()
+    mcts_cfg = MCTSConfig(num_simulations=5)
+    mcts = MCTS(model, mcts_cfg)
+    sp_cfg = SelfPlayConfig(max_moves=10, resign_threshold=-1.0)
+
+    record = play_game(mcts, sp_cfg)
+    assert len(record.planes) <= 10
