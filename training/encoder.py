@@ -121,3 +121,119 @@ def index_to_move(idx: int) -> tuple[int, int, str | None]:
         (from_sq, to_sq, promo) tuple.
     """
     return _IDX_TO_MOVE[idx]
+
+
+# Piece type indices (matching FEN chars)
+_PIECE_TO_PLANE = {'P': 0, 'N': 1, 'B': 2, 'R': 3, 'Q': 4, 'K': 5,
+                   'p': 0, 'n': 1, 'b': 2, 'r': 3, 'q': 4, 'k': 5}
+
+
+def _parse_fen(fen: str):
+    """Parse FEN string into components."""
+    parts = fen.split()
+    board_str = parts[0]
+    color = parts[1]
+    castling = parts[2] if len(parts) > 2 else '-'
+    ep = parts[3] if len(parts) > 3 else '-'
+    halfmove = int(parts[4]) if len(parts) > 4 else 0
+    fullmove = int(parts[5]) if len(parts) > 5 else 1
+    return board_str, color, castling, ep, halfmove, fullmove
+
+
+def _board_to_pieces(board_str: str):
+    """Parse FEN board string into a dict of {square: (color, piece_type)}."""
+    pieces = {}
+    rank = 7  # FEN starts from rank 8 (index 7)
+    file = 0
+    for ch in board_str:
+        if ch == '/':
+            rank -= 1
+            file = 0
+        elif ch.isdigit():
+            file += int(ch)
+        else:
+            sq = make_square(file, rank)
+            is_white = ch.isupper()
+            pieces[sq] = (is_white, _PIECE_TO_PLANE[ch])
+            file += 1
+    return pieces
+
+
+def encode_position(fen: str) -> np.ndarray:
+    """Encode a chess position as a 112×8×8 float32 tensor.
+
+    The board is always oriented from the side-to-move's perspective.
+    When Black is to move, the board is flipped vertically.
+
+    Plane layout (112 total):
+        0-12:   Time step 0 (current position) — 13 planes
+        13-25:  Time step 1 (repeated current) — 13 planes
+        ...     (8 time steps total, all identical without history)
+        104:    Color to move (1 = white, 0 = black)
+        105:    Total move count (normalized: fullmove / 200)
+        106:    Our kingside castling
+        107:    Our queenside castling
+        108:    Opponent kingside castling
+        109:    Opponent queenside castling
+        110:    Halfmove clock (normalized: halfmove / 100)
+        111:    All-ones bias plane
+
+    Each time step (13 planes):
+        0-5:    Our pieces (pawn, knight, bishop, rook, queen, king)
+        6-11:   Opponent pieces (pawn, knight, bishop, rook, queen, king)
+        12:     Repetition count (0 for now — no history tracking)
+    """
+    board_str, color, castling, ep, halfmove, fullmove = _parse_fen(fen)
+    pieces = _board_to_pieces(board_str)
+
+    is_white = (color == 'w')
+    planes = np.zeros((112, 8, 8), dtype=np.float32)
+
+    # Fill piece planes for one time step
+    step_planes = np.zeros((13, 8, 8), dtype=np.float32)
+
+    for sq, (piece_is_white, piece_type) in pieces.items():
+        # Flip square if black to move
+        actual_sq = sq if is_white else mirror_move(sq)
+        r, f = rank_of(actual_sq), file_of(actual_sq)
+
+        if piece_is_white == is_white:
+            # Our piece → planes 0-5
+            step_planes[piece_type, r, f] = 1.0
+        else:
+            # Opponent piece → planes 6-11
+            step_planes[6 + piece_type, r, f] = 1.0
+
+    # Plane 12: repetition count (0 for now)
+
+    # Copy to all 8 time steps (no history available)
+    for t in range(8):
+        planes[t * 13:(t + 1) * 13] = step_planes
+
+    # Constant planes (104-111)
+    # 104: color to move
+    if is_white:
+        planes[104] = 1.0
+
+    # 105: total move count (normalized)
+    planes[105] = fullmove / 200.0
+
+    # 106-109: castling rights (from side-to-move perspective)
+    if is_white:
+        if 'K' in castling: planes[106] = 1.0
+        if 'Q' in castling: planes[107] = 1.0
+        if 'k' in castling: planes[108] = 1.0
+        if 'q' in castling: planes[109] = 1.0
+    else:
+        if 'k' in castling: planes[106] = 1.0
+        if 'q' in castling: planes[107] = 1.0
+        if 'K' in castling: planes[108] = 1.0
+        if 'Q' in castling: planes[109] = 1.0
+
+    # 110: halfmove clock (normalized)
+    planes[110] = halfmove / 100.0
+
+    # 111: all-ones bias
+    planes[111] = 1.0
+
+    return planes

@@ -101,3 +101,77 @@ def test_mirror_move():
     assert mirror_move(0) == 56
     # H8(63) mirrored = H1(7)
     assert mirror_move(63) == 7
+
+
+import numpy as np
+from training.encoder import encode_position
+
+
+def test_encode_starting_position_shape():
+    planes = encode_position("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1")
+    assert planes.shape == (112, 8, 8)
+    assert planes.dtype == np.float32
+
+
+def test_encode_starting_position_white_pawns():
+    planes = encode_position("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1")
+    # White to move, so "our" pieces = white
+    # Plane 0 = our pawns. White pawns on rank 1 (index 1 in 0-indexed)
+    # In the tensor: planes[0] should have 1s on rank 1 (row index 1)
+    pawn_plane = planes[0]
+    assert pawn_plane.sum() == 8  # 8 white pawns
+    # All on rank 1
+    for file in range(8):
+        assert pawn_plane[1, file] == 1.0
+
+
+def test_encode_starting_position_opponent_pawns():
+    planes = encode_position("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1")
+    # Plane 6 = opponent pawns (black). Black pawns on rank 6
+    opp_pawn_plane = planes[6]
+    assert opp_pawn_plane.sum() == 8
+    for file in range(8):
+        assert opp_pawn_plane[6, file] == 1.0
+
+
+def test_encode_black_to_move_flips():
+    # Same position but black to move — board should be flipped
+    planes = encode_position("rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq - 0 1")
+    # Black to move: "our" pieces = black, board flipped vertically
+    # Black pawns were on rank 6, after flip they're on rank 1
+    our_pawn_plane = planes[0]
+    assert our_pawn_plane.sum() == 8
+    for file in range(8):
+        assert our_pawn_plane[1, file] == 1.0
+
+
+def test_encode_castling_planes():
+    planes = encode_position("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1")
+    # Constant planes start at index 104
+    # Plane 106 = our kingside castling (K for white) → all 1s
+    assert planes[106].sum() == 64  # All 1s
+    # Plane 107 = our queenside castling (Q for white) → all 1s
+    assert planes[107].sum() == 64
+
+
+def test_encode_no_castling():
+    planes = encode_position("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w - - 0 1")
+    # No castling rights → planes 106-109 all zeros
+    for i in range(106, 110):
+        assert planes[i].sum() == 0
+
+
+def test_encode_color_plane():
+    # White to move: color plane (104) = all 1s
+    planes_w = encode_position("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1")
+    assert planes_w[104].sum() == 64
+
+    # Black to move: color plane (104) = all 0s
+    planes_b = encode_position("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR b KQkq - 0 1")
+    assert planes_b[104].sum() == 0
+
+
+def test_encode_bias_plane():
+    planes = encode_position("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1")
+    # Plane 111 = all-ones bias
+    assert planes[111].sum() == 64
