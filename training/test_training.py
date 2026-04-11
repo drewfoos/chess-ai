@@ -633,7 +633,7 @@ def test_lr_scheduler_reduces_lr():
 
 # ── Self-Play Tests ──────────────────────────────────────────────────────────
 
-from training.selfplay import SelfPlayConfig, play_game, GameRecord
+from training.selfplay import SelfPlayConfig, play_game, GameRecord, generate_games
 
 
 def test_play_game_produces_record():
@@ -711,3 +711,95 @@ def test_training_loop_one_generation():
         # Verify training data was saved
         data_path = os.path.join(tmpdir, "data", "gen_001.npz")
         assert os.path.exists(data_path)
+
+
+# ── Integration Smoke Tests ──────────────────────────────────────────────────
+
+def test_selfplay_to_training_integration():
+    """End-to-end: self-play -> train -> verify loss is finite."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # 1. Create model
+        cfg = NetworkConfig(num_blocks=1, num_filters=16)
+        model = ChessNetwork(cfg)
+        model.eval()
+
+        # 2. Generate self-play data
+        mcts_cfg = MCTSConfig(num_simulations=10)
+        sp_cfg = SelfPlayConfig(max_moves=20, resign_threshold=-1.0)
+        data_path = os.path.join(tmpdir, "selfplay.npz")
+        num_positions = generate_games(
+            model, num_games=3, output_path=data_path,
+            mcts_config=mcts_cfg, selfplay_config=sp_cfg,
+        )
+        assert num_positions > 0
+
+        # 3. Load into ChessDataset
+        dataset = ChessDataset([data_path])
+        assert len(dataset) == num_positions
+        loader = DataLoader(dataset, batch_size=8, shuffle=True, drop_last=True)
+
+        # 4. Train for 2 epochs
+        optimizer = create_optimizer(model, lr=1e-3)
+        losses = []
+        for epoch in range(2):
+            for planes, policies, values in loader:
+                loss = train_step(model, optimizer, planes, policies, values)
+                losses.append(loss)
+
+        # Verify loss is finite and positive
+        assert len(losses) > 0
+        assert all(not np.isnan(l) for l in losses)
+        assert all(not np.isinf(l) for l in losses)
+        assert all(l > 0 for l in losses)
+
+
+def test_selfplay_npz_format():
+    """Self-play .npz has correct format for ChessDataset."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        cfg = NetworkConfig(num_blocks=1, num_filters=16)
+        model = ChessNetwork(cfg)
+        model.eval()
+
+        mcts_cfg = MCTSConfig(num_simulations=10)
+        sp_cfg = SelfPlayConfig(max_moves=15, resign_threshold=-1.0)
+        data_path = os.path.join(tmpdir, "test.npz")
+        generate_games(model, num_games=2, output_path=data_path,
+                       mcts_config=mcts_cfg, selfplay_config=sp_cfg)
+
+        with np.load(data_path) as data:
+            assert 'planes' in data
+            assert 'policies' in data
+            assert 'values' in data
+            n = data['planes'].shape[0]
+            assert data['planes'].shape == (n, 112, 8, 8)
+            assert data['policies'].shape == (n, 1858)
+            assert data['values'].shape == (n, 3)
+            # Policy targets should sum to ~1
+            np.testing.assert_allclose(
+                data['policies'].sum(axis=1), 1.0, atol=1e-5
+            )
+            # WDL targets should sum to 1
+            np.testing.assert_allclose(
+                data['values'].sum(axis=1), 1.0, atol=1e-5
+            )
+
+
+def test_selfplay_gpu():
+    """Self-play works on GPU."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        cfg = NetworkConfig(num_blocks=1, num_filters=16)
+        model = ChessNetwork(cfg).cuda()
+        model.eval()
+
+        mcts_cfg = MCTSConfig(num_simulations=10)
+        sp_cfg = SelfPlayConfig(max_moves=10, resign_threshold=-1.0)
+        data_path = os.path.join(tmpdir, "gpu_selfplay.npz")
+        num_positions = generate_games(
+            model, num_games=2, output_path=data_path,
+            mcts_config=mcts_cfg, selfplay_config=sp_cfg,
+            device='cuda',
+        )
+        assert num_positions > 0
