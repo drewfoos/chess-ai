@@ -439,3 +439,66 @@ def test_gpu_training():
     loss = train_step(model, optimizer, planes, policies, values)
     assert loss > 0
     assert not np.isnan(loss)
+
+
+import chess
+from training.encoder import encode_board
+
+
+def test_encode_board_shape():
+    """encode_board produces the correct tensor shape."""
+    board = chess.Board()
+    planes = encode_board(board)
+    assert planes.shape == (112, 8, 8)
+    assert planes.dtype == np.float32
+
+
+def test_encode_board_starting_matches_fen():
+    """Starting position via encode_board matches encode_position for time step 0."""
+    board = chess.Board()
+    from_board = encode_board(board)
+    from_fen = encode_position(board.fen())
+    # All 8 time steps are identical (no history) so entire tensor matches
+    np.testing.assert_array_equal(from_board, from_fen)
+
+
+def test_encode_board_history_differs():
+    """After moves, earlier time steps show different positions."""
+    board = chess.Board()
+    board.push_san("e4")
+    board.push_san("e5")
+    board.push_san("Nf3")
+    planes = encode_board(board)
+    # Time step 0 (current: after 1.e4 e5 2.Nf3) differs from
+    # time step 1 (position after 1.e4 e5)
+    step0 = planes[0:13]
+    step1 = planes[13:26]
+    assert not np.array_equal(step0, step1)
+
+
+def test_encode_board_black_to_move_flips():
+    """Board is flipped when Black is to move."""
+    board = chess.Board()
+    board.push_san("e4")  # Now Black to move
+    planes = encode_board(board)
+    # Color plane (104) should be 0 (Black to move)
+    assert planes[104].sum() == 0
+    # "Our" pawns (plane 0) should be Black's pawns, flipped to rank 1
+    our_pawns = planes[0]
+    assert our_pawns.sum() == 8
+    for file in range(8):
+        assert our_pawns[1, file] == 1.0
+
+
+def test_encode_board_repetition_plane():
+    """Repetition plane is set when position repeats."""
+    board = chess.Board()
+    # Play moves that repeat: Nf3 Nf6 Ng1 Ng8 (back to start)
+    board.push_san("Nf3")
+    board.push_san("Nf6")
+    board.push_san("Ng1")
+    board.push_san("Ng8")
+    # Now the starting position has occurred twice
+    planes = encode_board(board)
+    # Repetition plane (index 12 within time step 0) should be 1
+    assert planes[12].sum() == 64  # All ones = repetition detected
