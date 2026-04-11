@@ -504,6 +504,107 @@ def test_encode_board_repetition_plane():
     assert planes[12].sum() == 64  # All ones = repetition detected
 
 
+from training.mcts import Node, MCTS, MCTSConfig, chess_move_to_policy_index
+
+
+def test_node_initial_state():
+    """New node has zero visits and no children."""
+    node = Node(prior=0.5)
+    assert node.visit_count == 0
+    assert node.total_value == 0.0
+    assert node.prior == 0.5
+    assert len(node.children) == 0
+
+
+def test_node_value():
+    """Node value is average of backpropagated values."""
+    node = Node(prior=0.1)
+    node.visit_count = 4
+    node.total_value = 2.0
+    assert node.value() == 0.5
+
+
+def test_node_puct_prefers_high_prior():
+    """PUCT formula prefers unvisited children with higher prior."""
+    parent = Node(prior=1.0)
+    parent.visit_count = 10
+    child_high = Node(prior=0.9)
+    child_low = Node(prior=0.1)
+    parent.children = {chess.Move.from_uci("e2e4"): child_high,
+                       chess.Move.from_uci("a2a3"): child_low}
+    c_puct = 2.5
+    score_high = child_high.puct_score(parent.visit_count, c_puct)
+    score_low = child_low.puct_score(parent.visit_count, c_puct)
+    assert score_high > score_low
+
+
+def test_mcts_returns_legal_move():
+    """MCTS search returns a legal move from the starting position."""
+    cfg = NetworkConfig(num_blocks=1, num_filters=16)
+    model = ChessNetwork(cfg)
+    model.eval()
+    mcts_cfg = MCTSConfig(num_simulations=20)
+    mcts = MCTS(model, mcts_cfg)
+    board = chess.Board()
+    result = mcts.search(board)
+    assert result.best_move in board.legal_moves
+
+
+def test_mcts_policy_target_shape():
+    """Search result includes a 1858-dim policy target."""
+    cfg = NetworkConfig(num_blocks=1, num_filters=16)
+    model = ChessNetwork(cfg)
+    model.eval()
+    mcts_cfg = MCTSConfig(num_simulations=20)
+    mcts = MCTS(model, mcts_cfg)
+    board = chess.Board()
+    result = mcts.search(board)
+    assert result.policy_target.shape == (1858,)
+    np.testing.assert_allclose(result.policy_target.sum(), 1.0, atol=1e-5)
+
+
+def test_mcts_policy_target_only_legal():
+    """Policy target has nonzero values only for legal moves."""
+    cfg = NetworkConfig(num_blocks=1, num_filters=16)
+    model = ChessNetwork(cfg)
+    model.eval()
+    mcts_cfg = MCTSConfig(num_simulations=50)
+    mcts = MCTS(model, mcts_cfg)
+    board = chess.Board()
+    result = mcts.search(board)
+    legal_indices = set()
+    for move in board.legal_moves:
+        idx = chess_move_to_policy_index(move, board.turn)
+        if idx is not None:
+            legal_indices.add(idx)
+    for i in range(1858):
+        if result.policy_target[i] > 0:
+            assert i in legal_indices, f"Nonzero policy at index {i} but not legal"
+
+
+def test_mcts_terminal_position():
+    """MCTS handles checkmate position without crashing."""
+    cfg = NetworkConfig(num_blocks=1, num_filters=16)
+    model = ChessNetwork(cfg)
+    model.eval()
+    mcts_cfg = MCTSConfig(num_simulations=10)
+    mcts = MCTS(model, mcts_cfg)
+    board = chess.Board("rnbqkbnr/pppp1ppp/4p3/8/6P1/5P2/PPPPP2P/RNBQKBNR b KQkq - 0 2")
+    board.push_san("Qh4#")
+    assert board.is_checkmate()
+    result = mcts.search(board)
+    assert result.best_move is None
+
+
+def test_chess_move_to_policy_index_roundtrip():
+    """chess_move_to_policy_index produces valid indices that roundtrip."""
+    board = chess.Board()
+    for move in board.legal_moves:
+        idx = chess_move_to_policy_index(move, board.turn)
+        assert idx is not None, f"Move {move} has no policy index"
+        assert 0 <= idx < 1858
+
+
 from torch.optim.lr_scheduler import MultiStepLR
 
 
