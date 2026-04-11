@@ -8,7 +8,16 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 
 ## [Unreleased]
 
-Nothing yet.
+### Added
+- MCTS tree search: `Node` struct with visit count, value, prior, children (`src/mcts/node.h/cpp`)
+- MCTS search loop: select (PUCT) → expand → evaluate → backpropagate (`src/mcts/search.h/cpp`)
+- `Evaluator` interface for pluggable position evaluation
+- `RandomEvaluator`: uniform policy + material-based value (stub for neural network)
+- Dirichlet noise at root for exploration diversity
+- Temperature-based move selection for self-play
+- First Play Urgency (FPU) reduction at root and non-root nodes
+- CLI `search` command: `chess_engine search [fen] [iterations]`
+- MCTS test suite: 19 tests covering node operations, PUCT, search, and edge cases
 
 ---
 
