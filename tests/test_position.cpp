@@ -1,4 +1,156 @@
 #include <gtest/gtest.h>
 #include "core/position.h"
+#include "core/attacks.h"
 
-TEST(Position, Placeholder) { EXPECT_TRUE(true); }
+class PositionTest : public ::testing::Test {
+protected:
+    void SetUp() override { attacks::init(); }
+};
+
+TEST_F(PositionTest, StartingPositionFEN) {
+    Position pos;
+    pos.set_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+    EXPECT_EQ(pos.side_to_move(), WHITE);
+    EXPECT_EQ(pos.castling_rights(), ALL_CASTLING);
+    EXPECT_EQ(pos.ep_square(), NO_SQUARE);
+    EXPECT_EQ(pos.halfmove_clock(), 0);
+    EXPECT_EQ(pos.fullmove_number(), 1);
+    EXPECT_EQ(pos.piece_on(E1), KING);
+    EXPECT_EQ(pos.color_on(E1), WHITE);
+    EXPECT_EQ(pos.piece_on(E8), KING);
+    EXPECT_EQ(pos.color_on(E8), BLACK);
+    EXPECT_EQ(pos.piece_on(A2), PAWN);
+    EXPECT_EQ(pos.piece_on(D8), QUEEN);
+    EXPECT_EQ(pos.piece_on(E4), NO_PIECE_TYPE);
+}
+
+TEST_F(PositionTest, FENRoundTrip) {
+    const char* fens[] = {
+        "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+        "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1",
+        "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+        "8/8/8/8/8/8/8/4K2k w - - 0 1",
+        "r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1",
+    };
+    Position pos;
+    for (const char* fen : fens) {
+        pos.set_fen(fen);
+        EXPECT_EQ(pos.to_fen(), std::string(fen)) << "Failed roundtrip for: " << fen;
+    }
+}
+
+TEST_F(PositionTest, PieceBitboards) {
+    Position pos;
+    pos.set_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+    Bitboard wp = pos.pieces(WHITE, PAWN);
+    EXPECT_EQ(wp, RANK_BB[1]);
+    Bitboard bp = pos.pieces(BLACK, PAWN);
+    EXPECT_EQ(bp, RANK_BB[6]);
+    EXPECT_EQ(popcount(pos.occupied()), 32);
+    EXPECT_EQ(popcount(pos.occupied(WHITE)), 16);
+    EXPECT_EQ(popcount(pos.occupied(BLACK)), 16);
+}
+
+TEST_F(PositionTest, IsSquareAttacked) {
+    Position pos;
+    pos.set_fen("rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq - 0 1");
+    EXPECT_TRUE(pos.is_attacked(D5, WHITE));
+    EXPECT_TRUE(pos.is_attacked(F5, WHITE));
+    EXPECT_FALSE(pos.is_attacked(E5, WHITE));
+}
+
+TEST_F(PositionTest, InCheck) {
+    Position pos;
+    pos.set_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+    EXPECT_FALSE(pos.in_check());
+    pos.set_fen("4k3/8/8/8/8/8/8/4R2K b - - 0 1");
+    EXPECT_TRUE(pos.in_check());
+}
+
+TEST_F(PositionTest, MakeUnmakeSimple) {
+    Position pos;
+    pos.set_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+    std::string original_fen = pos.to_fen();
+
+    UndoInfo undo;
+    Move m(E2, E4, FLAG_DOUBLE_PUSH);
+    pos.make_move(m, undo);
+
+    EXPECT_EQ(pos.piece_on(E4), PAWN);
+    EXPECT_EQ(pos.piece_on(E2), NO_PIECE_TYPE);
+    EXPECT_EQ(pos.side_to_move(), BLACK);
+    EXPECT_EQ(pos.ep_square(), E3);
+
+    pos.unmake_move(m, undo);
+    EXPECT_EQ(pos.to_fen(), original_fen);
+}
+
+TEST_F(PositionTest, MakeUnmakeCapture) {
+    Position pos;
+    pos.set_fen("rnbqkbnr/ppp1pppp/8/3p4/4P3/8/PPPP1PPP/RNBQKBNR w KQkq d6 0 2");
+    std::string original_fen = pos.to_fen();
+
+    UndoInfo undo;
+    Move m(E4, D5, FLAG_CAPTURE);
+    pos.make_move(m, undo);
+
+    EXPECT_EQ(pos.piece_on(D5), PAWN);
+    EXPECT_EQ(pos.color_on(D5), WHITE);
+    EXPECT_EQ(pos.piece_on(E4), NO_PIECE_TYPE);
+
+    pos.unmake_move(m, undo);
+    EXPECT_EQ(pos.to_fen(), original_fen);
+}
+
+TEST_F(PositionTest, MakeUnmakeCastling) {
+    Position pos;
+    pos.set_fen("r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1");
+    std::string original_fen = pos.to_fen();
+
+    UndoInfo undo;
+    Move m(E1, G1, FLAG_KING_CASTLE);
+    pos.make_move(m, undo);
+
+    EXPECT_EQ(pos.piece_on(G1), KING);
+    EXPECT_EQ(pos.piece_on(F1), ROOK);
+    EXPECT_EQ(pos.piece_on(E1), NO_PIECE_TYPE);
+    EXPECT_EQ(pos.piece_on(H1), NO_PIECE_TYPE);
+
+    pos.unmake_move(m, undo);
+    EXPECT_EQ(pos.to_fen(), original_fen);
+}
+
+TEST_F(PositionTest, MakeUnmakeEnPassant) {
+    Position pos;
+    pos.set_fen("rnbqkbnr/ppppp1pp/8/4Pp2/8/8/PPPP1PPP/RNBQKBNR w KQkq f6 0 3");
+    std::string original_fen = pos.to_fen();
+
+    UndoInfo undo;
+    Move m(E5, F6, FLAG_EP_CAPTURE);
+    pos.make_move(m, undo);
+
+    EXPECT_EQ(pos.piece_on(F6), PAWN);
+    EXPECT_EQ(pos.color_on(F6), WHITE);
+    EXPECT_EQ(pos.piece_on(F5), NO_PIECE_TYPE); // captured pawn gone
+    EXPECT_EQ(pos.piece_on(E5), NO_PIECE_TYPE);
+
+    pos.unmake_move(m, undo);
+    EXPECT_EQ(pos.to_fen(), original_fen);
+}
+
+TEST_F(PositionTest, MakeUnmakePromotion) {
+    Position pos;
+    pos.set_fen("8/P7/8/8/8/8/8/4K2k w - - 0 1");
+    std::string original_fen = pos.to_fen();
+
+    UndoInfo undo;
+    Move m(A7, A8, FLAG_PROMO_QUEEN);
+    pos.make_move(m, undo);
+
+    EXPECT_EQ(pos.piece_on(A8), QUEEN);
+    EXPECT_EQ(pos.color_on(A8), WHITE);
+    EXPECT_EQ(pos.piece_on(A7), NO_PIECE_TYPE);
+
+    pos.unmake_move(m, undo);
+    EXPECT_EQ(pos.to_fen(), original_fen);
+}
