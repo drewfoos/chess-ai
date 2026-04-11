@@ -281,3 +281,45 @@ def test_chess_dataset_multiple_files():
 
         dataset = ChessDataset([path1, path2])
         assert len(dataset) == 25
+
+
+from training.train import train_step, create_optimizer
+
+
+def test_train_step_reduces_loss():
+    cfg = NetworkConfig(num_blocks=2, num_filters=32)
+    model = ChessNetwork(cfg)
+    optimizer = create_optimizer(model)
+
+    # Create a batch of synthetic data
+    batch_size = 8
+    planes = torch.randn(batch_size, 112, 8, 8)
+    policies = torch.softmax(torch.randn(batch_size, 1858), dim=1)
+    values = torch.zeros(batch_size, 3)
+    values[:, 0] = 1.0  # All wins
+
+    # Run multiple steps and check loss decreases
+    losses = []
+    for _ in range(10):
+        loss = train_step(model, optimizer, planes, policies, values)
+        losses.append(loss)
+
+    # Loss should decrease over 10 steps
+    assert losses[-1] < losses[0]
+
+
+def test_train_step_loss_components():
+    cfg = NetworkConfig(num_blocks=2, num_filters=32)
+    model = ChessNetwork(cfg)
+    optimizer = create_optimizer(model)
+
+    planes = torch.randn(4, 112, 8, 8)
+    policies = torch.softmax(torch.randn(4, 1858), dim=1)
+    values = torch.zeros(4, 3)
+    values[:, 1] = 1.0  # All draws
+
+    loss = train_step(model, optimizer, planes, policies, values)
+    # Loss should be a positive number
+    assert loss > 0
+    assert not np.isnan(loss)
+    assert not np.isinf(loss)
