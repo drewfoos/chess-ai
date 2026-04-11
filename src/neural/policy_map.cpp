@@ -37,10 +37,8 @@ static uint32_t make_key(int from_sq, int to_sq, int promo_code) {
 }
 
 static std::unordered_map<uint32_t, int>& get_table() {
-    static std::unordered_map<uint32_t, int> table;
-    static bool initialized = false;
-    if (!initialized) {
-        initialized = true;
+    static std::unordered_map<uint32_t, int> table = []() {
+        std::unordered_map<uint32_t, int> t;
         int idx = 0;
         for (int from_sq = 0; from_sq < 64; ++from_sq) {
             int f = from_sq & 7;
@@ -55,7 +53,7 @@ static std::unordered_map<uint32_t, int>& get_table() {
                     int nr = r + dr * dist;
                     if (nf >= 0 && nf < 8 && nr >= 0 && nr < 8) {
                         int to_sq = nr * 8 + nf;
-                        table[make_key(from_sq, to_sq, 0)] = idx;
+                        t[make_key(from_sq, to_sq, 0)] = idx;
                         ++idx;
                     }
                 }
@@ -67,7 +65,7 @@ static std::unordered_map<uint32_t, int>& get_table() {
                 int nr = r + KNIGHT_DELTAS[k][1];
                 if (nf >= 0 && nf < 8 && nr >= 0 && nr < 8) {
                     int to_sq = nr * 8 + nf;
-                    table[make_key(from_sq, to_sq, 0)] = idx;
+                    t[make_key(from_sq, to_sq, 0)] = idx;
                     ++idx;
                 }
             }
@@ -81,15 +79,20 @@ static std::unordered_map<uint32_t, int>& get_table() {
                         int to_sq = nr * 8 + nf;
                         for (int piece_idx = 0; piece_idx < 3; ++piece_idx) {
                             int promo_code = int(PROMO_PIECES[piece_idx]);  // 1=N, 2=B, 3=R
-                            table[make_key(from_sq, to_sq, promo_code)] = idx;
+                            t[make_key(from_sq, to_sq, promo_code)] = idx;
                             ++idx;
                         }
                     }
                 }
             }
         }
-    }
+        return t;
+    }();
     return table;
+}
+
+int policy_table_size() {
+    return static_cast<int>(get_table().size());
 }
 
 int move_to_policy_index(Square from_sq, Square to_sq, PieceType promo) {

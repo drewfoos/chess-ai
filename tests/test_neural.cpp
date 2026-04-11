@@ -49,6 +49,10 @@ TEST_F(NeuralTest, PolicyMap_TotalSize) {
     EXPECT_EQ(neural::POLICY_SIZE, 1858);
 }
 
+TEST_F(NeuralTest, PolicyMap_RuntimeTableSize) {
+    EXPECT_EQ(neural::policy_table_size(), 1858);
+}
+
 TEST_F(NeuralTest, PolicyMap_MoveOverload_White) {
     Move m(E2, E4, FLAG_DOUBLE_PUSH);
     EXPECT_EQ(neural::move_to_policy_index(m, WHITE), 304);

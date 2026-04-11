@@ -14,4 +14,7 @@ int move_to_policy_index(Square from_sq, Square to_sq, PieceType promo);
 // High-level: extracts from/to/promo from Move, mirrors for Black.
 int move_to_policy_index(Move move, Color side_to_move);
 
+// Returns the number of entries in the runtime policy lookup table.
+int policy_table_size();
+
 } // namespace neural
