@@ -128,38 +128,48 @@ policy_target:  float[1858]         MCTS visit distribution (normalized)
 value_target:   float[3]            Game result as WDL: [P(win), P(draw), P(loss)]
 ```
 
-### 4. Self-Play Pipeline (C++) — Plan 4
+### 4. Self-Play & Data Pipeline (Python) — Plan 4
 
-Generates training games using MCTS + current network.
+Generates training games using Python MCTS + PyTorch model directly. Written entirely in Python to prove the RL loop before optimizing in C++ (Plan 5).
 
 ```
-src/selfplay/
-├── game.h/cpp       Self-play game loop (MCTS per move, temperature sampling)
-└── data.h/cpp       Training data serialization (protobuf or binary)
+training/
+├── mcts.py         Python MCTS: Node, PUCT, search, move-to-policy bridge
+├── selfplay.py     Self-play game generation + full RL training loop
+├── encoder.py      (modified) Added encode_board() with 8-step history
+├── model.py        (modified) Value head returns raw logits
+├── train.py        (modified) log_softmax loss, LR scheduler, split logging
+└── export.py       (modified) Softmax wrapper for TorchScript export
 ```
 
 **Data flow:**
 ```
-Current network weights
+Current PyTorch model
   ↓
-Self-play game loop:
-  Position → MCTS (800 nodes) → move selection (with temperature)
-  Record: (position encoding, MCTS visit distribution, side to move)
+Self-play game loop (python-chess + MCTS):
+  Position → encode_board() → model → (policy, value)
+  MCTS search (N simulations) → move selection (with temperature)
+  Record: (encoded position, visit distribution, side to move)
   ↓
-Game result: +1 / 0 / -1
+Game result: W/D/L
   ↓
-Label all positions with result
+Label all positions with WDL
   ↓
-Write training data to .gz file
+Save training data to .npz
+  ↓
+Train on sliding window of recent generations
+  ↓
+Export TorchScript → loop back
 ```
 
-**Temperature schedule:**
-- Moves 1–30: τ = 1.0 (diverse openings)
-- After move 30: τ = 0.1 (near-greedy for quality)
+**Key design decisions:**
+- Python-only (no C++ needed) — uses python-chess for move generation
+- Single-position inference (no batching) — simple, correct, fast enough for validation
+- Small network (2 blocks, 32 filters) for development speed (~10-30s per game)
+- Value head returns raw logits for numerical stability (softmax applied at inference/export)
+- En passant not encoded as separate input plane (matches Lc0; inferable from position history)
 
-**Throughput target (RTX 3080):**
-- 10b/128f network, 800 nodes/move: ~5–10 games/minute
-- ~7,200 games/day → ~576,000 training positions/day
+**Implementation status:** Complete. Full RL loop running: self-play → train → export → repeat.
 
 ### 5. C++ Neural Net Inference — Plan 5
 

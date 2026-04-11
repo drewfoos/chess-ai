@@ -12,6 +12,32 @@ Nothing yet.
 
 ---
 
+## [0.4.0] - 2026-04-11
+
+**Self-Play & Data Pipeline — Plan 4 complete.**
+
+### Added
+- Python MCTS implementation: PUCT selection, Dirichlet noise, temperature selection (`training/mcts.py`)
+- Self-play game generation: temperature schedule, resign logic, WDL labeling (`training/selfplay.py`)
+- Full RL training loop: generate -> train -> export -> repeat with sliding window (`training/selfplay.py`)
+- Position history encoding: `encode_board()` fills 8 time steps from move stack (`training/encoder.py`)
+- Move bridge: `chess_move_to_policy_index()` maps python-chess moves to 1858-dim encoding
+- LR scheduling: `MultiStepLR` support in training loop
+- CLI: `python -m training.selfplay generate` and `python -m training.selfplay loop`
+- Integration tests: self-play -> train end-to-end, GPU self-play
+
+### Changed
+- Value head returns raw logits (previously applied softmax in model)
+- Value loss uses `log_softmax` for numerical stability (previously `log(softmax + eps)`)
+- `compute_loss` returns `(total, policy, value)` tuple for split loss logging
+- TorchScript export applies softmax wrapper for value head
+- Training loop logs policy and value loss separately
+
+### Dependencies
+- Added: `python-chess` for self-play move generation
+
+---
+
 ## [0.3.0] - 2026-04-11
 
 **Neural Network & Training Pipeline — Plan 3 complete.**
