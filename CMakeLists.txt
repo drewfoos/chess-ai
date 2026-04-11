@@ -10,6 +10,7 @@ add_library(chess_core
     src/core/attacks.cpp
     src/core/position.cpp
     src/core/movegen.cpp
+    src/mcts/node.cpp
 )
 target_include_directories(chess_core PUBLIC src)
 
@@ -34,6 +35,7 @@ if(BUILD_TESTS)
         tests/test_position.cpp
         tests/test_movegen.cpp
         tests/test_perft.cpp
+        tests/test_mcts.cpp
     )
     target_link_libraries(chess_tests PRIVATE chess_core GTest::gtest_main)
     include(GoogleTest)
