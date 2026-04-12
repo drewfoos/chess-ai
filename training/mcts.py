@@ -39,6 +39,7 @@ class MCTSConfig:
     uncertainty_weight: float = 0.15  # exploration bonus from value variance (0 = disabled)
     variance_scaling: bool = True     # scale c_puct by parent value variance
     contempt: float = 0.0        # draw aversion: positive = prefer wins over draws
+    sibling_blending: bool = True  # Use sibling values for first-visit FPU (Ceres-style)
 
 
 @dataclass
@@ -59,7 +60,7 @@ class Node:
     __slots__ = ['prior', 'visit_count', 'total_value', 'children', 'terminal_status', 'pending_evals', 'sum_sq_value']
 
     def __init__(self, prior: float):
-        self.prior = prior
+        self.prior = np.float16(prior)
         self.visit_count = 0
         self.total_value = 0.0
         self.children: dict[chess.Move, 'Node'] = {}
@@ -81,7 +82,7 @@ class Node:
 
     def puct_score(self, parent_visits: int, c_puct: float) -> float:
         """PUCT score using pre-computed dynamic c_puct."""
-        exploration = c_puct * self.prior * math.sqrt(parent_visits) / (1 + self.visit_count)
+        exploration = c_puct * float(self.prior) * math.sqrt(parent_visits) / (1 + self.visit_count)
         return self.value() + exploration
 
     def is_expanded(self) -> bool:
@@ -309,15 +310,19 @@ class MCTS:
         return [(policy_probs[i], float(values[i])) for i in range(len(boards))]
 
     def _expand(self, node: Node, board: chess.Board, policy: np.ndarray):
+        moves_with_priors = []
         for move in board.legal_moves:
             idx = chess_move_to_policy_index(move, board.turn)
             prior = policy[idx] if idx is not None else 1e-6
-            node.children[move] = Node(prior=prior)
+            moves_with_priors.append((move, prior))
 
-        total_prior = sum(child.prior for child in node.children.values())
-        if total_prior > 0:
-            for child in node.children.values():
-                child.prior /= total_prior
+        # Sort by prior descending for cache locality in _select_child
+        moves_with_priors.sort(key=lambda x: x[1], reverse=True)
+
+        total_prior = sum(p for _, p in moves_with_priors)
+        for move, prior in moves_with_priors:
+            normalized = prior / total_prior if total_prior > 0 else 1e-6
+            node.children[move] = Node(prior=normalized)
 
     def _dynamic_cpuct(self, parent_visits: int) -> float:
         """Compute dynamic c_puct that grows with parent visit count."""
@@ -325,6 +330,18 @@ class MCTS:
         return cfg.c_puct_init + cfg.c_puct_factor * math.log(
             (parent_visits + cfg.c_puct_base) / cfg.c_puct_base
         )
+
+    def _sibling_fpu(self, node: Node, target_prior: float) -> float | None:
+        """Compute blended value from visited siblings with similar priors."""
+        if not self.config.sibling_blending:
+            return None
+        values = []
+        for child in node.children.values():
+            if child.visit_count > 0 and abs(float(child.prior) - target_prior) < 0.10:
+                values.append(child.value())
+        if values:
+            return sum(values) / len(values)
+        return None
 
     def _select_child(self, node: Node, is_root: bool = False) -> tuple[chess.Move, 'Node']:
         best_score = -float('inf')
@@ -350,7 +367,9 @@ class MCTS:
                 continue
 
             if child.visit_count == 0:
-                score = fpu_value + c_puct * child.prior * math.sqrt(node.visit_count)
+                sibling_val = self._sibling_fpu(node, float(child.prior))
+                effective_fpu = sibling_val if sibling_val is not None else fpu_value
+                score = effective_fpu + c_puct * float(child.prior) * math.sqrt(node.visit_count)
             else:
                 score = child.puct_score(node.visit_count, c_puct)
                 if self.config.uncertainty_weight > 0:
@@ -379,7 +398,7 @@ class MCTS:
             noise = np.random.dirichlet([self.config.dirichlet_alpha] * n)
         else:
             # KataGo-style: concentrate noise on plausible moves
-            priors = np.array([c.prior for c in root.children.values()])
+            priors = np.array([float(c.prior) for c in root.children.values()])
             log_priors = np.log(priors + 1e-8)
             threshold = log_priors.max() - 2.0  # moves within ~7x of best
             weights = np.ones_like(log_priors) * 0.5
@@ -390,7 +409,7 @@ class MCTS:
             noise = np.random.dirichlet(np.maximum(scaled_alpha, 0.01))
 
         for i, child in enumerate(root.children.values()):
-            child.prior = (1 - eps) * child.prior + eps * noise[i]
+            child.prior = np.float16((1 - eps) * float(child.prior) + eps * noise[i])
 
     def _terminal_value(self, board: chess.Board) -> float:
         if board.is_checkmate():

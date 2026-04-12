@@ -25,6 +25,11 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 - Smart pruning: stops MCTS early when best move has insurmountable visit lead (factor 1.33)
 - Opening randomization: 5% of games play 2-8 random legal moves from starting position for diversity
 - Auxiliary soft policy target (KataGo-style): raises search distribution to power 1/T (T=4), weighted 2x, forces network to learn about non-obvious moves
+- Temperature decay schedule: smooth decay with 0.4 floor (replaces hard cutoff)
+- Badgame split: forks games when temperature causes blunders, replays with greedy play
+- Sibling blending (Ceres): uses visited sibling values for first-visit FPU
+- Policy edge sorting: children sorted by prior descending for cache locality
+- Prior compression: Node priors stored as float16 (halves per-node memory)
 - `python -m training` shortcut for launching the training loop with sensible defaults
 
 ### Changed
