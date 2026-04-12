@@ -21,9 +21,11 @@ cmake_test_discovery_*.json
 CMakeSettings.json
 compile_commands.json
 
-# Claude
+# Claude / superpowers / personal notes
 .claude/
 CLAUDE.md
+brainstorm.md
+docs/superpowers/
 
 # Python
 __pycache__/

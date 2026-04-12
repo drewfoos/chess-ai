@@ -17,7 +17,7 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 - `pyproject.toml` enables TensorRT by default via `cmake.args = ["-DENABLE_TENSORRT=ON", ...]`; opt out with `pip install -e . --config-settings=cmake.define.ENABLE_TENSORRT=OFF`
 - `training/__init__.py` simplified to a one-line `import chess_mcts` safeguard (DLL registration is now the package's own responsibility)
 - `.gitignore` adds `_skbuild/` and `*.pyd`
-- `CLAUDE.md` build section documents `pip install -e .` as the primary Python workflow; `build.ps1` remains the C++-only / `ctest` path
+- README + architecture docs document `pip install -e .` as the primary Python workflow; `build.ps1` remains the C++-only / `ctest` path
 
 ### Added — TensorRT Inference Backend
 - `training/export.py::export_onnx()` emits opset-18 ONNX with `dynamic_axes={'input':{0:'batch'},...}` via the classic tracer (`dynamo=False`) — the dynamo exporter bakes batch=1 into Gemm shapes even when dynamic axes are requested
