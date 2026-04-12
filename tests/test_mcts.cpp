@@ -27,7 +27,7 @@ TEST_F(MCTSTest, NodeConstructionWithPrior) {
     Move m(E2, E4, FLAG_DOUBLE_PUSH);
     mcts::Node node(m, 0.35f);
     EXPECT_EQ(node.visit_count(), 0);
-    EXPECT_FLOAT_EQ(node.prior(), 0.35f);
+    EXPECT_NEAR(node.prior(), 0.35f, 0.002f);
     EXPECT_EQ(node.move(), m);
     EXPECT_TRUE(node.is_leaf());
 }
@@ -41,7 +41,7 @@ TEST_F(MCTSTest, AddChildren) {
     EXPECT_FALSE(root.is_leaf());
     EXPECT_EQ(root.num_children(), 3);
     EXPECT_EQ(root.child(0)->move(), Move(E2, E4, FLAG_DOUBLE_PUSH));
-    EXPECT_FLOAT_EQ(root.child(0)->prior(), 0.4f);
+    EXPECT_NEAR(root.child(0)->prior(), 0.4f, 0.002f);
     EXPECT_EQ(root.child(0)->parent(), &root);
 }
 
@@ -366,4 +366,73 @@ TEST_F(MCTSTest, SearchVisitCountsConsistency) {
         total += v;
     }
     EXPECT_EQ(total, params.num_iterations);
+}
+
+TEST_F(MCTSTest, Float16RoundTrip) {
+    // Test float16 conversion round-trip
+    float values[] = {0.0f, 0.5f, 1.0f, 0.001f, 0.99f, -0.5f};
+    for (float v : values) {
+        uint16_t h = mcts::Node::float_to_half(v);
+        float back = mcts::Node::half_to_float(h);
+        EXPECT_NEAR(back, v, 0.002f) << "Round-trip failed for " << v;
+    }
+}
+
+TEST_F(MCTSTest, NodePriorFloat16) {
+    // Prior stored as float16 should still be usable
+    Move m(E2, E4, FLAG_DOUBLE_PUSH);
+    mcts::Node node(m, 0.35f);
+    EXPECT_NEAR(node.prior(), 0.35f, 0.002f);
+    node.set_prior(0.75f);
+    EXPECT_NEAR(node.prior(), 0.75f, 0.002f);
+}
+
+TEST_F(MCTSTest, VirtualLossApplyRevert) {
+    mcts::Node node(Move(E2, E4, FLAG_DOUBLE_PUSH), 0.5f);
+    node.update(0.6f);
+    EXPECT_EQ(node.visit_count(), 1);
+    EXPECT_EQ(node.pending_evals(), 0);
+
+    node.apply_virtual_loss();
+    EXPECT_EQ(node.visit_count(), 2);
+    EXPECT_EQ(node.pending_evals(), 1);
+
+    node.revert_virtual_loss();
+    EXPECT_EQ(node.visit_count(), 1);
+    EXPECT_EQ(node.pending_evals(), 0);
+}
+
+TEST_F(MCTSTest, ValueVariance) {
+    mcts::Node node(Move(E2, E4, FLAG_DOUBLE_PUSH), 0.5f);
+    // < 2 visits -> 0 variance
+    EXPECT_FLOAT_EQ(node.value_variance(), 0.0f);
+    node.update(0.6f);
+    EXPECT_FLOAT_EQ(node.value_variance(), 0.0f);
+
+    // After update(0.6): visit=1, total=0.6, sum_sq=0.36
+    node.update(0.4f);  // visit=2, total=1.0, sum_sq=0.52
+    // mean=0.5, mean_sq=0.26, var=0.26-0.25=0.01
+    EXPECT_NEAR(node.value_variance(), 0.01f, 1e-5f);
+}
+
+TEST_F(MCTSTest, TerminalStatus) {
+    mcts::Node node;
+    EXPECT_EQ(node.terminal_status(), 0);
+    node.set_terminal_status(1);  // proven loss
+    EXPECT_EQ(node.terminal_status(), 1);
+    node.set_terminal_status(-1); // proven win
+    EXPECT_EQ(node.terminal_status(), -1);
+    node.set_terminal_status(2);  // proven draw
+    EXPECT_EQ(node.terminal_status(), 2);
+}
+
+TEST_F(MCTSTest, SortChildrenByPrior) {
+    mcts::Node root;
+    root.add_child(Move(E2, E4, FLAG_DOUBLE_PUSH), 0.2f);
+    root.add_child(Move(D2, D4, FLAG_DOUBLE_PUSH), 0.5f);
+    root.add_child(Move(G1, F3, FLAG_QUIET), 0.3f);
+    root.sort_children_by_prior();
+    EXPECT_NEAR(root.child(0)->prior(), 0.5f, 0.002f);
+    EXPECT_NEAR(root.child(1)->prior(), 0.3f, 0.002f);
+    EXPECT_NEAR(root.child(2)->prior(), 0.2f, 0.002f);
 }

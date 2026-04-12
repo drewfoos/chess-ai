@@ -4,9 +4,9 @@
 
 namespace mcts {
 
-Node::Node() : move_(Move::none()), prior_(0.0f), parent_(nullptr) {}
+Node::Node() : move_(Move::none()), prior_bits_(0), parent_(nullptr) {}
 
-Node::Node(Move move, float prior) : move_(move), prior_(prior), parent_(nullptr) {}
+Node::Node(Move move, float prior) : move_(move), prior_bits_(float_to_half(prior)), parent_(nullptr) {}
 
 void Node::add_child(Move move, float prior) {
     auto child = std::make_unique<Node>(move, prior);
@@ -17,6 +17,7 @@ void Node::add_child(Move move, float prior) {
 void Node::update(float value) {
     visit_count_++;
     total_value_ += value;
+    sum_sq_value_ += value * value;
 }
 
 Node* Node::select_child(float c_puct, float fpu_value) const {
@@ -30,7 +31,7 @@ Node* Node::select_child(float c_puct, float fpu_value) const {
 
     for (const auto& child : children_) {
         float q = child->visit_count_ > 0 ? child->mean_value() : fpu_value;
-        float u = c_puct * child->prior_ * sqrt_parent / (1.0f + child->visit_count_);
+        float u = c_puct * child->prior() * sqrt_parent / (1.0f + child->visit_count_);
         float score = q + u;
 
         if (score > best_score) {
