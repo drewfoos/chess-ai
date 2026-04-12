@@ -416,6 +416,9 @@ def generate_games(
         mcts = CppMCTS(model_path, mcts_config, device)
         print(f"  Using C++ MCTS engine ({device})")
     else:
+        if not HAS_CPP_MCTS:
+            print("  Warning: C++ MCTS not available, using slower Python MCTS. "
+                  "Build with -DBUILD_PYTHON=ON -DENABLE_NEURAL=ON for 50-100x speedup.")
         model = model.to(device)
         model.eval()
         mcts = MCTS(model, mcts_config, device=device)
@@ -565,22 +568,18 @@ def training_loop(
         play_model = swa_model if (swa_model is not None and gen > 1) else model
         play_model.eval()
 
-        # Export TorchScript model for C++ MCTS (if available)
+        # Export TorchScript model for C++ MCTS (always export so C++ engine can use it)
         # Always export from the base model (SWA wrapper lacks .config)
-        cpp_model_path = None
-        if HAS_CPP_MCTS:
-            from training.export import export_torchscript
-            cpp_model_path = os.path.join(checkpoint_dir, 'selfplay_model.pt')
-            export_model = model if swa_model is None else model
-            if swa_model is not None and gen > 1:
-                # Copy SWA params into base model temporarily for export
-                swa_state = swa_model.module.state_dict()
-                orig_state = model.state_dict()
-                model.load_state_dict(swa_state)
-                export_torchscript(model, cpp_model_path, device=device)
-                model.load_state_dict(orig_state)
-            else:
-                export_torchscript(model, cpp_model_path, device=device)
+        cpp_model_path = os.path.join(checkpoint_dir, 'selfplay_model.pt')
+        if swa_model is not None and gen > 1:
+            # Copy SWA params into base model temporarily for export
+            swa_state = swa_model.module.state_dict()
+            orig_state = model.state_dict()
+            model.load_state_dict(swa_state)
+            export_torchscript(model, cpp_model_path, device=device)
+            model.load_state_dict(orig_state)
+        else:
+            export_torchscript(model, cpp_model_path, device=device)
 
         num_positions = generate_games(
             play_model, gen_games, data_path,
