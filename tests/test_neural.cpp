@@ -324,4 +324,23 @@ TEST_F(NeuralTest, NeuralEval_DifferentPositions) {
     EXPECT_NE(r1.value, r2.value);
 }
 
+TEST_F(NeuralTest, Integration_MCTSWithNeural) {
+    neural::NeuralEvaluator eval(TEST_MODEL, "cpu");
+    mcts::SearchParams params;
+    params.num_iterations = 50;
+    params.add_noise = false;
+
+    mcts::Search search(eval, params);
+    Position pos;
+    pos.set_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+    auto result = search.run(pos);
+
+    EXPECT_FALSE(result.best_move.is_none());
+    int total_visits = 0;
+    for (int v : result.visit_counts) total_visits += v;
+    EXPECT_EQ(total_visits, 50);
+    EXPECT_GE(result.root_value, -1.0f);
+    EXPECT_LE(result.root_value, 1.0f);
+}
+
 #endif // HAS_LIBTORCH
