@@ -4,6 +4,9 @@
 #include "core/position.h"
 #include "core/movegen.h"
 #include "mcts/search.h"
+#ifdef HAS_LIBTORCH
+#include "neural/neural_evaluator.h"
+#endif
 #include <iostream>
 #include <string>
 #include <cstdlib>
@@ -40,18 +43,7 @@ static void divide(Position& pos, int depth) {
     std::cout << "\nTotal: " << total << "\n";
 }
 
-static void search_position(const std::string& fen, int iterations) {
-    Position pos;
-    pos.set_fen(fen);
-
-    mcts::RandomEvaluator eval;
-    mcts::SearchParams params;
-    params.num_iterations = iterations;
-    params.add_noise = false;
-
-    mcts::Search search(eval, params);
-    mcts::SearchResult result = search.run(pos);
-
+static void display_search_result(const Position& pos, const mcts::SearchResult& result, int iterations) {
     if (result.best_move.is_none()) {
         std::cout << "No legal moves (";
         if (pos.in_check()) std::cout << "checkmate";
@@ -87,6 +79,20 @@ static void search_position(const std::string& fen, int iterations) {
     }
 }
 
+static void search_position(const std::string& fen, int iterations) {
+    Position pos;
+    pos.set_fen(fen);
+
+    mcts::RandomEvaluator eval;
+    mcts::SearchParams params;
+    params.num_iterations = iterations;
+    params.add_noise = false;
+
+    mcts::Search search(eval, params);
+    mcts::SearchResult result = search.run(pos);
+    display_search_result(pos, result, iterations);
+}
+
 int main(int argc, char* argv[]) {
     attacks::init();
 
@@ -94,6 +100,9 @@ int main(int argc, char* argv[]) {
         std::cout << "Usage:\n";
         std::cout << "  chess_engine perft <depth> [fen]\n";
         std::cout << "  chess_engine search [fen] [iterations]\n";
+#ifdef HAS_LIBTORCH
+        std::cout << "  chess_engine search_nn <model_path> [fen] [iterations] [device]\n";
+#endif
         return 1;
     }
 
@@ -115,6 +124,32 @@ int main(int argc, char* argv[]) {
             : "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
         int iterations = (argc >= 4) ? std::atoi(argv[3]) : 800;
         search_position(fen, iterations);
+#ifdef HAS_LIBTORCH
+    } else if (command == "search_nn") {
+        if (argc < 3) {
+            std::cerr << "Usage: chess_engine search_nn <model_path> [fen] [iterations] [device]\n";
+            return 1;
+        }
+        std::string model_path = argv[2];
+        std::string fen = (argc >= 4) ? argv[3]
+            : "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
+        int iterations = (argc >= 5) ? std::atoi(argv[4]) : 800;
+        std::string device = (argc >= 6) ? argv[5] : "cpu";
+
+        Position pos;
+        pos.set_fen(fen);
+
+        neural::NeuralEvaluator eval(model_path, device);
+        mcts::SearchParams params;
+        params.num_iterations = iterations;
+        params.add_noise = false;
+
+        mcts::Search search(eval, params);
+        mcts::SearchResult result = search.run(pos);
+
+        std::cout << "Model: " << model_path << " (device: " << device << ")\n";
+        display_search_result(pos, result, iterations);
+#endif
     } else {
         std::cerr << "Unknown command: " << command << "\n";
         return 1;

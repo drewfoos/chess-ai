@@ -12,6 +12,19 @@ Nothing yet.
 
 ---
 
+## [0.5.0] - 2026-04-11
+
+### Added
+- C++ position encoder: converts Position to 112×8×8 float32 tensor (matches Python encoder exactly)
+- C++ policy map: move-to-policy-index mapping for 1858-dim neural network output
+- NeuralEvaluator: loads TorchScript models via LibTorch, implements Evaluator interface for MCTS
+- `search_nn` CLI command: MCTS search using neural network evaluation
+- Optional `ENABLE_NEURAL` CMake integration for LibTorch dependency
+- Cross-validation script for verifying C++/Python encoder parity
+- MCTS + neural network integration test
+
+---
+
 ## [0.4.0] - 2026-04-11
 
 **Self-Play & Data Pipeline — Plan 4 complete.**

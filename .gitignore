@@ -1,7 +1,9 @@
 # Build
 build/
+build_*/
 out/
 cmake-build-*/
+cmake_test_discovery_*.json
 *.obj
 *.exe
 *.pdb

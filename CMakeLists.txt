@@ -12,6 +12,8 @@ add_library(chess_core
     src/core/movegen.cpp
     src/mcts/node.cpp
     src/mcts/search.cpp
+    src/neural/policy_map.cpp
+    src/neural/encoder.cpp
 )
 target_include_directories(chess_core PUBLIC src)
 
@@ -37,8 +39,39 @@ if(BUILD_TESTS)
         tests/test_movegen.cpp
         tests/test_perft.cpp
         tests/test_mcts.cpp
+        tests/test_neural.cpp
     )
     target_link_libraries(chess_tests PRIVATE chess_core GTest::gtest_main)
     include(GoogleTest)
-    gtest_discover_tests(chess_tests)
+    gtest_discover_tests(chess_tests WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+endif()
+
+# Neural network support (optional — requires LibTorch)
+option(ENABLE_NEURAL "Build neural network evaluator (requires LibTorch)" OFF)
+
+if(ENABLE_NEURAL)
+    find_package(Torch REQUIRED)
+
+    add_library(chess_neural
+        src/neural/neural_evaluator.cpp
+    )
+    target_include_directories(chess_neural PUBLIC src)
+    target_link_libraries(chess_neural PUBLIC chess_core ${TORCH_LIBRARIES})
+    target_compile_definitions(chess_neural PUBLIC HAS_LIBTORCH)
+
+    target_link_libraries(chess_engine PRIVATE chess_neural)
+    target_compile_definitions(chess_engine PRIVATE HAS_LIBTORCH)
+
+    if(BUILD_TESTS)
+        target_link_libraries(chess_tests PRIVATE chess_neural)
+        target_compile_definitions(chess_tests PRIVATE HAS_LIBTORCH)
+    endif()
+
+    # Copy DLLs on Windows
+    if(MSVC)
+        file(GLOB TORCH_DLLS "${TORCH_INSTALL_PREFIX}/lib/*.dll")
+        add_custom_command(TARGET chess_engine POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            ${TORCH_DLLS} $<TARGET_FILE_DIR:chess_engine>)
+    endif()
 endif()

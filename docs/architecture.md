@@ -177,29 +177,32 @@ Loads trained network into C++ for use during MCTS and self-play.
 
 ```
 src/neural/
-├── encoder.h/cpp    Position → input tensor (112 × 8 × 8)
-└── network.h/cpp    TorchScript model loading, batch inference
+├── encoder.h/cpp           Position → input tensor (112 × 8 × 8)
+├── policy_map.h/cpp        Move → policy index mapping (1858-dim)
+└── neural_evaluator.h/cpp  TorchScript model loading, Evaluator interface
 ```
 
 **Data flow:**
 ```
 Position → Encoder → float[112][8][8] tensor
   ↓
-Batch of tensors → TorchScript model → GPU inference
+TorchScript model → single-position inference
   ↓
 Policy logits[1858] → mask illegal moves → softmax → move probabilities
-Value output[3] → WDL probabilities → v = P(win) - P(loss)
+Value output[3] → WDL → v = P(win) - P(loss) ∈ [-1, +1]
 ```
 
-**Batch inference architecture (multi-threaded):**
-```
-MCTS Thread 1 ──┐
-MCTS Thread 2 ──┼── Batch Queue ──→ GPU Thread ──→ TorchScript ──→ Results
-MCTS Thread 3 ──┤
-MCTS Thread 4 ──┘
-```
+**Implementation status:** Complete. Three components bridge the Python training pipeline and C++ MCTS:
 
-Batch size: 64–256 for GPU efficiency on RTX 3080.
+1. **Position Encoder** (`encoder.h`): Converts a `Position` to a 112×8×8 float32 tensor matching the Python encoder. 8 time steps (duplicated current position — no history in C++ MCTS), 13 planes per step (6 own + 6 opponent + repetition), 8 constant planes (color, move count, castling, halfmove, bias). Board flipped for Black to move.
+
+2. **Policy Map** (`policy_map.h`): Maps chess moves to indices in the 1858-dim policy vector. Replicates the Leela Chess Zero encoding: 56 queen-like + 8 knight + 9 underpromotion per source square. Handles Black mirroring and promotion flag extraction.
+
+3. **NeuralEvaluator** (`neural_evaluator.h`): Implements the `Evaluator` interface from `mcts/search.h`. Loads TorchScript models via LibTorch, runs single-position inference, extracts WDL value (win - loss → [-1, +1]), applies softmax over legal move logits for policy output. Supports CPU and CUDA devices.
+
+**Build:** Optional via `-DENABLE_NEURAL=ON -DCMAKE_PREFIX_PATH=<torch_cmake_path>`. Requires LibTorch (included in PyTorch installation).
+
+**CLI:** `chess_engine search_nn <model_path> [fen] [iterations] [device]`
 
 ### 6. Visualization Dashboard — Plan 6
 
