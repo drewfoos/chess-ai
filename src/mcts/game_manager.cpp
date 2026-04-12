@@ -3,6 +3,7 @@
 #include "mcts/game_manager.h"
 #include "core/movegen.h"
 #include "core/bitboard.h"
+#include "core/move_parser.h"
 #include <numeric>
 #include <random>
 #include <algorithm>
@@ -18,39 +19,6 @@ static void revert_virtual_loss_path(const std::vector<Node*>& path_nodes) {
     for (Node* n : path_nodes) {
         n->revert_virtual_loss();
     }
-}
-
-// Helper: parse a UCI move string against a position
-static Move parse_uci_move_internal(const Position& pos, const std::string& uci) {
-    if (uci.size() < 4 || uci.size() > 5) {
-        throw std::runtime_error("Invalid UCI move format: " + uci);
-    }
-
-    int from = (uci[0] - 'a') + (uci[1] - '1') * 8;
-    int to   = (uci[2] - 'a') + (uci[3] - '1') * 8;
-
-    PieceType promo = NO_PIECE_TYPE;
-    if (uci.size() == 5) {
-        switch (uci[4]) {
-            case 'q': promo = QUEEN;  break;
-            case 'r': promo = ROOK;   break;
-            case 'b': promo = BISHOP; break;
-            case 'n': promo = KNIGHT; break;
-            default:
-                throw std::runtime_error("Invalid promotion piece in UCI move: " + uci);
-        }
-    }
-
-    Move moves[MAX_MOVES];
-    int n = generate_legal_moves(pos, moves);
-    for (int i = 0; i < n; i++) {
-        if (moves[i].from() == Square(from) && moves[i].to() == Square(to)) {
-            if (promo == NO_PIECE_TYPE || moves[i].promo_piece() == promo) {
-                return moves[i];
-            }
-        }
-    }
-    throw std::runtime_error("Illegal move: " + uci);
 }
 
 GameManager::GameManager(neural::NeuralEvaluator& evaluator, const SearchParams& params)
@@ -105,7 +73,7 @@ void GameManager::init_games_from_fen(const std::vector<std::string>& fens,
         // Replay move history if provided
         if (i < static_cast<int>(move_histories.size())) {
             for (const auto& uci_str : move_histories[i]) {
-                Move m = parse_uci_move_internal(pos, uci_str);
+                Move m = parse_uci_move(pos, uci_str);
                 UndoInfo undo;
                 pos.make_move(m, undo);
                 history.push(pos);
