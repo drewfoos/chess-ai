@@ -13,6 +13,8 @@ namespace mcts {
 
 class NodePool;  // Forward declaration
 
+static_assert(sizeof(uint16_t) == 2, "uint16_t must be 2 bytes");
+
 struct Edge {
     uint16_t move_bits = 0;   // Raw Move data
     uint16_t prior_bits = 0;  // FP16 prior
@@ -21,6 +23,7 @@ struct Edge {
     float prior() const;      // Defined after Node (uses half_to_float)
     void set_prior(float p);  // Defined after Node (uses float_to_half)
 };
+static_assert(sizeof(Edge) == 4, "Edge must be 4 bytes for memory efficiency");
 
 class Node {
 public:
@@ -72,16 +75,17 @@ public:
     // Modification
     void update(float value);
 
-    // Selection
-    Node* select_child(float c_puct, float fpu_value) const;
-    Move best_move() const;
-
     // For backward compat — sets the node's own prior
     void set_prior(float p) { prior_bits_ = float_to_half(p); }
 
     // Pool management
     bool pool_managed() const { return pool_managed_; }
     void set_pool_managed(bool v) { pool_managed_ = v; }
+
+    // Selection — NOTE: may return nullptr for unvisited edges.
+    // Real search code uses select_child_advanced() + ensure_child() instead.
+    Node* select_child(float c_puct, float fpu_value) const;
+    Move best_move() const;
 
     // Float16 conversion helpers (public for testing)
     static uint16_t float_to_half(float value) {
@@ -112,7 +116,13 @@ public:
         float f; std::memcpy(&f, &bits, sizeof(f)); return f;
     }
 
-    // Reset node to initial state (for pool reuse)
+private:
+    friend class NodePool;  // NodePool needs access to reset()
+
+    // Reset node to initial state — only for pool reuse.
+    // Frees edge/child_nodes arrays but does NOT delete child Node objects
+    // (assumes pool owns them). Do not call on heap-allocated nodes with
+    // heap-allocated children — use the destructor instead.
     void reset() {
         move_ = Move::none();
         prior_bits_ = 0;
@@ -134,7 +144,6 @@ public:
         pool_managed_ = false;
     }
 
-private:
     Move move_;
     uint16_t prior_bits_ = 0;
 
