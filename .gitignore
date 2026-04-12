@@ -52,6 +52,9 @@ dashboard-*.png
 # Environment / secrets
 .env
 
+# Lichess bot (cloned external repo)
+lichess-bot/
+
 # OS
 Thumbs.db
 Desktop.ini
