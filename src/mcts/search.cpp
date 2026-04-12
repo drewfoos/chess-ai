@@ -59,6 +59,9 @@ EvalResult RandomEvaluator::evaluate(const Position& pos, const Move* moves, int
 Search::Search(Evaluator& evaluator, const SearchParams& params)
     : evaluator_(evaluator), params_(params), cache_(params.nn_cache_size) {}
 
+void Search::set_stop_flag(std::atomic<bool>* stop) { stop_flag_ = stop; }
+void Search::set_info_callback(InfoCallback cb) { info_callback_ = std::move(cb); }
+
 float Search::dynamic_cpuct(int parent_visits) const {
     return params_.c_puct_init + params_.c_puct_factor * std::log(
         (parent_visits + params_.c_puct_base) / params_.c_puct_base
@@ -526,6 +529,10 @@ SearchResult Search::run(const neural::PositionHistory& history) {
     int batch_size = std::max(1, params_.batch_size);
 
     while (sims_done < params_.num_iterations) {
+        if (stop_flag_ && stop_flag_->load(std::memory_order_relaxed)) {
+            break;
+        }
+
         // Smart pruning check
         if (params_.smart_pruning && root->num_children() >= 2 && sims_done > batch_size) {
             int remaining = params_.num_iterations - sims_done;
@@ -591,6 +598,15 @@ SearchResult Search::run(const neural::PositionHistory& history) {
         }
 
         sims_done += gather_count;
+
+        if (info_callback_ && root->num_children() > 0) {
+            SearchInfo sinfo;
+            sinfo.iterations = sims_done;
+            sinfo.total_nodes = root->visit_count();
+            sinfo.root_value = root->mean_value();
+            sinfo.best_move = root->best_move();
+            info_callback_(sinfo);
+        }
 
         // Check if root is resolved
         if (root->terminal_status() != 0) break;

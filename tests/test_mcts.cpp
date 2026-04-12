@@ -10,6 +10,7 @@
 #include "neural/policy_map.h"
 #include <numeric>
 #include <cmath>
+#include <atomic>
 
 class MCTSTest : public ::testing::Test {
 protected:
@@ -425,6 +426,41 @@ TEST_F(MCTSTest, ValueVariance) {
     node.update(0.4f);  // visit=2, total=1.0, sum_sq=0.52
     // mean=0.5, mean_sq=0.26, var=0.26-0.25=0.01
     EXPECT_NEAR(node.value_variance(), 0.01f, 1e-5f);
+}
+
+TEST_F(MCTSTest, StopFlagTerminatesSearchEarly) {
+    std::atomic<bool> stop{true};
+    mcts::SearchParams params;
+    params.num_iterations = 10000;
+    params.add_noise = false;
+    mcts::RandomEvaluator eval;
+    mcts::Search search(eval, params);
+    search.set_stop_flag(&stop);
+
+    Position pos;
+    pos.set_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+    auto result = search.run(pos);
+    EXPECT_LT(result.total_nodes, 100);
+}
+
+TEST_F(MCTSTest, InfoCallbackFired) {
+    int callback_count = 0;
+    mcts::SearchParams params;
+    params.num_iterations = 100;
+    params.batch_size = 8;
+    params.add_noise = false;
+    mcts::RandomEvaluator eval;
+    mcts::Search search(eval, params);
+    search.set_info_callback([&](const mcts::SearchInfo& info) {
+        callback_count++;
+        EXPECT_GT(info.iterations, 0);
+        EXPECT_FALSE(info.best_move.is_none());
+    });
+
+    Position pos;
+    pos.set_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+    search.run(pos);
+    EXPECT_GT(callback_count, 0);
 }
 
 TEST_F(MCTSTest, TerminalStatus) {

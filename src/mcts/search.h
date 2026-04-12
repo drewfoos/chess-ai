@@ -8,6 +8,8 @@
 #include <vector>
 #include <array>
 #include <memory>
+#include <atomic>
+#include <functional>
 
 namespace mcts {
 
@@ -73,6 +75,15 @@ struct SearchResult {
     float raw_value = 0.0f;                                       // NN value before MCTS
 };
 
+struct SearchInfo {
+    int iterations;       // Simulations completed
+    int total_nodes;      // Nodes in tree
+    float root_value;     // Current root value [-1, +1]
+    Move best_move;       // Current best move
+};
+
+using InfoCallback = std::function<void(const SearchInfo&)>;
+
 class Search {
 public:
     Search(Evaluator& evaluator, const SearchParams& params = SearchParams{});
@@ -88,7 +99,12 @@ public:
     // temperature → 0: greedy (pick most visited)
     static Move select_move_with_temperature(const SearchResult& result, float temperature);
 
+    void set_stop_flag(std::atomic<bool>* stop);
+    void set_info_callback(InfoCallback cb);
+
 private:
+    std::atomic<bool>* stop_flag_ = nullptr;
+    InfoCallback info_callback_;
     Evaluator& evaluator_;
     SearchParams params_;
     NNCache cache_;
