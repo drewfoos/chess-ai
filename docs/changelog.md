@@ -8,6 +8,10 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 
 ## [Unreleased]
 
+### Fixed — Tiered Network Schedule Persistence
+- `training_loop()` now persists `network_schedule` in each checkpoint dict; on resume (including auto-resume) the schedule is restored from the checkpoint if the caller didn't pass one — prevents silently dropping the scale-up plan on restart
+- New `--network-schedule "1:6:64,20:10:128"` CLI flag for `python -m training loop` (parses comma-separated `gen_start:blocks:filters` tiers)
+
 ### Changed — Python Packaging via scikit-build-core
 - New `pyproject.toml` at repo root wires the project to the `scikit_build_core.build` backend; `pip install -e .` now produces a proper editable site-packages install of `chess_mcts` with auto-rebuild on C++ source change
 - Compiled pybind11 extension renamed `chess_mcts` → `chess_mcts._core` (i.e. the `.pyd` now lives *inside* the Python package); user-facing API is unchanged — `import chess_mcts` still re-exports `SearchEngine`, `GameManager`, `SearchResult`, `encode_packed`

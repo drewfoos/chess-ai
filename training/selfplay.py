@@ -984,6 +984,13 @@ def training_loop(
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         except (ValueError, KeyError) as e:
             print(f"  Optimizer state could not be restored ({e}); continuing with fresh optimizer.")
+        # Restore tier schedule from checkpoint if caller didn't override it.
+        # Lets auto-resume preserve the original run's scale-up plan instead
+        # of silently dropping it (which would pin the net at the small tier).
+        saved_schedule = checkpoint.get('network_schedule')
+        if network_schedule is None and saved_schedule:
+            network_schedule = [tuple(t) for t in saved_schedule]
+            print(f"  Restored network_schedule from checkpoint: {network_schedule}")
         print(f"  Loaded generation {start_gen - 1} ({blocks}b{filters}f), resuming from gen {start_gen}")
     else:
         # Pick initial tier if schedule is set.
@@ -1164,6 +1171,7 @@ def training_loop(
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'config': config,
+            'network_schedule': network_schedule,
         }, checkpoint_path)
 
         # 5. Print per-generation stats
@@ -1236,6 +1244,8 @@ def main():
     loop_parser.add_argument('--parallel-games', type=int, default=128, help='Concurrent self-play games (C++ GameManager cross-game batching)')
     loop_parser.add_argument('--use-trt', dest='use_trt', action='store_true', default=True, help='Export ONNX + build TensorRT engine per generation and run self-play through the TRT backend (default: on)')
     loop_parser.add_argument('--no-use-trt', dest='use_trt', action='store_false', help='Disable TensorRT backend (use LibTorch only)')
+    loop_parser.add_argument('--network-schedule', type=str, default=None,
+                             help='Tiered net schedule, e.g. "1:6:64,20:10:128" (gen_start:blocks:filters, comma-separated)')
 
     args = parser.parse_args()
 
@@ -1265,6 +1275,16 @@ def main():
         )
 
     elif args.command == 'loop':
+        schedule = None
+        raw = getattr(args, 'network_schedule', None)
+        if raw:
+            schedule = []
+            for tier in raw.split(','):
+                parts = tier.strip().split(':')
+                if len(parts) != 3:
+                    parser.error(f"--network-schedule tier '{tier}' must be gen_start:blocks:filters")
+                schedule.append((int(parts[0]), int(parts[1]), int(parts[2])))
+
         adaptive_config = None
         if getattr(args, 'adaptive', False):
             adaptive_config = AdaptiveConfig(
@@ -1296,6 +1316,7 @@ def main():
             resume_from=getattr(args, 'resume_from', None),
             parallel_games=getattr(args, 'parallel_games', 128),
             use_trt=getattr(args, 'use_trt', True),
+            network_schedule=schedule,
         )
 
 
