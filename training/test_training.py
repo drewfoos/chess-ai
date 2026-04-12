@@ -1052,3 +1052,43 @@ def test_server_empty_summary():
         data = resp.get_json()
         assert data['total_generations'] == 0
         assert data['generations'] == []
+
+
+def test_integration_selfplay_to_dashboard():
+    """Full pipeline: self-play -> metrics -> Flask API -> verify data."""
+    import tempfile
+    from training.selfplay import training_loop
+    from visualization.server import create_app
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        training_loop(
+            generations=2,
+            games_per_gen=2,
+            train_epochs=1,
+            batch_size=32,
+            num_simulations=2,
+            blocks=1,
+            filters=16,
+            output_dir=tmpdir,
+            max_moves=10,
+        )
+
+        metrics_dir = os.path.join(tmpdir, 'metrics')
+        assert os.path.exists(os.path.join(metrics_dir, 'gen_001.json'))
+        assert os.path.exists(os.path.join(metrics_dir, 'gen_002.json'))
+        assert os.path.exists(os.path.join(metrics_dir, 'summary.json'))
+
+        app = create_app(metrics_dir)
+        client = app.test_client()
+
+        resp = client.get('/api/summary')
+        assert resp.status_code == 200
+        summary = resp.get_json()
+        assert summary['total_generations'] == 2
+        assert summary['total_games'] == 4
+
+        resp = client.get('/api/generation/1')
+        assert resp.status_code == 200
+        gen = resp.get_json()
+        assert len(gen['games']) == 2
+        assert len(gen['games'][0]['moves_uci']) > 0
