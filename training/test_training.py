@@ -1884,3 +1884,65 @@ def test_integration_selfplay_to_dashboard():
         gen = resp.get_json()
         assert len(gen['games']) == 2
         assert len(gen['games'][0]['moves_uci']) > 0
+
+
+# ---------- C++ MCTS Integration Tests ----------
+
+try:
+    import chess_mcts as _chess_mcts_test
+    _HAS_CPP_MCTS = True
+except ImportError:
+    _HAS_CPP_MCTS = False
+
+
+@pytest.mark.skipif(not _HAS_CPP_MCTS, reason="C++ MCTS not built")
+class TestCppMCTS:
+    """Tests for C++ MCTS integration (only run when chess_mcts module is available)."""
+
+    def _get_model_path(self, tmp_path):
+        """Export a small model to TorchScript and return the path."""
+        from training.model import ChessNetwork
+        from training.config import NetworkConfig
+        from training.export import export_torchscript
+        config = NetworkConfig(num_blocks=2, num_filters=32)
+        model = ChessNetwork(config)
+        model.eval()
+        path = str(tmp_path / "test_model.pt")
+        export_torchscript(model, path, device='cpu')
+        return path
+
+    def test_cpp_mcts_returns_legal_move(self, tmp_path):
+        import chess
+        from training.mcts import MCTSConfig
+        from training.selfplay import CppMCTS
+
+        model_path = self._get_model_path(tmp_path)
+        config = MCTSConfig(num_simulations=50)
+        engine = CppMCTS(model_path, config, 'cpu')
+
+        board = chess.Board()
+        result = engine.search(board)
+
+        assert result.best_move is not None
+        assert result.best_move in board.legal_moves
+        assert result.policy_target.shape == (1858,)
+        assert abs(result.policy_target.sum() - 1.0) < 0.01
+
+    def test_cpp_mcts_play_game(self, tmp_path):
+        from training.mcts import MCTSConfig
+        from training.selfplay import CppMCTS, SelfPlayConfig, play_game
+
+        model_path = self._get_model_path(tmp_path)
+        config = MCTSConfig(num_simulations=20)
+        engine = CppMCTS(model_path, config, 'cpu')
+        selfplay_config = SelfPlayConfig(
+            max_moves=20,
+            playout_cap_randomization=False,
+            kld_adaptive=False,
+            random_opening_fraction=0.0,
+        )
+
+        record = play_game(engine, selfplay_config)
+        assert record.num_moves > 0
+        assert len(record.planes) == record.num_moves
+        assert len(record.policies) == record.num_moves

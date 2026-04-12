@@ -18,7 +18,89 @@ import torch
 from training.config import NetworkConfig
 from training.encoder import encode_board, POLICY_SIZE
 from training.model import ChessNetwork
-from training.mcts import MCTS, MCTSConfig
+from training.mcts import MCTS, MCTSConfig, SearchResult
+
+# Try to import C++ MCTS bindings
+try:
+    import chess_mcts
+    HAS_CPP_MCTS = True
+except ImportError:
+    HAS_CPP_MCTS = False
+
+
+class _CppMCTSConfig:
+    """Mutable config proxy so play_game can adjust temperature/sims."""
+
+    def __init__(self, mcts_config: MCTSConfig):
+        self.temperature = mcts_config.temperature
+        self.num_simulations = mcts_config.num_simulations
+        self._base = mcts_config
+
+    def _to_dict(self) -> dict:
+        """Build config dict for C++ SearchEngine, reflecting current mutable state."""
+        cfg = self._base
+        return {
+            'num_iterations': self.num_simulations,
+            'c_puct_init': cfg.c_puct_init,
+            'c_puct_base': cfg.c_puct_base,
+            'c_puct_factor': cfg.c_puct_factor,
+            'fpu_reduction_root': cfg.fpu_reduction_root,
+            'fpu_reduction': cfg.fpu_reduction,
+            'dirichlet_alpha': cfg.dirichlet_alpha,
+            'dirichlet_epsilon': cfg.dirichlet_epsilon,
+            'add_noise': True,
+            'policy_softmax_temp': cfg.policy_softmax_temperature,
+            'batch_size': cfg.batch_size,
+            'smart_pruning': cfg.smart_pruning,
+            'smart_pruning_factor': cfg.smart_pruning_factor,
+            'two_fold_draw': cfg.two_fold_draw,
+            'shaped_dirichlet': cfg.shaped_dirichlet,
+            'uncertainty_weight': cfg.uncertainty_weight,
+            'variance_scaling': cfg.variance_scaling,
+            'contempt': cfg.contempt,
+            'sibling_blending': getattr(cfg, 'sibling_blending', True),
+            'nn_cache_size': cfg.nn_cache_size,
+        }
+
+
+class CppMCTS:
+    """Wrapper around C++ chess_mcts.SearchEngine matching Python MCTS API."""
+
+    def __init__(self, model_path: str, mcts_config: MCTSConfig, device: str):
+        self.config = _CppMCTSConfig(mcts_config)
+        self.nn_cache = None  # Managed internally by C++ engine
+        self._model_path = model_path
+        self._device = device
+        self._engine = chess_mcts.SearchEngine(
+            model_path, device, self.config._to_dict()
+        )
+
+    def search(self, board: chess.Board) -> SearchResult:
+        # Push current config (temperature → not used by C++, but sims may have changed)
+        self._engine.set_config({'num_iterations': self.config.num_simulations})
+
+        # Build UCI move history from board
+        history = [m.uci() for m in board.move_stack]
+
+        # Get the starting FEN (before any moves)
+        root_board = board.copy()
+        while root_board.move_stack:
+            root_board.pop()
+        fen = root_board.fen()
+
+        cpp_result = self._engine.search(fen, history)
+
+        return SearchResult(
+            best_move=chess.Move.from_uci(cpp_result.best_move) if cpp_result.best_move else None,
+            visit_counts={
+                chess.Move.from_uci(m): v
+                for m, v in cpp_result.visit_counts.items()
+            },
+            root_value=cpp_result.root_value,
+            policy_target=np.array(cpp_result.policy_target, dtype=np.float32),
+            raw_policy=np.array(cpp_result.raw_policy, dtype=np.float32),
+            raw_value=cpp_result.raw_value,
+        )
 
 
 @dataclass
@@ -118,8 +200,13 @@ def rescore_with_tablebases(
     return positions
 
 
-def play_game(mcts: MCTS, config: SelfPlayConfig) -> GameRecord:
-    """Play a single self-play game."""
+def play_game(mcts, config: SelfPlayConfig) -> GameRecord:
+    """Play a single self-play game.
+
+    Args:
+        mcts: MCTS engine (Python MCTS or CppMCTS wrapper).
+        config: Self-play configuration.
+    """
     if mcts.nn_cache is not None:
         mcts.nn_cache.clear()
     board = chess.Board()
@@ -285,11 +372,20 @@ def generate_games(
     selfplay_config: SelfPlayConfig = SelfPlayConfig(),
     device: str = 'cpu',
     metrics_logger=None,
+    model_path: str | None = None,
 ) -> int:
-    """Generate self-play games and save as .npz file."""
-    model = model.to(device)
-    model.eval()
-    mcts = MCTS(model, mcts_config, device=device)
+    """Generate self-play games and save as .npz file.
+
+    If C++ MCTS bindings are available and model_path is provided, uses the
+    faster C++ search engine. Otherwise falls back to Python MCTS.
+    """
+    if HAS_CPP_MCTS and model_path is not None:
+        mcts = CppMCTS(model_path, mcts_config, device)
+        print(f"  Using C++ MCTS engine ({device})")
+    else:
+        model = model.to(device)
+        model.eval()
+        mcts = MCTS(model, mcts_config, device=device)
 
     all_planes = []
     all_policies = []
@@ -421,12 +517,31 @@ def training_loop(
         data_path = os.path.join(data_dir, f'gen_{gen:03d}.npz')
         play_model = swa_model if (swa_model is not None and gen > 1) else model
         play_model.eval()
+
+        # Export TorchScript model for C++ MCTS (if available)
+        # Always export from the base model (SWA wrapper lacks .config)
+        cpp_model_path = None
+        if HAS_CPP_MCTS:
+            from training.export import export_torchscript
+            cpp_model_path = os.path.join(checkpoint_dir, 'selfplay_model.pt')
+            export_model = model if swa_model is None else model
+            if swa_model is not None and gen > 1:
+                # Copy SWA params into base model temporarily for export
+                swa_state = swa_model.module.state_dict()
+                orig_state = model.state_dict()
+                model.load_state_dict(swa_state)
+                export_torchscript(model, cpp_model_path, device=device)
+                model.load_state_dict(orig_state)
+            else:
+                export_torchscript(model, cpp_model_path, device=device)
+
         num_positions = generate_games(
             play_model, games_per_gen, data_path,
             mcts_config=mcts_config,
             selfplay_config=selfplay_config,
             device=device,
             metrics_logger=metrics_logger,
+            model_path=cpp_model_path,
         )
 
         # 2. Load sliding window of recent generations
