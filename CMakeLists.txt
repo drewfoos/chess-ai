@@ -76,3 +76,21 @@ if(ENABLE_NEURAL)
             ${TORCH_DLLS} $<TARGET_FILE_DIR:chess_engine>)
     endif()
 endif()
+
+# Python bindings (requires pybind11 and LibTorch)
+option(BUILD_PYTHON "Build Python bindings" OFF)
+if(BUILD_PYTHON AND ENABLE_NEURAL)
+    find_package(Python COMPONENTS Interpreter Development REQUIRED)
+    find_package(pybind11 REQUIRED)
+    pybind11_add_module(chess_mcts src/python/bindings.cpp)
+    target_link_libraries(chess_mcts PRIVATE chess_core chess_neural)
+    target_compile_definitions(chess_mcts PRIVATE HAS_LIBTORCH)
+
+    # Copy DLLs on Windows
+    if(MSVC)
+        file(GLOB TORCH_DLLS "${TORCH_INSTALL_PREFIX}/lib/*.dll")
+        add_custom_command(TARGET chess_mcts POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            ${TORCH_DLLS} $<TARGET_FILE_DIR:chess_mcts>)
+    endif()
+endif()

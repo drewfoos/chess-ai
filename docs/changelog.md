@@ -8,6 +8,15 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 
 ## [Unreleased]
 
+### Added — Python Bindings (pybind11)
+- `chess_mcts` Python module exposing C++ MCTS search engine via pybind11
+- `SearchEngine` class: loads TorchScript model, runs MCTS search from FEN + move history
+- `SearchResult` with best_move, visit_counts dict, policy_target/raw_policy numpy arrays, root_value, raw_value, total_nodes
+- UCI move parsing against legal moves for correct MoveFlag resolution
+- Configurable SearchParams from Python dict (all fields exposed)
+- `BUILD_PYTHON` CMake option (requires `ENABLE_NEURAL=ON` and pybind11)
+- `attacks::init()` called automatically on module import
+
 ### Added — C++ Core Search Rewrite
 - Batched gather/evaluate/scatter MCTS loop in C++ `Search::run()` with virtual loss
 - `SearchResult` now includes `policy_target` (1858-dim visit distribution), `raw_policy`, and `raw_value` for training data
