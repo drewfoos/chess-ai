@@ -803,3 +803,100 @@ def test_selfplay_gpu():
             device='cuda',
         )
         assert num_positions > 0
+
+
+# ── Metrics Tests ────────────────────────────────────────────────────────────
+
+import json
+from training.metrics import MetricsLogger, GameMetrics, TrainingMetrics, GenerationMetrics
+
+
+def test_metrics_logger_creates_directory():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        metrics_dir = os.path.join(tmpdir, 'metrics')
+        logger = MetricsLogger(metrics_dir)
+        assert os.path.isdir(metrics_dir)
+
+
+def test_metrics_game_recorded():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        logger = MetricsLogger(tmpdir)
+        game = GameMetrics(
+            game_num=1,
+            num_moves=45,
+            result='1-0',
+            duration_s=12.5,
+            moves_uci=['e2e4', 'd7d5', 'e4d5'],
+        )
+        logger.record_game(game)
+        assert len(logger.current_games) == 1
+
+
+def test_metrics_generation_saved():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        logger = MetricsLogger(tmpdir)
+        game = GameMetrics(
+            game_num=1, num_moves=30, result='1/2-1/2',
+            duration_s=10.0, moves_uci=['e2e4', 'e7e5'],
+        )
+        logger.record_game(game)
+        training = TrainingMetrics(
+            total_loss=2.5, policy_loss=1.8, value_loss=0.7,
+            num_batches=10, learning_rate=0.001,
+        )
+        logger.save_generation(
+            generation=1, num_positions=150,
+            training=training, duration_s=25.0,
+        )
+        gen_path = os.path.join(tmpdir, 'gen_001.json')
+        assert os.path.exists(gen_path)
+        with open(gen_path) as f:
+            data = json.load(f)
+        assert data['generation'] == 1
+        assert data['num_positions'] == 150
+        assert len(data['games']) == 1
+        assert data['training']['total_loss'] == 2.5
+
+
+def test_metrics_summary_updated():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        logger = MetricsLogger(tmpdir)
+        game = GameMetrics(
+            game_num=1, num_moves=20, result='0-1',
+            duration_s=8.0, moves_uci=['d2d4'],
+        )
+        logger.record_game(game)
+        training = TrainingMetrics(
+            total_loss=3.0, policy_loss=2.0, value_loss=1.0,
+            num_batches=5, learning_rate=0.001,
+        )
+        logger.save_generation(1, 100, training, 20.0)
+        summary_path = os.path.join(tmpdir, 'summary.json')
+        assert os.path.exists(summary_path)
+        with open(summary_path) as f:
+            summary = json.load(f)
+        assert summary['total_generations'] == 1
+        assert len(summary['generations']) == 1
+
+
+def test_metrics_multiple_generations():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        logger = MetricsLogger(tmpdir)
+        for gen in range(1, 4):
+            game = GameMetrics(
+                game_num=1, num_moves=20, result='1/2-1/2',
+                duration_s=5.0, moves_uci=['e2e4'],
+            )
+            logger.record_game(game)
+            training = TrainingMetrics(
+                total_loss=3.0 - gen * 0.5, policy_loss=2.0, value_loss=1.0,
+                num_batches=5, learning_rate=0.001,
+            )
+            logger.save_generation(gen, 100, training, 15.0)
+        summary_path = os.path.join(tmpdir, 'summary.json')
+        with open(summary_path) as f:
+            summary = json.load(f)
+        assert summary['total_generations'] == 3
+        assert len(summary['generations']) == 3
+        losses = [g['training']['total_loss'] for g in summary['generations']]
+        assert losses == [2.5, 2.0, 1.5]
