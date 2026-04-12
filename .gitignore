@@ -52,6 +52,10 @@ dashboard-*.png
 # Environment / secrets
 .env
 
+# LibTorch (downloaded dependency)
+libtorch/
+libtorch.zip
+
 # Lichess bot (cloned external repo)
 lichess-bot/
 
