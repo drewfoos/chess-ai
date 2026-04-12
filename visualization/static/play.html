@@ -483,6 +483,8 @@
             box-shadow: none !important;
             background-color: transparent !important;
         }
+        /* Toggled by the "Hide eval bars" checkbox. */
+        .board-area.bars-hidden .eval-bar { display: none; }
 
         .error-toast {
             position: fixed;
@@ -568,6 +570,12 @@
                     <select class="control-select" id="model-select" style="flex: 1; min-width: 200px;">
                         <option value="random">-- random fallback --</option>
                     </select>
+                </div>
+                <div class="controls-row" style="margin-bottom: 10px;">
+                    <label style="display:flex; align-items:center; gap:6px; font-size:0.8em; color: var(--text-dim); cursor:pointer; user-select:none;">
+                        <input type="checkbox" id="hide-bars" style="margin:0;">
+                        Hide eval bars
+                    </label>
                 </div>
                 <div class="thinking" id="thinking">
                     Engine thinking
@@ -1494,8 +1502,30 @@ document.getElementById('sf-depth').addEventListener('change', function() {
     sfDepth = parseInt(this.value);
     fetchStockfishEval();
 });
+// ---------- Hide eval bars toggle ----------
+(function() {
+    var checkbox = document.getElementById('hide-bars');
+    var boardArea = document.querySelector('.board-area');
+    var saved = localStorage.getItem('play.hideBars') === '1';
+    checkbox.checked = saved;
+    boardArea.classList.toggle('bars-hidden', saved);
+    checkbox.addEventListener('change', function() {
+        boardArea.classList.toggle('bars-hidden', this.checked);
+        localStorage.setItem('play.hideBars', this.checked ? '1' : '0');
+    });
+})();
+
 document.getElementById('model-select').addEventListener('change', function() {
     currentModel = this.value;
+    // The previous engine's score/nodes/depth no longer reflect the
+    // selected model — blank them out so the bar+stats re-populate on
+    // the next engine reply instead of lingering on stale data.
+    updateEvalBar(0, null);
+    document.getElementById('info-score').textContent = '0.00';
+    document.getElementById('info-score').className = 'value score-neutral';
+    document.getElementById('info-nodes').textContent = '--';
+    document.getElementById('info-nps').textContent = '--';
+    document.getElementById('info-depth').textContent = '--';
     // Kick a new-game request so the server preloads the model now
     fetch('/api/play/new', {
         method: 'POST',
