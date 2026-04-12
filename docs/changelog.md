@@ -8,6 +8,15 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 
 ## [Unreleased]
 
+### Added — Parallel Self-Play via GameManager
+- `play_games_batched()` in `training/selfplay.py` drives `chess_mcts.GameManager` for N concurrent games with cross-game NN batching (single shared model, single forward pass per step across all game trees)
+- Dynamic backfill keeps `parallel_games` slots active until `num_games` is reached
+- Python-side temperature sampling over `visit_counts` per game (per-game temperature schedule preserved)
+- Wired into `generate_games()` C++ path, replacing the prior serial `ThreadPoolExecutor(max_workers=1)` + per-game `CppMCTS` code path that played games strictly back-to-back
+- New `--parallel-games` CLI flag (default 16) for `python -m training.selfplay loop` and `train.py` launcher prompt
+- Extracted `_finalize_record()` helper so single-game `play_game()` and batched path share tablebase rescoring + WDL labeling + Q-blending logic
+- Known trade-off: batched path currently skips per-game playout-cap randomization and KLD-adaptive visits (all moves use full sims)
+
 ### Added — C++ MCTS Performance Optimizations
 - FP16 inference via `model_.to(torch::kHalf)` for ~2x GPU throughput on RTX 3080 Tensor Cores
 - Pinned (page-locked) memory for async CPU→GPU DMA transfers with non-blocking `.to(device_)`

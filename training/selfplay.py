@@ -341,37 +341,43 @@ def play_game(mcts, config: SelfPlayConfig) -> GameRecord:
     # Restore full simulation count
     mcts.config.num_simulations = full_sims
 
-    # Determine game result if not resigned
+    _finalize_record(record, board, positions, board_history, config)
+    return record
+
+
+def _finalize_record(
+    record: GameRecord,
+    board: chess.Board,
+    positions: list,
+    board_history: list,
+    config: SelfPlayConfig,
+) -> None:
+    """Determine game result, rescore with tablebases, label positions with WDL."""
+    # Determine game result if not already set (e.g. by resign logic)
     if record.result == '*':
         outcome = board.outcome(claim_draw=True)
-        if outcome is None:
-            record.result = '1/2-1/2'
-        elif outcome.winner is None:
+        if outcome is None or outcome.winner is None:
             record.result = '1/2-1/2'
         elif outcome.winner == chess.WHITE:
             record.result = '1-0'
         else:
             record.result = '0-1'
 
-    # Tablebase rescoring (optional): replace endgame results with TB-correct WDL
     tablebase = _try_load_syzygy(config.syzygy_path)
     if tablebase is not None:
         positions = rescore_with_tablebases(positions, board_history, tablebase)
         tablebase.close()
 
-    # Label all positions with WDL + moves-left + optional Q-blending
     total_moves = len(positions)
     q_ratio = config.q_ratio
 
     for i, pos_data in enumerate(positions):
-        # Unpack — TB rescoring adds an optional 7th element (corrected WDL or None)
         if len(pos_data) == 7:
             planes, policy_target, side_to_move, root_q, pos_surprise, is_full, tb_wdl = pos_data
         else:
             planes, policy_target, side_to_move, root_q, pos_surprise, is_full = pos_data
             tb_wdl = None
 
-        # Use tablebase WDL if available, otherwise game-result WDL
         if tb_wdl is not None:
             z_wdl = tb_wdl
         elif record.result == '1/2-1/2':
@@ -387,10 +393,7 @@ def play_game(mcts, config: SelfPlayConfig) -> GameRecord:
             else:
                 z_wdl = np.array([0.0, 0.0, 1.0], dtype=np.float32)
 
-        # Q-value blending: blend game result WDL with search Q as soft WDL
         if q_ratio > 0:
-            # Convert root_q ∈ [-1, 1] to soft WDL
-            # q > 0 → more win, q < 0 → more loss, q ≈ 0 → draw
             q_win = max(0.0, root_q)
             q_loss = max(0.0, -root_q)
             q_draw = 1.0 - q_win - q_loss
@@ -407,7 +410,183 @@ def play_game(mcts, config: SelfPlayConfig) -> GameRecord:
         record.use_policy.append(is_full)
 
     record.num_moves = total_moves
-    return record
+
+
+def play_games_batched(
+    model_path: str,
+    num_games: int,
+    mcts_config: MCTSConfig,
+    selfplay_config: SelfPlayConfig,
+    device: str,
+    parallel_games: int,
+    use_fp16: bool = False,
+    on_game_done=None,
+) -> list[GameRecord]:
+    """Play num_games concurrently using chess_mcts.GameManager.
+
+    GameManager runs N games' MCTS in lockstep, batching NN evaluations across
+    trees for a single shared GPU forward pass per step. Dynamic backfill keeps
+    `parallel_games` active at all times until num_games is reached.
+
+    Per-game playout-cap randomization and KLD-adaptive visits are NOT applied
+    here — all moves use full sims (trade-off for cross-game batching).
+    """
+    cfg_proxy = _CppMCTSConfig(mcts_config)
+    cfg_dict = cfg_proxy._to_dict()
+    try:
+        manager = chess_mcts.GameManager(model_path, device, cfg_dict, use_fp16)
+    except TypeError:
+        # Older build without use_fp16 kwarg
+        manager = chess_mcts.GameManager(model_path, device, cfg_dict)
+
+    num_sims = mcts_config.num_simulations
+    parallel_games = max(1, min(parallel_games, num_games))
+
+    slot_board: list[chess.Board | None] = [None] * parallel_games
+    slot_record: list[GameRecord | None] = [None] * parallel_games
+    slot_positions: list[list] = [[] for _ in range(parallel_games)]
+    slot_board_history: list[list] = [[] for _ in range(parallel_games)]
+    slot_move_num = [0] * parallel_games
+    slot_resign_count = [0] * parallel_games
+    slot_start_time = [0.0] * parallel_games
+
+    next_game_id = [0]
+    completed: list[GameRecord] = []
+
+    def start_slot(slot: int) -> bool:
+        if next_game_id[0] >= num_games:
+            slot_board[slot] = None
+            return False
+        next_game_id[0] += 1
+        board = chess.Board()
+        record = GameRecord()
+        # Opening randomization
+        if selfplay_config.random_opening_fraction > 0 and \
+                random.random() < selfplay_config.random_opening_fraction:
+            n_random = random.randint(2, selfplay_config.random_opening_moves)
+            for _ in range(n_random):
+                legal = list(board.legal_moves)
+                if not legal or board.is_game_over():
+                    break
+                mv = random.choice(legal)
+                board.push(mv)
+                record.moves_uci.append(mv.uci())
+        slot_board[slot] = board
+        slot_record[slot] = record
+        slot_positions[slot] = []
+        slot_board_history[slot] = []
+        slot_move_num[slot] = 0
+        slot_resign_count[slot] = 0
+        slot_start_time[slot] = time.time()
+        return True
+
+    def finish_slot(slot: int) -> None:
+        board = slot_board[slot]
+        record = slot_record[slot]
+        _finalize_record(record, board, slot_positions[slot],
+                         slot_board_history[slot], selfplay_config)
+        duration = time.time() - slot_start_time[slot]
+        completed.append(record)
+        if on_game_done is not None:
+            on_game_done(record, duration, len(completed))
+
+    for s in range(parallel_games):
+        start_slot(s)
+
+    while True:
+        active = [s for s in range(parallel_games) if slot_board[s] is not None]
+        if not active:
+            break
+
+        # Handle any games that ended before we search this round
+        to_search: list[int] = []
+        for s in active:
+            board = slot_board[s]
+            if slot_move_num[s] >= selfplay_config.max_moves or \
+                    board.is_game_over(claim_draw=True):
+                finish_slot(s)
+                if not start_slot(s):
+                    slot_board[s] = None
+            else:
+                to_search.append(s)
+        if not to_search:
+            continue
+
+        # Build per-slot FEN + short history (last 8 moves) for repetition detection
+        fens: list[str] = []
+        histories: list[list[str]] = []
+        for s in to_search:
+            board = slot_board[s]
+            if len(board.move_stack) > 0:
+                temp = board.copy()
+                n_hist = min(8, len(temp.move_stack))
+                popped = [temp.pop().uci() for _ in range(n_hist)]
+                fens.append(temp.fen())
+                histories.append(list(reversed(popped)))
+            else:
+                fens.append(board.fen())
+                histories.append([])
+
+        manager.init_games_from_fen(fens, histories, num_sims)
+        while not manager.all_complete():
+            manager.step()
+
+        for j, s in enumerate(to_search):
+            board = slot_board[s]
+            record = slot_record[s]
+            result = manager.get_result(j)
+            vc = result.visit_counts
+
+            if not vc:
+                # No legal moves — declare draw and finish
+                record.result = '1/2-1/2'
+                finish_slot(s)
+                if not start_slot(s):
+                    slot_board[s] = None
+                continue
+
+            # Temperature-based move selection over visit counts
+            temperature = 1.0 if slot_move_num[s] < selfplay_config.temperature_moves else 0.01
+            moves_list = list(vc.keys())
+            visits = np.array([vc[m] for m in moves_list], dtype=np.float64)
+            if temperature <= 0.01 or visits.sum() == 0:
+                best_idx = int(np.argmax(visits))
+            else:
+                adj = visits ** (1.0 / temperature)
+                probs = adj / adj.sum()
+                best_idx = int(np.random.choice(len(moves_list), p=probs))
+            move_uci = moves_list[best_idx]
+            best_move = chess.Move.from_uci(move_uci)
+
+            policy_target = np.asarray(result.policy_target, dtype=np.float32)
+            raw_policy = np.asarray(result.raw_policy, dtype=np.float32)
+            surprise = 0.0
+            if raw_policy.size > 0 and raw_policy.shape == policy_target.shape:
+                surprise += float(np.abs(policy_target - raw_policy).sum())
+                surprise += abs(result.root_value - result.raw_value)
+
+            planes = encode_board(board)
+            slot_positions[s].append(
+                (planes, policy_target, board.turn, result.root_value, surprise, True)
+            )
+            slot_board_history[s].append(board.copy())
+
+            if result.root_value < selfplay_config.resign_threshold:
+                slot_resign_count[s] += 1
+                if slot_resign_count[s] >= selfplay_config.consecutive_resign:
+                    record.result = '0-1' if board.turn == chess.WHITE else '1-0'
+                    finish_slot(s)
+                    if not start_slot(s):
+                        slot_board[s] = None
+                    continue
+            else:
+                slot_resign_count[s] = 0
+
+            record.moves_uci.append(move_uci)
+            board.push(best_move)
+            slot_move_num[s] += 1
+
+    return completed
 
 
 def generate_games(
@@ -419,11 +598,13 @@ def generate_games(
     device: str = 'cpu',
     metrics_logger=None,
     model_path: str | None = None,
+    parallel_games: int = 16,
 ) -> int:
     """Generate self-play games and save as .npz file.
 
     If C++ MCTS bindings are available and model_path is provided, uses the
-    faster C++ search engine. Otherwise falls back to Python MCTS.
+    faster C++ GameManager with cross-game NN batching. Otherwise falls back to
+    sequential Python MCTS.
     """
     use_cpp = HAS_CPP_MCTS and model_path is not None
 
@@ -433,7 +614,8 @@ def generate_games(
             num_simulations=mcts_config.num_simulations,
             batch_size=max(mcts_config.batch_size, 64),
         )
-        print(f"  Using C++ MCTS engine ({device}, batch_size={cpp_config.batch_size})")
+        print(f"  Using C++ GameManager ({device}, parallel_games={parallel_games}, "
+              f"batch_size={cpp_config.batch_size})")
     else:
         if not HAS_CPP_MCTS:
             print("  Warning: C++ MCTS not available, using slower Python MCTS. "
@@ -451,53 +633,38 @@ def generate_games(
     start = time.time()
 
     if use_cpp:
-        # Parallel game generation: run multiple games concurrently using threads.
-        # Each thread gets its own CppMCTS instance; the GPU handles concurrent
-        # inference calls efficiently via CUDA stream scheduling.
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-        import threading
+        def _on_done(record, duration, completed_count):
+            if metrics_logger is not None:
+                from training.metrics import GameMetrics
+                metrics_logger.record_game(GameMetrics(
+                    game_num=completed_count,
+                    num_moves=record.num_moves,
+                    result=record.result,
+                    duration_s=duration,
+                    moves_uci=record.moves_uci,
+                ))
+            all_planes.extend(record.planes)
+            all_policies.extend(record.policies)
+            all_values.extend(record.values)
+            all_moves_left.extend(record.moves_left)
+            all_surprise.extend(record.surprise)
+            all_use_policy.extend(record.use_policy)
+            print(
+                f"  Game {completed_count}/{num_games}: "
+                f"{record.num_moves} moves, {record.result}, "
+                f"{duration:.1f}s ({len(all_planes)} positions total)"
+            )
 
-        num_workers = 1  # Single worker: multiple models thrash GPU memory
-        completed = 0
-        lock = threading.Lock()
-
-        def _play_one(game_idx):
-            engine = CppMCTS(model_path, cpp_config, device)
-            game_start = time.time()
-            record = play_game(engine, selfplay_config)
-            game_time = time.time() - game_start
-            return game_idx, record, game_time
-
-        with ThreadPoolExecutor(max_workers=num_workers) as pool:
-            futures = {pool.submit(_play_one, i): i for i in range(num_games)}
-            for future in as_completed(futures):
-                game_idx, record, game_time = future.result()
-                completed += 1
-
-                if metrics_logger is not None:
-                    from training.metrics import GameMetrics
-                    metrics_logger.record_game(GameMetrics(
-                        game_num=completed,
-                        num_moves=record.num_moves,
-                        result=record.result,
-                        duration_s=game_time,
-                        moves_uci=record.moves_uci,
-                    ))
-
-                with lock:
-                    all_planes.extend(record.planes)
-                    all_policies.extend(record.policies)
-                    all_values.extend(record.values)
-                    all_moves_left.extend(record.moves_left)
-                    all_surprise.extend(record.surprise)
-                    all_use_policy.extend(record.use_policy)
-
-                    total_positions = len(all_planes)
-                    print(
-                        f"  Game {completed}/{num_games}: "
-                        f"{record.num_moves} moves, {record.result}, "
-                        f"{game_time:.1f}s ({total_positions} positions total)"
-                    )
+        play_games_batched(
+            model_path=model_path,
+            num_games=num_games,
+            mcts_config=cpp_config,
+            selfplay_config=selfplay_config,
+            device=device,
+            parallel_games=parallel_games,
+            use_fp16=(device == 'cuda'),
+            on_game_done=_on_done,
+        )
     else:
         mcts = MCTS(model, mcts_config, device=device)
         for game_num in range(num_games):
@@ -567,6 +734,7 @@ def training_loop(
     syzygy_path: str | None = None,
     adaptive: AdaptiveConfig | None = None,
     resume_from: str | None = None,
+    parallel_games: int = 16,
 ):
     """Full reinforcement learning training loop.
 
@@ -668,6 +836,7 @@ def training_loop(
             device=device,
             metrics_logger=metrics_logger,
             model_path=cpp_model_path,
+            parallel_games=parallel_games,
         )
 
         # 2. Load sliding window of recent generations
@@ -804,6 +973,7 @@ def main():
     loop_parser.add_argument('--early-max-moves', type=int, default=150, help='Max moves for early generations')
     loop_parser.add_argument('--early-games', type=int, default=200, help='Games per early generation')
     loop_parser.add_argument('--resume-from', type=str, default=None, help='Resume from a checkpoint file (e.g. selfplay_output/checkpoints/model_gen_5.pt)')
+    loop_parser.add_argument('--parallel-games', type=int, default=16, help='Concurrent self-play games (C++ GameManager cross-game batching)')
 
     args = parser.parse_args()
 
@@ -860,6 +1030,7 @@ def main():
             syzygy_path=getattr(args, 'syzygy', None),
             adaptive=adaptive_config,
             resume_from=getattr(args, 'resume_from', None),
+            parallel_games=getattr(args, 'parallel_games', 16),
         )
 
 

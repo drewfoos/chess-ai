@@ -50,6 +50,7 @@ def main():
     blocks = int(prompt("Network blocks", 10))
     filters = int(prompt("Network filters", 128))
     window_size = int(prompt("Sliding window size", 5))
+    parallel_games = int(prompt("Parallel games (C++ cross-game batching)", 16))
     output_dir = prompt("Output directory", "selfplay_output")
 
     # Resume option
@@ -73,6 +74,7 @@ def main():
     print(f"  Device:       {device}")
     print(f"  Batch size:   {batch_size}")
     print(f"  Network:      {blocks} blocks, {filters} filters")
+    print(f"  Parallel:     {parallel_games} games")
     print(f"  Output:       {output_dir}")
     if resume_from:
         print(f"  Resume from:  {resume_from}")
@@ -99,6 +101,7 @@ def main():
         window_size=window_size,
         output_dir=output_dir,
         resume_from=resume_from,
+        parallel_games=parallel_games,
     )
 
 
