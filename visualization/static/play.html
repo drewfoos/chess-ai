@@ -1357,6 +1357,9 @@ function installBoardMouseHandlers() {
     wrapper.addEventListener('contextmenu', blockMenu, true);
     document.addEventListener('contextmenu', blockMenu, true);
 
+    // Capture phase: fires before chessboard.js's square-level mousedown
+    // handler, which calls stopPropagation() and otherwise swallows our
+    // click-to-select logic at the wrapper level.
     wrapper.addEventListener('mousedown', function(e) {
         if (e.button === 2) {
             var sq = squareFromEvent(e);
@@ -1398,7 +1401,7 @@ function installBoardMouseHandlers() {
                 if (premove) { premove = null; clearPremoveHighlight(); }
             }
         }
-    });
+    }, true);
 
     wrapper.addEventListener('mouseup', function(e) {
         if (e.button === 2 && rightDown) {
