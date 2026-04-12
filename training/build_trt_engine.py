@@ -51,8 +51,13 @@ def build_engine(
     workspace_mb: int = 2048,
     input_name: str = 'input',
     verbose: bool = False,
+    refittable: bool = True,
 ) -> str:
     """Build a serialized TRT engine and write it to `output_path`.
+
+    When `refittable=True` the engine includes refit data so subsequent
+    generations can swap in new weights via `refit_engine()` without
+    re-running the 30-90s plan-compilation step.
 
     Returns the output path. Raises RuntimeError on build failure.
     """
@@ -74,6 +79,10 @@ def build_engine(
     )
     if fp16 and builder.platform_has_fast_fp16:
         config.set_flag(trt.BuilderFlag.FP16)
+    if refittable:
+        # REFIT lets subsequent generations reuse this engine with new weights
+        # via OnnxParserRefitter, skipping plan compilation (~5-10s vs 60-90s).
+        config.set_flag(trt.BuilderFlag.REFIT)
 
     # Determine the (C, H, W) part of the input shape from the network input.
     in_tensor = None
@@ -104,6 +113,85 @@ def build_engine(
     with open(output_path, 'wb') as f:
         f.write(bytes(serialized))
     return output_path
+
+
+def refit_engine(
+    onnx_path: str,
+    engine_path: str,
+    verbose: bool = False,
+) -> str:
+    """Refit an existing refittable engine with weights from a new ONNX file.
+
+    The ONNX must have the same graph topology as the one the engine was
+    built from (identical layer shapes and initializer names). Typically
+    5-10s vs 30-90s for a full `build_engine()` on RTX-class hardware.
+
+    Raises RuntimeError if the existing engine wasn't built with REFIT, if
+    topology differs, or if the refit itself fails. Callers should catch
+    and fall back to `build_engine()` on any failure.
+    """
+    if not os.path.exists(engine_path):
+        raise RuntimeError(f"Engine not found for refit: {engine_path}")
+
+    severity = trt.Logger.INFO if verbose else trt.Logger.WARNING
+    logger = trt.Logger(severity)
+    runtime = trt.Runtime(logger)
+    with open(engine_path, 'rb') as f:
+        engine = runtime.deserialize_cuda_engine(f.read())
+    if engine is None:
+        raise RuntimeError(f"Failed to deserialize engine at {engine_path}")
+
+    refitter = trt.Refitter(engine, logger)
+    onnx_refitter = trt.OnnxParserRefitter(refitter, logger)
+    if not onnx_refitter.refit_from_file(onnx_path):
+        errs = '\n'.join(
+            str(onnx_refitter.get_error(i)) for i in range(onnx_refitter.num_errors)
+        )
+        raise RuntimeError(f"OnnxParserRefitter failed:\n{errs}")
+
+    missing = refitter.get_missing_weights()
+    if missing:
+        raise RuntimeError(
+            f"Refit incomplete — {len(missing)} weights unset "
+            f"(first: {missing[0] if missing else 'n/a'})"
+        )
+
+    if not refitter.refit_cuda_engine():
+        raise RuntimeError("refit_cuda_engine() returned False")
+
+    # Re-serialize so the on-disk engine reflects the refit weights. C++
+    # TRTEvaluator reloads from disk each generation, so the updated plan
+    # is picked up next time the engine path is consumed.
+    serialized = engine.serialize()
+    if serialized is None:
+        raise RuntimeError("engine.serialize() returned None after refit")
+    with open(engine_path, 'wb') as f:
+        f.write(bytes(serialized))
+    return engine_path
+
+
+def build_or_refit_engine(
+    onnx_path: str,
+    output_path: str,
+    can_refit: bool,
+    **build_kwargs,
+) -> tuple[str, bool]:
+    """Refit an existing engine if possible, otherwise build from scratch.
+
+    `can_refit` is the caller's assertion that the existing engine at
+    `output_path` has the same architecture as the new ONNX. Even with
+    `can_refit=True`, refit failures (stale engine, missing REFIT flag,
+    topology drift) fall back to a full build.
+
+    Returns (engine_path, refitted_flag) so callers can report timing.
+    """
+    if can_refit and os.path.exists(output_path):
+        try:
+            refit_engine(onnx_path, output_path)
+            return output_path, True
+        except Exception as e:
+            print(f"  [trt] refit failed ({e}) — falling back to full build")
+    return build_engine(onnx_path, output_path, **build_kwargs), False
 
 
 def main():

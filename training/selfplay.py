@@ -868,19 +868,29 @@ def _trt_available() -> bool:
         return False
 
 
-def _build_trt_engine_for_self_play(model, cpp_model_path: str) -> str:
-    """Export ONNX from `model` and build a TensorRT engine alongside cpp_model_path.
+def _build_trt_engine_for_self_play(
+    model, cpp_model_path: str, can_refit: bool = False,
+) -> str:
+    """Export ONNX from `model` and build or refit the TensorRT engine.
 
-    Returns the .trt path. Uses env TENSORRT_PATH for DLL discovery (handled in
-    training.build_trt_engine).
+    `can_refit=True` tells the builder the existing .trt on disk has the
+    same architecture as `model` (same block/filter count), so it can
+    skip plan compilation and just swap in new weights (~10× faster).
+    Pass False at tier transitions / first run.
+
+    Returns the .trt path. Uses env TENSORRT_PATH for DLL discovery.
     """
+    import time as _time
     from training.export import export_onnx
-    from training.build_trt_engine import build_engine
+    from training.build_trt_engine import build_or_refit_engine
 
     onnx_path = cpp_model_path.replace('.pt', '.onnx')
     trt_path = cpp_model_path.replace('.pt', '.trt')
     export_onnx(model, onnx_path)
-    build_engine(onnx_path, trt_path)
+    t0 = _time.time()
+    _, refitted = build_or_refit_engine(onnx_path, trt_path, can_refit=can_refit)
+    elapsed = _time.time() - t0
+    print(f"  [trt] {'refit' if refitted else 'build'} took {elapsed:.1f}s")
     return trt_path
 
 
@@ -1150,6 +1160,12 @@ def training_loop(
     # Used to mark the first gen after a resume on the dashboard's loss chart.
     first_gen_after_resume = start_gen if resume_from else None
 
+    # Tracks the architecture the current on-disk .trt engine was built for.
+    # A refit is only valid when architecture is unchanged; first iteration
+    # has to do a full build since any engine from a prior process may be
+    # stale (different weights dtype, different ONNX opset, etc.).
+    trt_engine_arch: tuple[int, int] | None = None
+
     for gen in range(start_gen, end_gen + 1):
         gen_start = time.time()
 
@@ -1205,6 +1221,11 @@ def training_loop(
         # Always export from the base model (SWA wrapper lacks .config)
         cpp_model_path = os.path.join(checkpoint_dir, 'selfplay_model.pt')
         trt_engine_path = ""
+        # Refit is valid iff the on-disk engine is for the same architecture.
+        # Tier transition rebuilt the model this iteration, so force a full
+        # build when the tracked arch doesn't match the current config.
+        can_refit = trt_engine_arch == (config.num_blocks, config.num_filters)
+
         if swa_model is not None and gen > 1:
             # Copy SWA params into base model temporarily for export
             swa_state = swa_model.module.state_dict()
@@ -1212,12 +1233,19 @@ def training_loop(
             model.load_state_dict(swa_state)
             export_torchscript(model, cpp_model_path, device=device)
             if use_trt:
-                trt_engine_path = _build_trt_engine_for_self_play(model, cpp_model_path)
+                trt_engine_path = _build_trt_engine_for_self_play(
+                    model, cpp_model_path, can_refit=can_refit,
+                )
             model.load_state_dict(orig_state)
         else:
             export_torchscript(model, cpp_model_path, device=device)
             if use_trt:
-                trt_engine_path = _build_trt_engine_for_self_play(model, cpp_model_path)
+                trt_engine_path = _build_trt_engine_for_self_play(
+                    model, cpp_model_path, can_refit=can_refit,
+                )
+
+        if use_trt:
+            trt_engine_arch = (config.num_blocks, config.num_filters)
 
         num_positions = generate_games(
             play_model, gen_games, data_path,

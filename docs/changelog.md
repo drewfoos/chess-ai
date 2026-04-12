@@ -8,6 +8,14 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 
 ## [Unreleased]
 
+### Changed — TensorRT Engine Refit
+- `training/build_trt_engine.py::build_engine()` now sets `BuilderFlag.REFIT` by default so engines can be refit with new weights without rebuilding the plan
+- New `refit_engine(onnx_path, engine_path)` uses `trt.Refitter` + `trt.OnnxParserRefitter.refit_from_file()` to swap weights into an existing engine (~5-10s vs 30-90s plan compile) and re-serializes it to disk so the C++ `TRTEvaluator` picks up the refit on its next reload
+- New `build_or_refit_engine(onnx_path, output_path, can_refit, **build_kwargs) -> (path, refitted)` tries refit when the caller asserts the architecture is unchanged, and falls back to a full build on any refit failure (stale engine, missing REFIT flag, topology drift)
+- `training/selfplay.py::training_loop()` tracks `trt_engine_arch` and only requests refit when the current `(blocks, filters)` matches the engine on disk; on tier transition the engine is rebuilt from scratch
+- Prints `[trt] refit ... in X.Ys` vs `[trt] built ... in X.Ys` so the speedup is visible in the log
+- Tests: `test_refit_engine_swaps_weights_without_rebuild`, `test_refit_fails_gracefully_on_non_refittable_engine`, `test_build_or_refit_falls_back_when_engine_missing`
+
 ### Fixed — Tiered Network Schedule Persistence
 - `training_loop()` now persists `network_schedule` in each checkpoint dict; on resume (including auto-resume) the schedule is restored from the checkpoint if the caller didn't pass one — prevents silently dropping the scale-up plan on restart
 - New `--network-schedule "1:6:64,20:10:128"` CLI flag for `python -m training loop` (parses comma-separated `gen_start:blocks:filters` tiers)
