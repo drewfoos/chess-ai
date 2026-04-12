@@ -104,7 +104,14 @@ class MetricsLogger:
         if len(summary['generations']) > self.max_summary_generations:
             summary['generations'] = summary['generations'][-self.max_summary_generations:]
 
-        summary['total_generations'] = gen_data['generation']  # actual generation count, not len
+        # Highest generation number we've ever seen. Using max() (instead of
+        # just the current gen) makes the counter monotonic — if a run is
+        # accidentally restarted at gen 1 against an existing metrics dir,
+        # we keep reporting the true peak instead of resetting the dashboard.
+        summary['total_generations'] = max(
+            summary.get('total_generations', 0),
+            gen_data['generation'],
+        )
 
         total_positions = sum(g['num_positions'] for g in summary['generations'])
         total_time = sum(g['duration_s'] for g in summary['generations'])

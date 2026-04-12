@@ -945,6 +945,27 @@ def training_loop(
     metrics_dir = os.path.join(output_dir, 'metrics')
     metrics_logger = MetricsLogger(metrics_dir)
 
+    # Auto-resume: if the caller didn't pass --resume-from but the output
+    # directory already contains checkpoints, pick up the most recent one.
+    # Matches the common case where a run was interrupted and the user just
+    # re-runs the same command; avoids accidentally starting over at gen 1
+    # against an existing metrics/ dir (which breaks the dashboard counter).
+    if resume_from is None:
+        try:
+            existing = [
+                f for f in os.listdir(checkpoint_dir)
+                if f.startswith('model_gen_') and f.endswith('.pt')
+            ]
+            if existing:
+                def _gen_of(fname: str) -> int:
+                    return int(fname[len('model_gen_'):-len('.pt')])
+                latest = max(existing, key=_gen_of)
+                resume_from = os.path.join(checkpoint_dir, latest)
+                print(f"Auto-resuming from most recent checkpoint: {latest}")
+                print(f"  (pass --resume-from explicitly, or use a fresh --output-dir, to override)")
+        except FileNotFoundError:
+            pass
+
     # Resume path takes priority: saved architecture wins over caller args.
     start_gen = 1
     if resume_from:
