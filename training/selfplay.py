@@ -24,6 +24,8 @@ from training.mcts import MCTS, MCTSConfig
 @dataclass
 class SelfPlayConfig:
     temperature_moves: int = 30
+    temperature_decay_moves: int = 60    # decay period after temperature_moves
+    temperature_min: float = 0.4         # floor (don't go fully greedy during training)
     max_moves: int = 512
     resign_threshold: float = -0.95
     consecutive_resign: int = 5
@@ -38,6 +40,9 @@ class SelfPlayConfig:
     syzygy_path: str | None = None          # Path to Syzygy tablebase files (None = disabled)
     random_opening_fraction: float = 0.05   # Fraction of games with random openings
     random_opening_moves: int = 8           # Max random moves for opening randomization
+    badgame_split: bool = True             # Fork games when temperature causes blunders
+    badgame_threshold: float = 0.3         # Q-value gap to trigger a fork
+    badgame_max_forks: int = 3             # Max forks per game
 
 
 @dataclass
@@ -137,6 +142,7 @@ def play_game(mcts: MCTS, config: SelfPlayConfig) -> GameRecord:
 
     positions = []  # (planes, policy_target, side_to_move, root_q, surprise, is_full)
     board_history = []  # board snapshots for tablebase rescoring
+    branch_points = []  # (board_copy, best_move, move_num) for badgame split
     resign_count = 0
     full_sims = mcts.config.num_simulations
     prev_kld = 0.0  # KL divergence from previous move (for adaptive visits)
@@ -145,11 +151,14 @@ def play_game(mcts: MCTS, config: SelfPlayConfig) -> GameRecord:
         if board.is_game_over(claim_draw=True):
             break
 
-        # Set temperature based on move number
+        # Set temperature: full → smooth decay → floor
         if move_num < config.temperature_moves:
             mcts.config.temperature = 1.0
+        elif move_num < config.temperature_moves + config.temperature_decay_moves:
+            t = (move_num - config.temperature_moves) / config.temperature_decay_moves
+            mcts.config.temperature = 1.0 - t * (1.0 - config.temperature_min)
         else:
-            mcts.config.temperature = 0.01
+            mcts.config.temperature = config.temperature_min
 
         # Playout cap randomization: randomly choose full or quick search
         is_full_search = True
@@ -203,6 +212,20 @@ def play_game(mcts: MCTS, config: SelfPlayConfig) -> GameRecord:
             resign_count = 0
 
         record.moves_uci.append(result.best_move.uci())
+
+        # Badgame split: record branch points where temperature caused a blunder
+        if (config.badgame_split and mcts.config.temperature > 0.1
+                and result.visit_counts and len(branch_points) < config.badgame_max_forks):
+            best_move_by_visits = max(result.visit_counts, key=result.visit_counts.get)
+            if best_move_by_visits != result.best_move:
+                best_child = result.root_node.children.get(best_move_by_visits) if result.root_node else None
+                sel_child = result.root_node.children.get(result.best_move) if result.root_node else None
+                if (best_child and sel_child
+                        and best_child.visit_count > 0 and sel_child.visit_count > 0):
+                    q_gap = abs(best_child.value() - sel_child.value())
+                    if q_gap > config.badgame_threshold:
+                        branch_points.append((board.copy(), best_move_by_visits, move_num))
+
         board.push(result.best_move)
 
     # Restore full simulation count
@@ -225,6 +248,23 @@ def play_game(mcts: MCTS, config: SelfPlayConfig) -> GameRecord:
     if tablebase is not None:
         positions = rescore_with_tablebases(positions, board_history, tablebase)
         tablebase.close()
+
+    # Badgame split: replay from branch points with greedy play
+    for fork_board, fork_move, fork_move_num in branch_points:
+        fork_board.push(fork_move)
+        mcts.config.temperature = 0.01  # greedy
+        mcts.config.num_simulations = full_sims
+        for _ in range(min(20, config.max_moves - fork_move_num)):
+            if fork_board.is_game_over(claim_draw=True):
+                break
+            fork_result = mcts.search(fork_board)
+            if fork_result.best_move is None:
+                break
+            fork_planes = encode_board(fork_board)
+            positions.append((fork_planes, fork_result.policy_target, fork_board.turn,
+                             fork_result.root_value, 0.0, True))
+            board_history.append(fork_board.copy())
+            fork_board.push(fork_result.best_move)
 
     # Label all positions with WDL + moves-left + optional Q-blending
     total_moves = len(positions)

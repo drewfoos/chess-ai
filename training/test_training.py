@@ -1884,3 +1884,178 @@ def test_integration_selfplay_to_dashboard():
         gen = resp.get_json()
         assert len(gen['games']) == 2
         assert len(gen['games'][0]['moves_uci']) > 0
+
+
+# ── Tier 2 Round 3: Temperature Decay, Badgame Split ────────────────────────
+
+
+def test_temperature_decay_schedule():
+    """Temperature should decay smoothly instead of hard cutoff."""
+    cfg = NetworkConfig(num_blocks=1, num_filters=16)
+    model = ChessNetwork(cfg)
+    model.eval()
+    mcts_cfg = MCTSConfig(num_simulations=5)
+    mcts = MCTS(model, mcts_cfg, 'cpu')
+    sp_cfg = SelfPlayConfig(
+        max_moves=50, resign_threshold=-1.0,
+        temperature_moves=10, temperature_decay_moves=20, temperature_min=0.4,
+    )
+    record = play_game(mcts, sp_cfg)
+    assert len(record.planes) > 0
+
+
+def test_temperature_min_floor():
+    """Temperature should not go below temperature_min."""
+    cfg = SelfPlayConfig()
+    assert cfg.temperature_min == 0.4
+    assert cfg.temperature_decay_moves == 60
+
+
+def test_temperature_decay_values():
+    """Verify smooth decay math at specific move numbers."""
+    cfg = SelfPlayConfig(temperature_moves=10, temperature_decay_moves=20, temperature_min=0.4)
+    # Move 5: within temperature_moves → 1.0
+    assert 5 < cfg.temperature_moves
+    # Move 10: start of decay → 1.0
+    t = (10 - cfg.temperature_moves) / cfg.temperature_decay_moves
+    assert t == 0.0
+    temp = 1.0 - t * (1.0 - cfg.temperature_min)
+    assert temp == 1.0
+    # Move 20: midpoint of decay → 0.7
+    t = (20 - cfg.temperature_moves) / cfg.temperature_decay_moves
+    assert t == 0.5
+    temp = 1.0 - t * (1.0 - cfg.temperature_min)
+    assert abs(temp - 0.7) < 1e-6
+    # Move 30: end of decay → 0.4
+    t = (30 - cfg.temperature_moves) / cfg.temperature_decay_moves
+    assert t == 1.0
+    temp = 1.0 - t * (1.0 - cfg.temperature_min)
+    assert abs(temp - 0.4) < 1e-6
+
+
+def test_badgame_split_produces_extra_positions():
+    """Badgame split should produce positions from forked games."""
+    cfg = NetworkConfig(num_blocks=1, num_filters=16)
+    model = ChessNetwork(cfg)
+    model.eval()
+    mcts_cfg = MCTSConfig(num_simulations=10)
+    mcts = MCTS(model, mcts_cfg, 'cpu')
+    sp_cfg = SelfPlayConfig(
+        max_moves=30, resign_threshold=-1.0,
+        badgame_split=True, badgame_threshold=0.1, badgame_max_forks=3,
+    )
+    record = play_game(mcts, sp_cfg)
+    assert len(record.planes) > 0
+
+
+def test_badgame_split_disabled():
+    """With badgame_split=False, game still completes normally."""
+    cfg = NetworkConfig(num_blocks=1, num_filters=16)
+    model = ChessNetwork(cfg)
+    model.eval()
+    mcts_cfg = MCTSConfig(num_simulations=5)
+    mcts = MCTS(model, mcts_cfg, 'cpu')
+    sp_cfg = SelfPlayConfig(
+        max_moves=15, resign_threshold=-1.0,
+        badgame_split=False,
+    )
+    record = play_game(mcts, sp_cfg)
+    assert len(record.planes) > 0
+
+
+def test_badgame_split_config_defaults():
+    """SelfPlayConfig badgame split defaults should be set."""
+    cfg = SelfPlayConfig()
+    assert cfg.badgame_split is True
+    assert cfg.badgame_threshold == 0.3
+    assert cfg.badgame_max_forks == 3
+
+
+# ── Tier 2 Round 3: Sibling Blending ────────────────────────────────────────
+
+
+def test_sibling_blending_uses_neighbor_values():
+    """Unvisited child should use sibling values when available."""
+    parent = Node(prior=1.0)
+    parent.visit_count = 50
+    parent.total_value = 25.0
+    parent.sum_sq_value = 15.0
+    # Visited sibling with similar prior
+    a = Node(prior=0.3)
+    a.visit_count = 10
+    a.total_value = 7.0  # mean 0.7
+    a.sum_sq_value = 5.0
+    # Unvisited child with similar prior
+    b = Node(prior=0.28)
+    parent.children[chess.Move.from_uci('e2e4')] = a
+    parent.children[chess.Move.from_uci('d2d4')] = b
+    cfg = NetworkConfig(num_blocks=1, num_filters=16)
+    model = ChessNetwork(cfg)
+    mcts_cfg = MCTSConfig(sibling_blending=True, variance_scaling=False, uncertainty_weight=0.0)
+    mcts = MCTS(model, mcts_cfg, 'cpu')
+    sibling_val = mcts._sibling_fpu(parent, 0.28)
+    assert sibling_val is not None
+    assert abs(sibling_val - 0.7) < 0.01
+
+
+def test_sibling_blending_disabled():
+    """With sibling_blending=False, returns None."""
+    cfg = NetworkConfig(num_blocks=1, num_filters=16)
+    model = ChessNetwork(cfg)
+    mcts_cfg = MCTSConfig(sibling_blending=False)
+    mcts = MCTS(model, mcts_cfg, 'cpu')
+    parent = Node(prior=1.0)
+    assert mcts._sibling_fpu(parent, 0.3) is None
+
+
+def test_sibling_blending_no_similar_prior():
+    """No sibling with similar prior should return None."""
+    parent = Node(prior=1.0)
+    parent.visit_count = 50
+    parent.total_value = 25.0
+    parent.sum_sq_value = 15.0
+    a = Node(prior=0.9)  # far from 0.1
+    a.visit_count = 10
+    a.total_value = 7.0
+    a.sum_sq_value = 5.0
+    parent.children[chess.Move.from_uci('e2e4')] = a
+    cfg = NetworkConfig(num_blocks=1, num_filters=16)
+    model = ChessNetwork(cfg)
+    mcts_cfg = MCTSConfig(sibling_blending=True)
+    mcts = MCTS(model, mcts_cfg, 'cpu')
+    assert mcts._sibling_fpu(parent, 0.1) is None
+
+
+# ── Tier 2 Round 3: Edge Sorting + Prior Compression ────────────────────────
+
+
+def test_expand_sorts_children_by_prior():
+    """Children should be sorted by prior descending after expansion."""
+    cfg = NetworkConfig(num_blocks=1, num_filters=16)
+    model = ChessNetwork(cfg)
+    model.eval()
+    mcts = MCTS(model, MCTSConfig(), 'cpu')
+    board = chess.Board()
+    policy, _ = mcts._evaluate(board)
+    node = Node(prior=1.0)
+    mcts._expand(node, board, policy)
+    priors = [float(c.prior) for c in node.children.values()]
+    assert priors == sorted(priors, reverse=True)
+
+
+def test_prior_compression_float16():
+    """Node priors should be stored as float16."""
+    node = Node(prior=0.5)
+    assert isinstance(node.prior, np.float16)
+
+
+def test_search_with_sorted_edges():
+    """Search should work correctly with sorted children."""
+    cfg = NetworkConfig(num_blocks=1, num_filters=16)
+    model = ChessNetwork(cfg)
+    model.eval()
+    mcts = MCTS(model, MCTSConfig(num_simulations=32), 'cpu')
+    board = chess.Board()
+    result = mcts.search(board)
+    assert result.best_move in board.legal_moves
+    assert result.policy_target.shape == (1858,)

@@ -38,6 +38,11 @@ These Lc0 features are already in our codebase:
 | Uncertainty boosting (Round 3) | Done | `training/mcts.py` — Ceres-style variance bonus in `_select_child` |
 | Variance-scaled cPUCT (Round 3) | Done | `training/mcts.py` — KataGo-style parent variance scaling |
 | Node value variance tracking (Round 3) | Done | `training/mcts.py` — `sum_sq_value` + `value_variance()` |
+| Temperature decay schedule (Round 3 T2) | Done | `training/selfplay.py` — smooth decay with 0.4 floor |
+| Badgame split (Round 3 T2) | Done | `training/selfplay.py` — fork on Q-gap, replay greedy |
+| Sibling blending / Ceres FPU (Round 3 T2) | Done | `training/mcts.py` — `_sibling_fpu()` in `_select_child` |
+| Policy edge sorting (Round 3 T2) | Done | `training/mcts.py` — sorted by prior in `_expand()` |
+| Prior compression float16 (Round 3 T2) | Done | `training/mcts.py` — `np.float16` in `Node.__init__` |
 
 ---
 
