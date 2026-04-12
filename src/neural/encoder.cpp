@@ -9,19 +9,18 @@ static void fill_plane(float* output, int plane, float value) {
     for (int i = 0; i < 64; i++) start[i] = value;
 }
 
-void encode_position(const Position& pos, float* output) {
-    std::memset(output, 0, TENSOR_SIZE * sizeof(float));
-
-    bool is_white = (pos.side_to_move() == WHITE);
-
-    // Encode current position (time step 0, planes 0-11 = pieces, plane 12 = repetition)
+// Encode pieces from a single position into a specific time step's planes.
+// base_plane is the starting plane index for this time step (t * 13).
+// is_white indicates whether the current player (at time step 0) is white,
+// used for board flipping consistency.
+static void encode_pieces(const Position& pos, float* output, int base_plane, bool is_white) {
     for (int sq = 0; sq < 64; sq++) {
         PieceType pt = pos.piece_on(Square(sq));
         if (pt == NO_PIECE_TYPE) continue;
 
         Color c = pos.color_on(Square(sq));
 
-        // Flip square for black to move
+        // Flip square for black to move (from current player's perspective)
         int actual_sq;
         if (!is_white) {
             int sq_file = sq & 7;
@@ -31,35 +30,62 @@ void encode_position(const Position& pos, float* output) {
             actual_sq = sq;
         }
 
+        // "Our" pieces are always the current player's (history.current().side_to_move()),
+        // regardless of whose turn it was at this historical position.
         int plane;
-        if (c == pos.side_to_move()) {
-            plane = int(pt);           // 0-5: our pieces
+        if (c == (is_white ? WHITE : BLACK)) {
+            plane = base_plane + int(pt);           // 0-5: current player's pieces
         } else {
-            plane = 6 + int(pt);      // 6-11: opponent pieces
+            plane = base_plane + 6 + int(pt);      // 6-11: opponent pieces
         }
 
         int rank = actual_sq >> 3;
         int file = actual_sq & 7;
         output[plane * 64 + rank * 8 + file] = 1.0f;
     }
+}
 
-    // Plane 12: repetition count (zero for now — no history tracking in C++ yet)
-    // Already zeroed by memset.
+void encode_position(const PositionHistory& history, float* output) {
+    std::memset(output, 0, TENSOR_SIZE * sizeof(float));
 
-    // Copy time step 0 (13 planes * 64 = 832 floats) to steps 1-7
-    for (int t = 1; t < 8; t++) {
-        std::memcpy(output + t * 13 * 64, output, 13 * 64 * sizeof(float));
+    const Position& current = history.current();
+    bool is_white = (current.side_to_move() == WHITE);
+
+    // Encode 8 time steps with real historical positions
+    for (int t = 0; t < 8; t++) {
+        const Position& pos = history.at(t);
+        int base_plane = t * 13;
+
+        // Encode piece planes (0-11 within time step)
+        encode_pieces(pos, output, base_plane, is_white);
+
+        // Plane 12: repetition indicator
+        // Check if this historical position appears more than once up to this point
+        // For simplicity: check if the position at step t matches any other position in history
+        if (t == 0 && history.is_repetition(2)) {
+            fill_plane(output, base_plane + 12, 1.0f);
+        } else if (t > 0) {
+            // For older time steps, check if that position was repeated at its point in history
+            // We check if positions_[idx] hash matches any earlier position
+            int idx = history.length() - 1 - t;
+            if (idx > 0) {
+                // Use a simple approach: the position at step t is a repetition if
+                // it appears elsewhere in the first idx+1 positions
+                // We approximate by comparing with the current position's repetition status
+                // For now, only mark step 0's repetition (matching Python encoder behavior)
+            }
+        }
     }
 
-    // Constant planes 104-111
+    // Constant planes 104-111 (from current position)
     // Plane 104: color (1.0 if white to move, 0.0 if black)
     if (is_white) fill_plane(output, 104, 1.0f);
 
     // Plane 105: move count (fullmove_number / 200)
-    fill_plane(output, 105, pos.fullmove_number() / 200.0f);
+    fill_plane(output, 105, current.fullmove_number() / 200.0f);
 
     // Planes 106-109: castling rights from STM perspective
-    CastlingRight cr = pos.castling_rights();
+    CastlingRight cr = current.castling_rights();
     if (is_white) {
         if (cr & WHITE_OO)  fill_plane(output, 106, 1.0f);
         if (cr & WHITE_OOO) fill_plane(output, 107, 1.0f);
@@ -73,10 +99,17 @@ void encode_position(const Position& pos, float* output) {
     }
 
     // Plane 110: halfmove clock / 100
-    fill_plane(output, 110, pos.halfmove_clock() / 100.0f);
+    fill_plane(output, 110, current.halfmove_clock() / 100.0f);
 
     // Plane 111: bias plane (all ones)
     fill_plane(output, 111, 1.0f);
+}
+
+void encode_position(const Position& pos, float* output) {
+    // Wrap single position into a 1-position history and call the history overload
+    PositionHistory hist;
+    hist.reset(pos);
+    encode_position(hist, output);
 }
 
 } // namespace neural

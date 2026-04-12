@@ -1,5 +1,6 @@
 #pragma once
 #include "core/position.h"
+#include "neural/position_history.h"
 
 namespace neural {
 
@@ -22,5 +23,8 @@ constexpr int TENSOR_SIZE = INPUT_PLANES * BOARD_SIZE * BOARD_SIZE;  // 7168
 //   110  : halfmove clock / 100
 //   111  : bias (all ones)
 void encode_position(const Position& pos, float* output);
+
+// Encode from history (fills all 8 time steps with real positions)
+void encode_position(const PositionHistory& history, float* output);
 
 } // namespace neural

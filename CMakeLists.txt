@@ -14,6 +14,7 @@ add_library(chess_core
     src/mcts/search.cpp
     src/neural/policy_map.cpp
     src/neural/encoder.cpp
+    src/neural/position_history.cpp
 )
 target_include_directories(chess_core PUBLIC src)
 
