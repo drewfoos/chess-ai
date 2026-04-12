@@ -468,6 +468,21 @@
 
         /* Disable native context menu on the board */
         #board-wrapper { user-select: none; -webkit-user-select: none; }
+        /* Prevent the browser's native "save image / copy image" context menu
+           on piece sprites (chessboard.js uses JS-based drag, not HTML5 drag,
+           so disabling image dragging here does not break piece movement). */
+        #board-wrapper img {
+            -webkit-user-drag: none;
+            user-drag: none;
+            -webkit-touch-callout: none;
+        }
+        /* Neutralize chessboard.js's built-in yellow highlight classes in case
+           any codepath applies them — we use our own purple/gray scheme. */
+        #board-wrapper .highlight1-32417,
+        #board-wrapper .highlight2-9c5d2 {
+            box-shadow: none !important;
+            background-color: transparent !important;
+        }
 
         .error-toast {
             position: fixed;
@@ -782,9 +797,16 @@ function afterPlayerMove(source, target) {
 
 function onSnapEnd() {
     board.position(chess.fen());
-    // Re-draw highlights since chessboard.js may regenerate squares
+    // chessboard.js regenerates the square DOM on snap, so we have to
+    // re-apply our highlight classes here.
     updateHighlights();
-    clearLegalMoves();
+    if (selectedSquare) {
+        // User click-selected a piece (no actual move yet) — keep the
+        // legal-move dots visible after the snap-back.
+        showLegalMoves(selectedSquare);
+    } else {
+        clearLegalMoves();
+    }
     if (premove) highlightPremove();
     setTimeout(redrawOverlay, 0);
 }
