@@ -1356,8 +1356,14 @@ def test_lr_scheduler_reduces_lr():
     scheduler = MultiStepLR(optimizer, milestones=[2, 4], gamma=0.1)
 
     lrs = []
+    dummy_input = torch.randn(1, cfg.input_planes, 8, 8)
     for epoch in range(6):
         lrs.append(optimizer.param_groups[0]['lr'])
+        optimizer.zero_grad()
+        policy, value, mlh = model(dummy_input)
+        loss = policy.sum() + value.sum() + mlh.sum()
+        loss.backward()
+        optimizer.step()
         scheduler.step()
 
     # Before milestone 2: lr = 0.1
