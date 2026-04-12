@@ -808,7 +808,7 @@ def test_selfplay_gpu():
 # ── Metrics Tests ────────────────────────────────────────────────────────────
 
 import json
-from training.metrics import MetricsLogger, GameMetrics, TrainingMetrics, GenerationMetrics
+from training.metrics import MetricsLogger, GameMetrics, TrainingMetrics
 
 
 def test_metrics_logger_creates_directory():

@@ -5,6 +5,7 @@ Writes per-generation JSON files and a rolling summary for the dashboard.
 
 import json
 import os
+import tempfile
 from dataclasses import dataclass, field, asdict
 
 
@@ -24,16 +25,6 @@ class TrainingMetrics:
     value_loss: float
     num_batches: int
     learning_rate: float
-
-
-@dataclass
-class GenerationMetrics:
-    generation: int
-    num_positions: int
-    num_games: int
-    games: list[dict]
-    training: dict
-    duration_s: float
 
 
 class MetricsLogger:
@@ -107,5 +98,12 @@ class MetricsLogger:
         summary['total_games'] = total_games
         summary['total_time_s'] = total_time
 
-        with open(summary_path, 'w') as f:
-            json.dump(summary, f, indent=2)
+        # Atomic write: write to temp file then rename to avoid corrupt reads
+        fd, tmp_path = tempfile.mkstemp(dir=self.metrics_dir, suffix='.json')
+        try:
+            with os.fdopen(fd, 'w') as f:
+                json.dump(summary, f, indent=2)
+            os.replace(tmp_path, summary_path)
+        except BaseException:
+            os.unlink(tmp_path)
+            raise
