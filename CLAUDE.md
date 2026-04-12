@@ -112,6 +112,9 @@ Plan location: (plan file in Claude Code session plans)
 - NodePool arena allocator: contiguous `std::deque<Node>` eliminates per-node heap allocation (~2K allocs/step → 0)
 - Pre-allocated encode buffers in GameManager (eliminates 3.6MB/step allocation churn)
 - Default batch size 128, NN cache 200K entries (up from 16 and 20K)
+- Multivisit MCTS: collapses repeated same-child PUCT selections into N visits per descent in GameManager (configurable via `max_collapse_visits`, default 8; single-level lookahead at the leaf's parent)
+- Tiered network schedule: `training_loop(network_schedule=[(gen_start, blocks, filters), ...])` rebuilds model/optimizer/SWA at tier boundaries; `load_checkpoint_with_config()` honors saved architecture on resume; dashboard shows current `Xb Yf` per generation
+- TensorRT inference backend (optional, `-DENABLE_TENSORRT=ON`): ONNX export (opset 18, classic tracer, dynamic batch axis) → `build_trt_engine.py` builds FP16 engine with batch profile (1,128,256) → C++ `TRTEvaluator` uses `enqueueV3` with pinned buffers; shared `RawBatchEvaluator` interface lets `GameManager` swap backends. Enabled via `SearchEngine(..., use_trt=True)`, `training_loop(use_trt=True)` / `--use-trt`, or `chess_engine uci_trt <engine>`
 
 ## Non-Goals (Right Now)
 
@@ -149,6 +152,18 @@ chess-ai/
 - **C++17** with CMake 3.20+
 - **MSVC** (Visual Studio 2022 Community)
 - **Google Test** via FetchContent (no system install)
+- **Python packaging** via scikit-build-core (`pyproject.toml`) — `chess_mcts`
+  becomes a proper site-packages package with DLL resolution baked in at
+  configure time. No more manual `.pyd` copies or `PYTHONPATH` hacks.
+
+**Primary Python workflow (recommended):**
+- Install once: `pip install -e .`
+  (TensorRT is on by default — requires `TENSORRT_PATH` env var; to opt out
+  pass `--config-settings=cmake.define.ENABLE_TENSORRT=OFF`)
+- `import chess_mcts` then works from any directory, any shell.
+- Editable install auto-rebuilds on C++ source change via scikit-build-core.
+
+**C++-only / ctest workflow (via `build.ps1`):**
 - Generator: `cmake -B build -G "Visual Studio 17 2022"`
 - Build: `cmake --build build --config Release`
 - Test: `ctest --test-dir build --build-config Release --output-on-failure`

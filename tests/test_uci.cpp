@@ -122,3 +122,55 @@ TEST_F(UCITest, GoInfiniteAndStop) {
     handler.loop();
     EXPECT_NE(out.str().find("bestmove"), std::string::npos);
 }
+
+TEST_F(UCITest, UciAdvertisesGuiFriendlyOptions) {
+    // Arena/Lichess routinely try to set Hash/Threads/Ponder/Move Overhead.
+    // Missing advertisements make some GUIs refuse the engine entirely.
+    std::istringstream in("uci\nquit\n");
+    std::ostringstream out;
+    mcts::RandomEvaluator eval;
+    uci::UCIHandler handler(eval, {}, in, out);
+    handler.loop();
+    auto s = out.str();
+    EXPECT_NE(s.find("option name Hash"), std::string::npos);
+    EXPECT_NE(s.find("option name Threads"), std::string::npos);
+    EXPECT_NE(s.find("option name UCI_Chess960"), std::string::npos);
+    EXPECT_NE(s.find("option name Ponder"), std::string::npos);
+    EXPECT_NE(s.find("option name Move Overhead"), std::string::npos);
+}
+
+TEST_F(UCITest, SetOptionAcceptsMultiWordNames) {
+    // "Move Overhead" has a space — the parser must handle that. Also verify
+    // it doesn't blow up on Hash/Threads/Ponder (which we accept but ignore).
+    std::istringstream in(
+        "setoption name Hash value 512\n"
+        "setoption name Threads value 4\n"
+        "setoption name Ponder value false\n"
+        "setoption name Move Overhead value 200\n"
+        "setoption name Iterations value 123\n"
+        "position startpos\n"
+        "go nodes 10\n"
+        "quit\n");
+    std::ostringstream out;
+    mcts::RandomEvaluator eval;
+    uci::UCIHandler handler(eval, {}, in, out);
+    handler.loop();
+    // Nothing crashed and we still produced a move.
+    EXPECT_NE(out.str().find("bestmove"), std::string::npos);
+}
+
+TEST_F(UCITest, InfoLineIncludesDepthAndTime) {
+    // Arena/Lichess display Depth and Time columns — make sure we emit them.
+    std::istringstream in(
+        "position startpos\ngo nodes 200\nquit\n");
+    std::ostringstream out;
+    mcts::RandomEvaluator eval;
+    mcts::SearchParams params;
+    params.add_noise = false;
+    uci::UCIHandler handler(eval, params, in, out);
+    handler.loop();
+    auto s = out.str();
+    EXPECT_NE(s.find("info"), std::string::npos);
+    EXPECT_NE(s.find("depth "), std::string::npos);
+    EXPECT_NE(s.find("time "), std::string::npos);
+}

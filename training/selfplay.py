@@ -60,6 +60,12 @@ class _CppMCTSConfig:
             'contempt': cfg.contempt,
             'sibling_blending': getattr(cfg, 'sibling_blending', True),
             'nn_cache_size': cfg.nn_cache_size,
+            'max_collapse_visits': getattr(cfg, 'max_collapse_visits', 8),
+            'fpu_absolute_root': getattr(cfg, 'fpu_absolute_root', False),
+            'fpu_absolute_root_value': getattr(cfg, 'fpu_absolute_root_value', 1.0),
+            'mlh_weight': getattr(cfg, 'mlh_weight', 0.0),
+            'mlh_cap': getattr(cfg, 'mlh_cap', 10.0),
+            'mlh_q_threshold': getattr(cfg, 'mlh_q_threshold', 0.6),
         }
 
 
@@ -133,6 +139,8 @@ class SelfPlayConfig:
     syzygy_path: str | None = None          # Path to Syzygy tablebase files (None = disabled)
     random_opening_fraction: float = 0.05   # Fraction of games with random openings
     random_opening_moves: int = 8           # Max random moves for opening randomization
+    opening_book_path: str | None = None    # File of starting FENs, one per line (None = disabled)
+    opening_book_fraction: float = 0.5      # Fraction of games seeded from book FENs
 
 
 @dataclass
@@ -179,6 +187,38 @@ class GameRecord:
     result: str = '*'
     num_moves: int = 0
     moves_uci: list[str] = field(default_factory=list)
+
+
+_opening_book_cache: dict[str, list[str]] = {}
+
+
+def _load_opening_book(path: str | None) -> list[str]:
+    """Load opening FENs from file. Cached by path. Returns [] if path is None/missing."""
+    if not path:
+        return []
+    if path in _opening_book_cache:
+        return _opening_book_cache[path]
+    if not os.path.exists(path):
+        print(f"  Warning: opening book not found at {path}, skipping")
+        _opening_book_cache[path] = []
+        return []
+    with open(path) as f:
+        fens = [line.strip() for line in f if line.strip() and not line.startswith('#')]
+    print(f"  Loaded {len(fens)} opening positions from {path}")
+    _opening_book_cache[path] = fens
+    return fens
+
+
+def _sample_opening_fen(config: SelfPlayConfig) -> str | None:
+    """Pick a random book FEN, or None if book not configured / not triggered."""
+    if not config.opening_book_path or config.opening_book_fraction <= 0:
+        return None
+    if random.random() >= config.opening_book_fraction:
+        return None
+    fens = _load_opening_book(config.opening_book_path)
+    if not fens:
+        return None
+    return random.choice(fens)
 
 
 def _try_load_syzygy(path: str | None):
@@ -255,11 +295,23 @@ def play_game(mcts, config: SelfPlayConfig) -> GameRecord:
     """
     if mcts.nn_cache is not None:
         mcts.nn_cache.clear()
-    board = chess.Board()
+
+    # Opening book seeding: start from a random book position if configured.
+    # Falls back to standard opening randomization when no book FEN is sampled.
+    book_fen = _sample_opening_fen(config)
+    if book_fen is not None:
+        try:
+            board = chess.Board(book_fen)
+        except ValueError:
+            board = chess.Board()
+            book_fen = None
+    else:
+        board = chess.Board()
     record = GameRecord()
 
-    # Opening randomization: play random moves to diversify openings
-    if config.random_opening_fraction > 0 and random.random() < config.random_opening_fraction:
+    # Opening randomization: play random moves to diversify openings (only if not book-seeded)
+    if book_fen is None and config.random_opening_fraction > 0 and \
+            random.random() < config.random_opening_fraction:
         n_random = random.randint(2, config.random_opening_moves)
         for _ in range(n_random):
             legal = list(board.legal_moves)
@@ -421,6 +473,8 @@ def play_games_batched(
     parallel_games: int,
     use_fp16: bool = False,
     on_game_done=None,
+    use_trt: bool = False,
+    trt_engine_path: str = "",
 ) -> list[GameRecord]:
     """Play num_games concurrently using chess_mcts.GameManager.
 
@@ -433,11 +487,21 @@ def play_games_batched(
     """
     cfg_proxy = _CppMCTSConfig(mcts_config)
     cfg_dict = cfg_proxy._to_dict()
-    try:
-        manager = chess_mcts.GameManager(model_path, device, cfg_dict, use_fp16)
-    except TypeError:
-        # Older build without use_fp16 kwarg
-        manager = chess_mcts.GameManager(model_path, device, cfg_dict)
+    if use_trt:
+        try:
+            manager = chess_mcts.GameManager(
+                model_path, device, cfg_dict, use_fp16, True, trt_engine_path,
+            )
+        except TypeError as e:
+            raise RuntimeError(
+                "chess_mcts module lacks use_trt support — rebuild with -DENABLE_TENSORRT=ON"
+            ) from e
+    else:
+        try:
+            manager = chess_mcts.GameManager(model_path, device, cfg_dict, use_fp16)
+        except TypeError:
+            # Older build without use_fp16 kwarg
+            manager = chess_mcts.GameManager(model_path, device, cfg_dict)
 
     num_sims = mcts_config.num_simulations
     parallel_games = max(1, min(parallel_games, num_games))
@@ -458,10 +522,20 @@ def play_games_batched(
             slot_board[slot] = None
             return False
         next_game_id[0] += 1
-        board = chess.Board()
+
+        # Opening book seeding (falls back to standard board on invalid FEN)
+        book_fen = _sample_opening_fen(selfplay_config)
+        if book_fen is not None:
+            try:
+                board = chess.Board(book_fen)
+            except ValueError:
+                board = chess.Board()
+                book_fen = None
+        else:
+            board = chess.Board()
         record = GameRecord()
-        # Opening randomization
-        if selfplay_config.random_opening_fraction > 0 and \
+        # Opening randomization (skip if book-seeded)
+        if book_fen is None and selfplay_config.random_opening_fraction > 0 and \
                 random.random() < selfplay_config.random_opening_fraction:
             n_random = random.randint(2, selfplay_config.random_opening_moves)
             for _ in range(n_random):
@@ -599,6 +673,8 @@ def generate_games(
     metrics_logger=None,
     model_path: str | None = None,
     parallel_games: int = 16,
+    use_trt: bool = False,
+    trt_engine_path: str = "",
 ) -> int:
     """Generate self-play games and save as .npz file.
 
@@ -609,11 +685,11 @@ def generate_games(
     use_cpp = HAS_CPP_MCTS and model_path is not None
 
     if use_cpp:
-        # Use larger batch size for C++ MCTS to reduce GPU call overhead
-        cpp_config = MCTSConfig(
-            num_simulations=mcts_config.num_simulations,
-            batch_size=max(mcts_config.batch_size, 64),
-        )
+        # Use larger batch size for C++ MCTS to reduce GPU call overhead.
+        # Preserve all other mcts_config fields (FPU, MLH, contempt, etc.) — earlier
+        # code built a fresh MCTSConfig that silently dropped them.
+        from dataclasses import replace
+        cpp_config = replace(mcts_config, batch_size=max(mcts_config.batch_size, 128))
         print(f"  Using C++ GameManager ({device}, parallel_games={parallel_games}, "
               f"batch_size={cpp_config.batch_size})")
     else:
@@ -664,6 +740,8 @@ def generate_games(
             parallel_games=parallel_games,
             use_fp16=(device == 'cuda'),
             on_game_done=_on_done,
+            use_trt=use_trt,
+            trt_engine_path=trt_engine_path,
         )
     else:
         mcts = MCTS(model, mcts_config, device=device)
@@ -700,9 +778,27 @@ def generate_games(
     total_positions = len(all_planes)
 
     os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
-    np.savez(
+
+    # Pack dense planes → 104 uint64 bitboards + 4 scalar metadata arrays.
+    # Disk footprint is ~3–4× smaller (binary planes only, no scalar broadcast),
+    # and np.savez_compressed adds gzip on top. The 8 scalar feature planes
+    # (color/fullmove/castling/rule50/bias) are reconstructible from metadata
+    # at load time, so we drop them from disk.
+    from training.dataset import _pack_dense_planes, _extract_metadata_from_dense
+    planes_arr = np.asarray(all_planes, dtype=np.float32)
+    bitboards = _pack_dense_planes(planes_arr)
+    meta = _extract_metadata_from_dense(planes_arr)
+    # Release the dense array ASAP to keep peak RAM flat during save.
+    del planes_arr
+
+    np.savez_compressed(
         output_path,
-        planes=np.array(all_planes, dtype=np.float32),
+        format_version=np.uint8(2),
+        bitboards=bitboards,
+        stm=meta['stm'],
+        castling=meta['castling'],
+        rule50=meta['rule50'],
+        fullmove=meta['fullmove'],
         policies=np.array(all_policies, dtype=np.float32),
         values=np.array(all_values, dtype=np.float32),
         moves_left=np.array(all_moves_left, dtype=np.float32),
@@ -715,9 +811,82 @@ def generate_games(
     return total_positions
 
 
+def resolve_tier(
+    gen: int,
+    schedule: list[tuple[int, int, int]] | None,
+    default_blocks: int,
+    default_filters: int,
+) -> tuple[int, int]:
+    """Return (blocks, filters) active for `gen` given a tier schedule.
+
+    Schedule entries are (gen_start, blocks, filters) — last tier with
+    gen_start <= gen wins. If schedule is falsy, returns the defaults.
+    """
+    if not schedule:
+        return default_blocks, default_filters
+    active = [t for t in schedule if t[0] <= gen]
+    if not active:
+        return default_blocks, default_filters
+    _, blocks, filters = active[-1]
+    return blocks, filters
+
+
+def load_checkpoint_with_config(
+    resume_from: str,
+    default_blocks: int,
+    default_filters: int,
+    device: str,
+) -> tuple[ChessNetwork, NetworkConfig, int]:
+    """Load a checkpoint, honoring its saved NetworkConfig when present.
+
+    Returns (model loaded with saved weights, its config, next_gen).
+    When the checkpoint carries no 'config' key, falls back to the defaults
+    supplied by the caller.
+    """
+    checkpoint = torch.load(resume_from, map_location=device, weights_only=False)
+    saved_cfg = checkpoint.get('config')
+    if saved_cfg is not None:
+        config = saved_cfg
+    else:
+        config = NetworkConfig(num_blocks=default_blocks, num_filters=default_filters)
+    model = ChessNetwork(config).to(device)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    start_gen = checkpoint['generation'] + 1
+    return model, config, start_gen
+
+
+def _trt_available() -> bool:
+    """Return True if both the tensorrt Python package and TRT bindings in
+    chess_mcts are usable. Cheap probe — only imports tensorrt.
+    """
+    try:
+        # build_trt_engine handles $TENSORRT_PATH DLL discovery on Windows
+        from training import build_trt_engine  # noqa: F401
+        import tensorrt  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+def _build_trt_engine_for_self_play(model, cpp_model_path: str) -> str:
+    """Export ONNX from `model` and build a TensorRT engine alongside cpp_model_path.
+
+    Returns the .trt path. Uses env TENSORRT_PATH for DLL discovery (handled in
+    training.build_trt_engine).
+    """
+    from training.export import export_onnx
+    from training.build_trt_engine import build_engine
+
+    onnx_path = cpp_model_path.replace('.pt', '.onnx')
+    trt_path = cpp_model_path.replace('.pt', '.trt')
+    export_onnx(model, onnx_path)
+    build_engine(onnx_path, trt_path)
+    return trt_path
+
+
 def training_loop(
     generations: int = 10,
-    games_per_gen: int = 50,
+    games_per_gen: int = 400,
     train_epochs: int = 5,
     batch_size: int = 2048,
     lr: float = 1e-3,
@@ -726,15 +895,19 @@ def training_loop(
     blocks: int = 10,
     filters: int = 128,
     window_size: int = 5,
-    output_dir: str = 'selfplay_output',
+    output_dir: str = 'models/current_run',
     device: str = 'auto',
     max_moves: int = 512,
     resign_threshold: float = -0.95,
     use_swa: bool = True,
     syzygy_path: str | None = None,
+    opening_book_path: str | None = None,
+    opening_book_fraction: float = 0.5,
     adaptive: AdaptiveConfig | None = None,
     resume_from: str | None = None,
-    parallel_games: int = 16,
+    parallel_games: int = 128,
+    network_schedule: list[tuple[int, int, int]] | None = None,
+    use_trt: bool = True,
 ):
     """Full reinforcement learning training loop.
 
@@ -747,6 +920,14 @@ def training_loop(
 
     After all generations, export final TorchScript model.
     """
+    # TRT fallback: if the caller opted into use_trt but the environment can't
+    # provide it (no tensorrt wheel, TENSORRT_PATH unset, or chess_mcts built
+    # without HAS_TENSORRT), warn once and continue with LibTorch FP16.
+    if use_trt and not _trt_available():
+        print("  [warn] use_trt=True but tensorrt not importable — falling back to LibTorch FP16. "
+              "Install the tensorrt wheel from your TensorRT SDK and set TENSORRT_PATH to enable.")
+        use_trt = False
+
     from torch.utils.data import DataLoader, WeightedRandomSampler
     from training.dataset import ChessDataset
     from training.train import compute_loss, create_optimizer
@@ -764,19 +945,31 @@ def training_loop(
     metrics_dir = os.path.join(output_dir, 'metrics')
     metrics_logger = MetricsLogger(metrics_dir)
 
-    config = NetworkConfig(num_blocks=blocks, num_filters=filters)
-    model = ChessNetwork(config).to(device)
-    optimizer = create_optimizer(model, lr=lr, weight_decay=weight_decay)
-
-    # Resume from checkpoint if specified
+    # Resume path takes priority: saved architecture wins over caller args.
     start_gen = 1
     if resume_from:
         print(f"Resuming from checkpoint: {resume_from}")
+        model, config, start_gen = load_checkpoint_with_config(
+            resume_from,
+            default_blocks=blocks,
+            default_filters=filters,
+            device=device,
+        )
+        blocks = config.num_blocks
+        filters = config.num_filters
+        optimizer = create_optimizer(model, lr=lr, weight_decay=weight_decay)
         checkpoint = torch.load(resume_from, map_location=device, weights_only=False)
-        model.load_state_dict(checkpoint['model_state_dict'])
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        start_gen = checkpoint['generation'] + 1
-        print(f"  Loaded generation {checkpoint['generation']}, resuming from gen {start_gen}")
+        try:
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        except (ValueError, KeyError) as e:
+            print(f"  Optimizer state could not be restored ({e}); continuing with fresh optimizer.")
+        print(f"  Loaded generation {start_gen - 1} ({blocks}b{filters}f), resuming from gen {start_gen}")
+    else:
+        # Pick initial tier if schedule is set.
+        blocks, filters = resolve_tier(1, network_schedule, blocks, filters)
+        config = NetworkConfig(num_blocks=blocks, num_filters=filters)
+        model = ChessNetwork(config).to(device)
+        optimizer = create_optimizer(model, lr=lr, weight_decay=weight_decay)
 
     # Stochastic Weight Averaging: use averaged model for self-play (smoother policy)
     swa_model = None
@@ -784,8 +977,26 @@ def training_loop(
         from torch.optim.swa_utils import AveragedModel
         swa_model = AveragedModel(model)
 
-    mcts_config = MCTSConfig(num_simulations=num_simulations)
-    selfplay_config = SelfPlayConfig(max_moves=max_moves, resign_threshold=resign_threshold, syzygy_path=syzygy_path)
+    # Enable Lc0-style search features for the training loop:
+    # - Absolute root FPU: unvisited root children treated as value=1.0 (pessimistic),
+    #   encouraging broader early root exploration.
+    # - MLH PUCT bonus: in winning/losing positions, prefer children that shorten/lengthen
+    #   the game. Disabled until MLH outputs diverge (which requires training signal).
+    mcts_config = MCTSConfig(
+        num_simulations=num_simulations,
+        fpu_absolute_root=True,
+        fpu_absolute_root_value=1.0,
+        mlh_weight=0.03,
+        mlh_cap=8.0,
+        mlh_q_threshold=0.6,
+    )
+    selfplay_config = SelfPlayConfig(
+        max_moves=max_moves,
+        resign_threshold=resign_threshold,
+        syzygy_path=syzygy_path,
+        opening_book_path=opening_book_path,
+        opening_book_fraction=opening_book_fraction,
+    )
 
     # Default adaptive config if not provided
     if adaptive is None:
@@ -796,10 +1007,27 @@ def training_loop(
     print(f"Starting training loop: generations {start_gen}-{end_gen}, {games_per_gen} games/gen")
     print(f"Device: {device}, Model: {blocks} blocks, {filters} filters"
           f"{', SWA enabled' if use_swa else ''}"
-          f"{', adaptive' if adaptive.enabled else ''}")
+          f"{', adaptive' if adaptive.enabled else ''}"
+          f"{f', tiered schedule={network_schedule}' if network_schedule else ''}")
 
     for gen in range(start_gen, end_gen + 1):
         gen_start = time.time()
+
+        # Tier transition: rebuild model (and optimizer/SWA) if the schedule
+        # says this generation belongs to a new tier.
+        target_blocks, target_filters = resolve_tier(
+            gen, network_schedule, blocks, filters,
+        )
+        if (target_blocks, target_filters) != (config.num_blocks, config.num_filters):
+            print(f"  Scaling net: {config.num_blocks}b{config.num_filters}"
+                  f" -> {target_blocks}b{target_filters}")
+            config = NetworkConfig(num_blocks=target_blocks, num_filters=target_filters)
+            model = ChessNetwork(config).to(device)
+            optimizer = create_optimizer(model, lr=lr, weight_decay=weight_decay)
+            if use_swa:
+                from torch.optim.swa_utils import AveragedModel
+                swa_model = AveragedModel(model)
+            blocks, filters = target_blocks, target_filters
 
         # Adaptive settings: adjust sims/max_moves/games per generation
         gen_sims, gen_max_moves, gen_games = get_gen_settings(gen, adaptive)
@@ -808,7 +1036,8 @@ def training_loop(
 
         print(f"\n{'='*60}")
         print(f"Generation {gen}/{end_gen}"
-              f" (sims={gen_sims}, max_moves={gen_max_moves}, games={gen_games})")
+              f" (sims={gen_sims}, max_moves={gen_max_moves}, games={gen_games},"
+              f" net={blocks}b{filters}f)")
         print(f"{'='*60}")
 
         # 1. Generate self-play games (use SWA model if available)
@@ -819,15 +1048,20 @@ def training_loop(
         # Export TorchScript model for C++ MCTS (always export so C++ engine can use it)
         # Always export from the base model (SWA wrapper lacks .config)
         cpp_model_path = os.path.join(checkpoint_dir, 'selfplay_model.pt')
+        trt_engine_path = ""
         if swa_model is not None and gen > 1:
             # Copy SWA params into base model temporarily for export
             swa_state = swa_model.module.state_dict()
             orig_state = model.state_dict()
             model.load_state_dict(swa_state)
             export_torchscript(model, cpp_model_path, device=device)
+            if use_trt:
+                trt_engine_path = _build_trt_engine_for_self_play(model, cpp_model_path)
             model.load_state_dict(orig_state)
         else:
             export_torchscript(model, cpp_model_path, device=device)
+            if use_trt:
+                trt_engine_path = _build_trt_engine_for_self_play(model, cpp_model_path)
 
         num_positions = generate_games(
             play_model, gen_games, data_path,
@@ -837,6 +1071,8 @@ def training_loop(
             metrics_logger=metrics_logger,
             model_path=cpp_model_path,
             parallel_games=parallel_games,
+            use_trt=use_trt,
+            trt_engine_path=trt_engine_path,
         )
 
         # 2. Load sliding window of recent generations
@@ -930,6 +1166,7 @@ def training_loop(
             num_positions=num_positions,
             training=training_metrics,
             duration_s=gen_time,
+            network={'blocks': config.num_blocks, 'filters': config.num_filters},
         )
 
     # Export final TorchScript model
@@ -955,7 +1192,7 @@ def main():
     # Loop subcommand
     loop_parser = subparsers.add_parser('loop', help='Run full RL training loop')
     loop_parser.add_argument('--generations', type=int, default=10)
-    loop_parser.add_argument('--games-per-gen', type=int, default=50)
+    loop_parser.add_argument('--games-per-gen', type=int, default=400)
     loop_parser.add_argument('--train-epochs', type=int, default=5)
     loop_parser.add_argument('--batch-size', type=int, default=2048)
     loop_parser.add_argument('--lr', type=float, default=1e-3)
@@ -963,17 +1200,21 @@ def main():
     loop_parser.add_argument('--blocks', type=int, default=10)
     loop_parser.add_argument('--filters', type=int, default=128)
     loop_parser.add_argument('--window-size', type=int, default=5)
-    loop_parser.add_argument('--output-dir', type=str, default='selfplay_output')
+    loop_parser.add_argument('--output-dir', type=str, default='models/current_run')
     loop_parser.add_argument('--device', type=str, default='auto')
     loop_parser.add_argument('--max-moves', type=int, default=512)
     loop_parser.add_argument('--syzygy', type=str, default=None, help='Path to Syzygy tablebase files')
+    loop_parser.add_argument('--opening-book', type=str, default=None, help='Path to opening book FEN file (one FEN per line)')
+    loop_parser.add_argument('--opening-book-fraction', type=float, default=0.5, help='Fraction of games seeded from book')
     loop_parser.add_argument('--adaptive', action='store_true', default=False, help='Enable adaptive settings per generation')
     loop_parser.add_argument('--no-adaptive', dest='adaptive', action='store_false')
     loop_parser.add_argument('--early-sims', type=int, default=100, help='Simulations for early generations')
     loop_parser.add_argument('--early-max-moves', type=int, default=150, help='Max moves for early generations')
     loop_parser.add_argument('--early-games', type=int, default=200, help='Games per early generation')
     loop_parser.add_argument('--resume-from', type=str, default=None, help='Resume from a checkpoint file (e.g. selfplay_output/checkpoints/model_gen_5.pt)')
-    loop_parser.add_argument('--parallel-games', type=int, default=16, help='Concurrent self-play games (C++ GameManager cross-game batching)')
+    loop_parser.add_argument('--parallel-games', type=int, default=128, help='Concurrent self-play games (C++ GameManager cross-game batching)')
+    loop_parser.add_argument('--use-trt', dest='use_trt', action='store_true', default=True, help='Export ONNX + build TensorRT engine per generation and run self-play through the TRT backend (default: on)')
+    loop_parser.add_argument('--no-use-trt', dest='use_trt', action='store_false', help='Disable TensorRT backend (use LibTorch only)')
 
     args = parser.parse_args()
 
@@ -1028,9 +1269,12 @@ def main():
             device=args.device,
             max_moves=args.max_moves,
             syzygy_path=getattr(args, 'syzygy', None),
+            opening_book_path=getattr(args, 'opening_book', None),
+            opening_book_fraction=getattr(args, 'opening_book_fraction', 0.5),
             adaptive=adaptive_config,
             resume_from=getattr(args, 'resume_from', None),
-            parallel_games=getattr(args, 'parallel_games', 16),
+            parallel_games=getattr(args, 'parallel_games', 128),
+            use_trt=getattr(args, 'use_trt', True),
         )
 
 

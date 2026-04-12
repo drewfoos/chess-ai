@@ -26,7 +26,15 @@ NeuralEvaluator::NeuralEvaluator(const std::string& model_path, const std::strin
     model_.eval();
     use_fp16_ = use_fp16;
     if (use_fp16_ && device_ == torch::kCUDA) {
-        model_.to(torch::kHalf);
+        // Only cast floating-point tensors. Module::to(kHalf) casts ALL buffers,
+        // which would corrupt integer index buffers (e.g. AttentionPolicyHead's
+        // policy_index: long values up to 4287 can't round-trip through FP16).
+        for (auto p : model_.parameters()) {
+            if (p.is_floating_point()) p.set_data(p.to(torch::kHalf));
+        }
+        for (auto b : model_.buffers()) {
+            if (b.is_floating_point()) b.set_data(b.to(torch::kHalf));
+        }
     } else {
         use_fp16_ = false;  // FP16 only on CUDA
     }
@@ -71,6 +79,12 @@ mcts::EvalResult NeuralEvaluator::evaluate(const Position& pos, const Move* move
     // Value: win - loss
     auto wdl_acc = wdl_probs.accessor<float, 2>();
     result.value = wdl_acc[0][0] - wdl_acc[0][2];
+
+    // Optional MLH output (3rd tuple element). Older 2-output models → mlh=0.
+    if (output->elements().size() >= 3) {
+        auto mlh = output->elements()[2].toTensor().to(torch::kCPU).to(torch::kFloat32);
+        result.mlh = mlh.dim() == 0 ? mlh.item<float>() : mlh.accessor<float, 1>()[0];
+    }
 
     // Policy: extract logits for legal moves, then softmax
     auto policy_acc = policy_logits.accessor<float, 2>();
@@ -144,9 +158,20 @@ std::vector<mcts::EvalResult> NeuralEvaluator::evaluate_batch(
     auto policy_acc = policy_logits.accessor<float, 2>();
     auto wdl_acc = wdl_probs.accessor<float, 2>();
 
+    // Optional MLH tensor (1D, size B). Keep a flat float* and a has_mlh flag;
+    // older 2-output models leave mlh as 0.
+    bool has_mlh = output->elements().size() >= 3;
+    torch::Tensor mlh_tensor;
+    const float* mlh_ptr = nullptr;
+    if (has_mlh) {
+        mlh_tensor = output->elements()[2].toTensor().to(torch::kCPU).to(torch::kFloat32).contiguous();
+        mlh_ptr = mlh_tensor.data_ptr<float>();
+    }
+
     std::vector<mcts::EvalResult> results(batch_size);
     for (int b = 0; b < batch_size; b++) {
         results[b].value = wdl_acc[b][0] - wdl_acc[b][2];
+        if (has_mlh) results[b].mlh = mlh_ptr[b];
 
         int num_moves = requests[b].num_legal_moves;
         if (num_moves == 0) {
@@ -226,10 +251,19 @@ std::vector<BatchResult> NeuralEvaluator::evaluate_batch_raw(
     auto policy_acc = policy_logits.accessor<float, 2>();
     auto wdl_acc = wdl_probs.accessor<float, 2>();
 
+    bool has_mlh = output->elements().size() >= 3;
+    torch::Tensor mlh_tensor;
+    const float* mlh_ptr = nullptr;
+    if (has_mlh) {
+        mlh_tensor = output->elements()[2].toTensor().to(torch::kCPU).to(torch::kFloat32).contiguous();
+        mlh_ptr = mlh_tensor.data_ptr<float>();
+    }
+
     // Process each result
     for (int b = 0; b < batch_size; b++) {
         // Value: win - loss
         results[b].value = wdl_acc[b][0] - wdl_acc[b][2];
+        if (has_mlh) results[b].mlh = mlh_ptr[b];
 
         // Full policy (1858-dim, before masking to legal moves)
         results[b].full_policy.resize(POLICY_SIZE);

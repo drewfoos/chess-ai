@@ -76,9 +76,9 @@ void Search::replay_moves(const Position& root_pos, const std::vector<Move>& mov
     }
 }
 
-void Search::backpropagate(Node* node, float value) {
+void Search::backpropagate(Node* node, float value, int n) {
     while (node != nullptr) {
-        node->update(value);
+        node->update(value, n);
         value = -value;
         node = node->parent();
     }
@@ -137,8 +137,11 @@ void Search::propagate_terminal(Node* node) {
 Node* Search::select_child_advanced(Node* node, bool is_root) {
     assert(!node->is_leaf());
 
+    bool absolute_fpu_at_root = is_root && params_.fpu_absolute_root;
     float fpu_red = is_root ? params_.fpu_reduction_root : params_.fpu_reduction;
-    float fpu_value = node->mean_value() - fpu_red;
+    float fpu_value = absolute_fpu_at_root
+        ? params_.fpu_absolute_root_value
+        : node->mean_value() - fpu_red;
     float c_puct = dynamic_cpuct(node->visit_count());
 
     // Variance-scaled cPUCT
@@ -152,8 +155,9 @@ Node* Search::select_child_advanced(Node* node, bool is_root) {
     float sqrt_parent = std::sqrt(static_cast<float>(node->visit_count()));
 
     // Sibling blending: compute average value of visited siblings for FPU
+    // (disabled at root when absolute-FPU is on — see game_manager.cpp for rationale).
     float sibling_fpu = fpu_value;
-    if (params_.sibling_blending) {
+    if (params_.sibling_blending && !absolute_fpu_at_root) {
         float visited_sum = 0.0f;
         int visited_count = 0;
         for (int i = 0; i < node->num_edges(); i++) {
@@ -193,7 +197,7 @@ Node* Search::select_child_advanced(Node* node, bool is_root) {
             float child_fpu = sibling_fpu;
 
             // Per-child sibling blending: use average of visited siblings with similar priors
-            if (params_.sibling_blending) {
+            if (params_.sibling_blending && !absolute_fpu_at_root) {
                 float child_prior = edge_prior;
                 float sim_sum = 0.0f;
                 int sim_count = 0;
@@ -219,6 +223,14 @@ Node* Search::select_child_advanced(Node* node, bool is_root) {
             // Uncertainty boosting
             if (params_.uncertainty_weight > 0.0f && child->visit_count() > 1) {
                 score += params_.uncertainty_weight * std::sqrt(child->value_variance());
+            }
+
+            // Lc0-style MLH bonus — see game_manager.cpp for rationale.
+            if (params_.mlh_weight > 0.0f && std::abs(q) > params_.mlh_q_threshold) {
+                float delta_m = node->mlh() - child->mlh() - 1.0f;
+                float bonus = params_.mlh_weight * (q >= 0.0f ? 1.0f : -1.0f) * delta_m;
+                bonus = std::max(-params_.mlh_cap, std::min(params_.mlh_cap, bonus));
+                score += bonus;
             }
         }
 
@@ -272,6 +284,7 @@ void Search::expand_node(Node* node, const Position& pos, const EvalResult& eval
 
     node->create_edges(moves, priors.data(), num_moves);
     node->sort_edges_by_prior();
+    node->set_mlh(eval_result.mlh);
 }
 
 // Helper: revert virtual loss on all nodes in the path
@@ -342,6 +355,7 @@ void Search::gather_leaf(Node* root, const neural::PositionHistory& history,
         EvalResult eval_result;
         eval_result.policy = cached->policy;
         eval_result.value = cached->value;
+        eval_result.mlh = cached->mlh;
 
         expand_node(node, current_pos, eval_result);
 
@@ -511,6 +525,7 @@ SearchResult Search::run(const neural::PositionHistory& history) {
     // Expand root with edges
     root->create_edges(moves, root_eval.policy.data(), num_moves);
     root->sort_edges_by_prior();
+    root->set_mlh(root_eval.mlh);
 
     // Initial root visit
     root->update(root_eval.value);
@@ -521,6 +536,7 @@ SearchResult Search::run(const neural::PositionHistory& history) {
     root_entry.policy = root_eval.policy;
     root_entry.value = root_eval.value;
     root_entry.num_moves = num_moves;
+    root_entry.mlh = root_eval.mlh;
     cache_.put(root_hash, std::move(root_entry));
 
     // Add Dirichlet noise at root for exploration
@@ -606,6 +622,7 @@ SearchResult Search::run(const neural::PositionHistory& history) {
                 entry.policy = eval_result.policy;
                 entry.value = eval_result.value;
                 entry.num_moves = leaf_num_moves[i];
+                entry.mlh = eval_result.mlh;
                 cache_.put(pos_hash, std::move(entry));
 
                 propagate_terminal(pe.leaf);

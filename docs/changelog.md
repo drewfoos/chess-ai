@@ -8,6 +8,43 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 
 ## [Unreleased]
 
+### Changed — Python Packaging via scikit-build-core
+- New `pyproject.toml` at repo root wires the project to the `scikit_build_core.build` backend; `pip install -e .` now produces a proper editable site-packages install of `chess_mcts` with auto-rebuild on C++ source change
+- Compiled pybind11 extension renamed `chess_mcts` → `chess_mcts._core` (i.e. the `.pyd` now lives *inside* the Python package); user-facing API is unchanged — `import chess_mcts` still re-exports `SearchEngine`, `GameManager`, `SearchResult`, `encode_packed`
+- New `src/python/chess_mcts/__init__.py` registers LibTorch + TensorRT DLL directories via `os.add_dll_directory` before loading `_core`, fixing recurring Windows `ImportError: DLL load failed` when importing from a bare shell / arbitrary CWD (Python 3.8+ import uses `LOAD_LIBRARY_SEARCH_DEFAULT_DIRS` which ignores `%PATH%`)
+- New `src/python/chess_mcts/_paths.py.in`: CMake `configure_file()` bakes absolute `LIBTORCH_LIB` / `TENSORRT_BIN` paths into the installed package at configure time — no env-var drift, no PATH hacks at runtime
+- `CMakeLists.txt`: `BUILD_PYTHON` target renamed `chess_mcts` → `_core`; added `install(TARGETS _core DESTINATION chess_mcts COMPONENT python)` + `install(FILES _paths.py ...)` so scikit-build-core can bundle both into the wheel; post-build DLL copy guarded with `if(NOT SKBUILD)` so `build.ps1` workflows still get DLLs copied next to the extension
+- `pyproject.toml` enables TensorRT by default via `cmake.args = ["-DENABLE_TENSORRT=ON", ...]`; opt out with `pip install -e . --config-settings=cmake.define.ENABLE_TENSORRT=OFF`
+- `training/__init__.py` simplified to a one-line `import chess_mcts` safeguard (DLL registration is now the package's own responsibility)
+- `.gitignore` adds `_skbuild/` and `*.pyd`
+- `CLAUDE.md` build section documents `pip install -e .` as the primary Python workflow; `build.ps1` remains the C++-only / `ctest` path
+
+### Added — TensorRT Inference Backend
+- `training/export.py::export_onnx()` emits opset-18 ONNX with `dynamic_axes={'input':{0:'batch'},...}` via the classic tracer (`dynamo=False`) — the dynamo exporter bakes batch=1 into Gemm shapes even when dynamic axes are requested
+- `training/build_trt_engine.py` builds a serialized FP16 engine from ONNX with a batch optimization profile `(min, opt, max) = (1, 128, 256)`; prepends `$TENSORRT_PATH/bin` to `os.environ['PATH']` before importing tensorrt (TRT's Python loader walks PATH directly)
+- `src/neural/trt_evaluator.{h,cpp}`: `TRTEvaluator` mirrors `NeuralEvaluator`'s interface — `evaluate()` + `evaluate_batch()` + `evaluate_batch_raw()` — using `IRuntime::deserializeCudaEngine` + `IExecutionContext::enqueueV3` with pinned host + device buffers pre-allocated for `max_batch_size`. `setInputShape()` binds the dynamic batch dim per call
+- `neural::RawBatchEvaluator` abstract interface lets `GameManager` hold either `NeuralEvaluator` or `TRTEvaluator` behind `evaluate_batch_raw()`
+- `SearchEngine`, `PyGameManager` accept `use_trt: bool` + `trt_engine_path: str` kwargs; `chess_engine uci_trt <engine>` and `chess_engine search_nn_trt <engine> [fen] [iters]` expose the TRT path from the CLI
+- `training_loop(use_trt=True)` (also `--use-trt` flag) exports ONNX + rebuilds the TRT engine alongside `selfplay_model.pt` each generation and passes the engine path into `play_games_batched`
+- `CMakeLists.txt` gains `ENABLE_TENSORRT` option with `find_path(NvInfer.h)` / `find_library(nvinfer_10, nvonnxparser_10)` under `$TENSORRT_ROOT`; `build.ps1 -TensorRT` threads `-DENABLE_TENSORRT=ON` through the configure step and copies TRT DLLs alongside `chess_engine.exe` + `chess_mcts.pyd`
+- Tests: `TestONNXExport.test_roundtrip` + `test_dynamic_batch`, `TestTRTEngineBuilder.test_build_engine_produces_loadable_plan`, plus C++ `TRT_LoadEngine` / `TRT_SinglePosition` / `TRT_MatchesLibTorch` (skip if `tests/fixtures/test_model.trt` missing; when present, argmax agrees with LibTorch and value within 0.05 on 3 test FENs)
+
+### Added — Tiered Network Schedule
+- `training/selfplay.py::resolve_tier()` picks `(blocks, filters)` for a generation from a `[(gen_start, blocks, filters), ...]` schedule; last tier with `gen_start <= gen` wins
+- `training/selfplay.py::load_checkpoint_with_config()` reads saved `NetworkConfig` from the checkpoint and uses it to build the model, so resumes no longer crash when the user passes mismatched `--blocks/--filters`
+- New `training_loop(network_schedule=...)` kwarg; at the start of each generation the loop compares the active tier against the live model and, on mismatch, rebuilds the network + optimizer + SWA wrapper (random init on scale-up; data window gives the new net a head start)
+- `train.py` prompts for "Enable tiered-net schedule?" with defaults `[(1, 6, 64), (20, blocks, filters)]`
+- `MetricsLogger.save_generation(network=...)` records `{blocks, filters}` per-generation; summary + dashboard render a "Network" stat box showing current `Xb Yf`
+- Primary motivation: 6b64f starts 2–3× faster than 10b128f at inference, producing more data/hour while policy signal is still noisy, then scales up once the sliding window has accumulated
+
+### Added — Multivisit MCTS Optimization
+- `GameManager::compute_collapse_visits()` projects how many extra PUCT descents would route through the leaf's selected child before switching siblings (single-level lookahead at leaf's parent)
+- `gather_leaf_from_game()` collapses 1..N repeated same-child descents into one NN evaluation when PUCT stays stable — up to `max_collapse_visits` sims folded into a single tree walk
+- `Node::update(v, n)`, `apply_virtual_loss(n)`, `revert_virtual_loss(n)` accept a visit multiplier; backprop propagates `n` through the tree
+- `PendingLeaf.multivisit` stores the collapse count; batch scatter reverts/backprops with the stored N
+- Skipped at root (Dirichlet noise breaks smoothness), for terminal children, and when `max_collapse_visits <= 1`
+- New `SearchParams::max_collapse_visits` (default 8; set to 1 to disable); exposed via pybind `max_collapse_visits` key and `MCTSConfig.max_collapse_visits`
+
 ### Added — Parallel Self-Play via GameManager
 - `play_games_batched()` in `training/selfplay.py` drives `chess_mcts.GameManager` for N concurrent games with cross-game NN batching (single shared model, single forward pass per step across all game trees)
 - Dynamic backfill keeps `parallel_games` slots active until `num_games` is reached

@@ -17,6 +17,7 @@ namespace mcts {
 struct EvalResult {
     std::vector<float> policy;  // Prior probability per legal move (same order as moves array)
     float value;                // Position evaluation from side-to-move perspective: [-1, +1]
+    float mlh = 0.0f;           // Moves-left head estimate (0 when model lacks MLH output)
 };
 
 // Request for batch evaluation
@@ -61,6 +62,11 @@ struct SearchParams {
     float c_puct_factor = 2.0f;
     float fpu_reduction_root = 1.2f;
     float fpu_reduction = 1.2f;
+    // Lc0 "FpuStrategyAtRoot=absolute": treat unvisited root children as if they
+    // had a fixed value (typically ~1.0), forcing the search to touch every root
+    // child at least once before exploiting. Overrides fpu_reduction_root at root.
+    bool fpu_absolute_root = false;
+    float fpu_absolute_root_value = 1.0f;
     float dirichlet_alpha = 0.3f;
     float dirichlet_epsilon = 0.25f;
     bool add_noise = true;    // Add Dirichlet noise at root (for self-play)
@@ -77,6 +83,15 @@ struct SearchParams {
     float contempt = 0.0f;
     bool sibling_blending = true;
     int nn_cache_size = 200000;
+    int max_collapse_visits = 8;  // Multivisit cap; 1 disables the optimization
+
+    // Lc0-style moves-left head (MLH) PUCT bonus. Rewards shorter wins /
+    // longer losses by adding sign(Q) * clamp((parent_m - child_m - 1), ±cap) * weight
+    // to the child's selection score. Only applied when |Q| > q_threshold.
+    // Default weight=0 (disabled) until an MLH-aware model is exported.
+    float mlh_weight = 0.0f;
+    float mlh_cap = 10.0f;
+    float mlh_q_threshold = 0.6f;
 };
 
 // Search result
@@ -148,7 +163,7 @@ private:
     void expand_node(Node* node, const Position& pos, const EvalResult& eval_result);
 
     // Backpropagate value up the tree
-    void backpropagate(Node* node, float value);
+    void backpropagate(Node* node, float value, int n = 1);
 
     // Propagate terminal status up the tree
     void propagate_terminal(Node* node);

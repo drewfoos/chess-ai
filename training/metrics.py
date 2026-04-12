@@ -51,6 +51,7 @@ class MetricsLogger:
         num_positions: int,
         training: TrainingMetrics,
         duration_s: float,
+        network: dict | None = None,
     ):
         """Save generation metrics to JSON and update summary."""
         gen_data = {
@@ -61,6 +62,8 @@ class MetricsLogger:
             'training': asdict(training),
             'duration_s': duration_s,
         }
+        if network is not None:
+            gen_data['network'] = network
 
         gen_path = os.path.join(self.metrics_dir, f'gen_{generation:03d}.json')
         with open(gen_path, 'w') as f:
@@ -84,6 +87,7 @@ class MetricsLogger:
             'num_games': gen_data['num_games'],
             'training': gen_data['training'],
             'duration_s': gen_data['duration_s'],
+            'network': gen_data.get('network'),
             'avg_game_length': (
                 sum(g['num_moves'] for g in gen_data['games']) / max(len(gen_data['games']), 1)
             ),

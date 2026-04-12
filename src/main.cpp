@@ -8,6 +8,9 @@
 #ifdef HAS_LIBTORCH
 #include "neural/neural_evaluator.h"
 #endif
+#ifdef HAS_TENSORRT
+#include "neural/trt_evaluator.h"
+#endif
 #include <iostream>
 #include <string>
 #include <cstdlib>
@@ -150,6 +153,42 @@ int main(int argc, char* argv[]) {
 
         std::cout << "Model: " << model_path << " (device: " << device << ")\n";
         display_search_result(pos, result, iterations);
+#endif
+#ifdef HAS_TENSORRT
+    } else if (command == "search_nn_trt") {
+        if (argc < 3) {
+            std::cerr << "Usage: chess_engine search_nn_trt <engine_path> [fen] [iterations]\n";
+            return 1;
+        }
+        std::string engine_path = argv[2];
+        std::string fen = (argc >= 4) ? argv[3]
+            : "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
+        int iterations = (argc >= 5) ? std::atoi(argv[4]) : 800;
+
+        Position pos;
+        pos.set_fen(fen);
+
+        neural::TRTEvaluator eval(engine_path, 2.2f, 256);
+        mcts::SearchParams params;
+        params.num_iterations = iterations;
+        params.add_noise = false;
+
+        mcts::Search search(eval, params);
+        mcts::SearchResult result = search.run(pos);
+
+        std::cout << "TRT engine: " << engine_path << "\n";
+        display_search_result(pos, result, iterations);
+    } else if (command == "uci_trt") {
+        if (argc < 3) {
+            std::cerr << "Usage: chess_engine uci_trt <engine_path>\n";
+            return 1;
+        }
+        std::string engine_path = argv[2];
+        neural::TRTEvaluator eval(engine_path, 2.2f, 256);
+        mcts::SearchParams params;
+        params.add_noise = false;
+        uci::UCIHandler handler(eval, params);
+        handler.loop();
 #endif
     } else if (command == "uci") {
 #ifdef HAS_LIBTORCH

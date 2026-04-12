@@ -29,7 +29,7 @@ class MCTSConfig:
     dirichlet_alpha: float = 0.3
     dirichlet_epsilon: float = 0.25
     temperature: float = 1.0
-    policy_softmax_temperature: float = 2.2
+    policy_softmax_temperature: float = 1.61
     batch_size: int = 16          # leaves gathered before one GPU forward pass
     nn_cache_size: int = 20000    # max cached evaluations (0 = disabled)
     smart_pruning: bool = True    # stop early if best move can't be overtaken
@@ -39,6 +39,19 @@ class MCTSConfig:
     uncertainty_weight: float = 0.15  # exploration bonus from value variance (0 = disabled)
     variance_scaling: bool = True     # scale c_puct by parent value variance
     contempt: float = 0.0        # draw aversion: positive = prefer wins over draws
+    max_collapse_visits: int = 8 # C++ multivisit cap: collapse repeated same-child PUCT selections into N visits per descent (1 disables)
+    # Asymmetric root FPU (Lc0 FpuStrategyAtRoot=absolute): at the root, treat unvisited
+    # children as having a fixed pessimistic value instead of (parent_mean - reduction).
+    # Encourages broader root exploration.
+    fpu_absolute_root: bool = False
+    fpu_absolute_root_value: float = 1.0
+    # Moves-left-head PUCT bonus (Lc0 MovesLeftMaxEffect). Adds
+    # sign(Q) * clamp(parent.mlh - child.mlh - 1, -cap, cap) * weight to PUCT when |Q| > threshold.
+    # In winning positions, prefers children that reduce moves-left (finish faster);
+    # in losing positions, prefers children that prolong the game. 0 disables.
+    mlh_weight: float = 0.0
+    mlh_cap: float = 10.0
+    mlh_q_threshold: float = 0.6
 
 
 @dataclass

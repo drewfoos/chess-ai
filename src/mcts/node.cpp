@@ -67,10 +67,10 @@ Node* Node::ensure_child(int i, NodePool* pool) {
     return child_nodes_[i];
 }
 
-void Node::update(float value) {
-    visit_count_++;
-    total_value_ += value;
-    sum_sq_value_ += value * value;
+void Node::update(float value, int n) {
+    visit_count_ += n;
+    total_value_ += static_cast<float>(n) * value;
+    sum_sq_value_ += static_cast<float>(n) * value * value;
 }
 
 Node* Node::select_child(float c_puct, float fpu_value) const {

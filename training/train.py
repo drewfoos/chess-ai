@@ -35,6 +35,7 @@ def compute_loss(
     policy_mask: torch.Tensor | None = None,
     soft_policy_weight: float = 2.0,
     soft_policy_temperature: float = 4.0,
+    wdl_label_smoothing: float = 0.05,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Compute combined policy + value + moves-left + soft policy loss.
 
@@ -73,9 +74,15 @@ def compute_loss(
             soft_policy_loss = per_sample_soft.mean()
         policy_loss = policy_loss + soft_policy_weight * soft_policy_loss
 
-    # Value loss: cross-entropy with soft WDL targets
+    # Value loss: cross-entropy with soft WDL targets.
+    # Label smoothing (Lc0/KataGo): blend hard target with uniform [1/3,1/3,1/3]
+    # to prevent value-head overconfidence on drawn/near-drawn positions.
+    if wdl_label_smoothing > 0:
+        smoothed_target = (1.0 - wdl_label_smoothing) * value_target + (wdl_label_smoothing / 3.0)
+    else:
+        smoothed_target = value_target
     value_log_probs = F.log_softmax(value_logits, dim=1)
-    value_loss = -(value_target * value_log_probs).sum(dim=1).mean()
+    value_loss = -(smoothed_target * value_log_probs).sum(dim=1).mean()
 
     total = policy_loss + value_loss
 

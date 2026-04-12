@@ -56,6 +56,25 @@
             color: var(--text-muted);
             margin-top: 6px;
         }
+        .run-switcher {
+            margin-top: 14px;
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 0.85em;
+            color: var(--text-muted);
+        }
+        .run-switcher select {
+            background: var(--bg-card);
+            color: var(--text);
+            border: 1px solid var(--border-accent);
+            border-radius: 6px;
+            padding: 6px 10px;
+            font-size: 0.95em;
+            min-width: 240px;
+            cursor: pointer;
+        }
+        .run-switcher select:hover { border-color: var(--accent); }
 
         /* Layout */
         .container {
@@ -262,6 +281,10 @@
     <div class="header">
         <h1><span>Chess AI</span> Training Dashboard</h1>
         <div class="subtitle">AlphaZero-style self-play reinforcement learning</div>
+        <div class="run-switcher">
+            <label for="run-select">Run:</label>
+            <select id="run-select"><option>Loading…</option></select>
+        </div>
     </div>
 
     <div class="container">
@@ -287,6 +310,10 @@
                     <div class="label">Speed</div>
                     <div class="value" id="stat-speed">-</div>
                     <div class="unit">pos/min</div>
+                </div>
+                <div class="stat-box">
+                    <div class="label">Network</div>
+                    <div class="value" id="stat-network">-</div>
                 </div>
             </div>
 
@@ -576,6 +603,15 @@ function updateDashboard(data) {
             var posPerMin = (data.total_positions / data.total_time_s * 60).toFixed(0);
             document.getElementById('stat-speed').textContent = posPerMin;
         }
+
+        var netEl = document.getElementById('stat-network');
+        if (netEl) {
+            if (latest.network) {
+                netEl.textContent = latest.network.blocks + 'b' + latest.network.filters + 'f';
+            } else {
+                netEl.textContent = '-';
+            }
+        }
     }
 
     // Loss chart
@@ -594,7 +630,10 @@ function updateDashboard(data) {
 
     // Generation selector
     var genSelect = document.getElementById('gen-select');
-    if (gens.length > 0 && genSelect.options.length !== gens.length) {
+    var firstVal = genSelect.options[0] ? genSelect.options[0].value : '';
+    var needsRepopulate = genSelect.options.length !== gens.length ||
+        isNaN(parseInt(firstVal));
+    if (gens.length > 0 && needsRepopulate) {
         genSelect.innerHTML = '';
         gens.forEach(function(g) {
             var opt = document.createElement('option');
@@ -607,7 +646,50 @@ function updateDashboard(data) {
     }
 }
 
+// --- Run switcher ---
+async function loadRuns() {
+    try {
+        var resp = await fetch('/api/runs');
+        if (!resp.ok) return;
+        var data = await resp.json();
+        var sel = document.getElementById('run-select');
+        sel.innerHTML = '';
+        if (!data.runs || data.runs.length === 0) {
+            sel.innerHTML = '<option>No runs found</option>';
+            return;
+        }
+        data.runs.forEach(function(r) {
+            var opt = document.createElement('option');
+            opt.value = r.id;
+            opt.textContent = r.name + '  (' + r.total_generations + ' gen' +
+                (r.total_generations === 1 ? '' : 's') + ')';
+            if (r.current) opt.selected = true;
+            sel.appendChild(opt);
+        });
+    } catch (e) {}
+}
+
+document.getElementById('run-select').addEventListener('change', async function(e) {
+    var id = e.target.value;
+    try {
+        var resp = await fetch('/api/runs/select', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({id: id}),
+        });
+        if (!resp.ok) return;
+        // Invalidate cached per-generation data and reset selectors, then refetch.
+        generationsData = {};
+        var genSelect = document.getElementById('gen-select');
+        genSelect.innerHTML = '<option>Loading…</option>';
+        var gameSelect = document.getElementById('game-select');
+        gameSelect.innerHTML = '<option>Loading…</option>';
+        await fetchSummary();
+    } catch (err) {}
+});
+
 // Initial fetch + poll
+loadRuns();
 fetchSummary();
 setInterval(fetchSummary, 10000);
 </script>

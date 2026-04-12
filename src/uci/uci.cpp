@@ -56,6 +56,13 @@ void UCIHandler::handle_uci() {
     send("id name ChessAI");
     send("id author drew");
     send("option name Iterations type spin default 800 min 1 max 100000");
+    // Accept common GUI-set options even if we don't use them — Arena/Lichess
+    // complain when they try to set an option the engine didn't advertise.
+    send("option name Hash type spin default 256 min 1 max 32768");
+    send("option name Threads type spin default 1 min 1 max 128");
+    send("option name UCI_Chess960 type check default false");
+    send("option name Ponder type check default false");
+    send("option name Move Overhead type spin default 50 min 0 max 5000");
     send("uciok");
 }
 
@@ -125,21 +132,32 @@ void UCIHandler::handle_stop() {
 }
 
 void UCIHandler::handle_setoption(std::istringstream& args) {
+    // Grammar: setoption name <NAME...> value <VALUE...>
+    // NAME and VALUE may each contain spaces; parse accordingly.
     std::string token;
-    args >> token; // "name"
+    args >> token;
     if (token != "name") return;
 
     std::string name;
-    args >> name;
-
-    args >> token; // "value"
-    if (token != "value") return;
+    std::string value;
+    bool in_value = false;
+    while (args >> token) {
+        if (!in_value && token == "value") { in_value = true; continue; }
+        if (in_value) {
+            if (!value.empty()) value += " ";
+            value += token;
+        } else {
+            if (!name.empty()) name += " ";
+            name += token;
+        }
+    }
 
     if (name == "Iterations") {
-        int val;
-        args >> val;
-        base_params_.num_iterations = val;
+        try { base_params_.num_iterations = std::stoi(value); } catch (...) {}
+    } else if (name == "Move Overhead") {
+        try { move_overhead_ms_ = std::max(0, std::stoi(value)); } catch (...) {}
     }
+    // Hash, Threads, UCI_Chess960, Ponder — accepted and silently ignored.
 }
 
 void UCIHandler::start_search(const TimeControl& tc) {
@@ -147,13 +165,24 @@ void UCIHandler::start_search(const TimeControl& tc) {
 
     auto alloc = allocate_time(tc, current_pos_.side_to_move(), nps_estimate_);
 
+    // When a wall-clock budget is given (movetime or clock time), let time
+    // drive the stop — not the iteration count derived from a stale nps_estimate.
+    // The first search calibrates nps_estimate_ to the engine's real speed;
+    // without this override, move 1 finishes in a fraction of the requested time.
+    int hard_deadline_ms = alloc.soft_time_ms;
+    if (hard_deadline_ms > 0) {
+        // Reserve a safety buffer so the GUI gets our bestmove before flagging.
+        hard_deadline_ms = std::max(10, hard_deadline_ms - move_overhead_ms_);
+        alloc.iterations = 1'000'000;
+    }
+
     stop_flag_.store(false);
     searching_.store(true);
 
     // Capture history by value so the search thread has its own copy
     neural::PositionHistory history_copy = history_;
 
-    search_thread_ = std::thread([this, alloc, history_copy]() {
+    search_thread_ = std::thread([this, alloc, hard_deadline_ms, history_copy]() {
         mcts::SearchParams params = base_params_;
         params.num_iterations = alloc.iterations;
         params.add_noise = false;
@@ -170,8 +199,13 @@ void UCIHandler::start_search(const TimeControl& tc) {
             auto since_last = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_info_time).count();
             int iters_since = info.iterations - last_info_iter;
 
+            auto elapsed_ms_now = std::chrono::duration_cast<std::chrono::milliseconds>(now - start_time).count();
+            if (hard_deadline_ms > 0 && elapsed_ms_now >= hard_deadline_ms) {
+                stop_flag_.store(true, std::memory_order_relaxed);
+            }
+
             if (since_last >= 500 || iters_since >= 100) {
-                auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - start_time).count();
+                auto elapsed_ms = elapsed_ms_now;
                 int nps = (elapsed_ms > 0) ? static_cast<int>(info.iterations * 1000 / elapsed_ms) : 0;
 
                 // Score in centipawns: root_value is [-1, +1], scale to cp
@@ -180,8 +214,16 @@ void UCIHandler::start_search(const TimeControl& tc) {
 
                 std::string pv = info.best_move.is_none() ? "0000" : info.best_move.to_uci();
 
-                send("info nodes " + std::to_string(info.total_nodes) +
+                // MCTS has no literal search depth — approximate via log2(iterations)
+                // so GUIs have a non-empty Depth column that grows with search effort.
+                int pseudo_depth = 1;
+                int it = info.iterations;
+                while (it > 1) { pseudo_depth++; it >>= 1; }
+
+                send("info depth " + std::to_string(pseudo_depth) +
+                     " nodes " + std::to_string(info.total_nodes) +
                      " nps " + std::to_string(nps) +
+                     " time " + std::to_string(elapsed_ms) +
                      " score cp " + std::to_string(score_cp) +
                      " pv " + pv);
 

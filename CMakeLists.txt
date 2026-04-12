@@ -29,6 +29,7 @@ if(BUILD_TESTS)
     FetchContent_Declare(
         googletest
         URL https://github.com/google/googletest/archive/refs/tags/v1.14.0.zip
+        DOWNLOAD_EXTRACT_TIMESTAMP TRUE
     )
     set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
     FetchContent_MakeAvailable(googletest)
@@ -46,7 +47,14 @@ if(BUILD_TESTS)
     )
     target_link_libraries(chess_tests PRIVATE chess_core GTest::gtest_main)
     include(GoogleTest)
-    gtest_discover_tests(chess_tests WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+    # DISCOVERY_MODE PRE_TEST: enumerate test cases at `ctest` time, not build time.
+    # At build time the exe can't always find its LibTorch/TRT DLLs (they get copied by
+    # POST_BUILD steps that race with Ninja's discovery step). Deferring discovery sidesteps
+    # the race and matches the VS generator's effective behavior.
+    gtest_discover_tests(chess_tests
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+        DISCOVERY_MODE PRE_TEST
+    )
 endif()
 
 # Neural network support (optional — requires LibTorch)
@@ -71,29 +79,123 @@ if(ENABLE_NEURAL)
         target_compile_definitions(chess_tests PRIVATE HAS_LIBTORCH)
     endif()
 
-    # Copy DLLs on Windows
+    # Copy DLLs on Windows next to every exe/module that links libtorch.
     if(MSVC)
         file(GLOB TORCH_DLLS "${TORCH_INSTALL_PREFIX}/lib/*.dll")
         add_custom_command(TARGET chess_engine POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E copy_if_different
             ${TORCH_DLLS} $<TARGET_FILE_DIR:chess_engine>)
+        if(BUILD_TESTS)
+            add_custom_command(TARGET chess_tests POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                ${TORCH_DLLS} $<TARGET_FILE_DIR:chess_tests>)
+        endif()
     endif()
+endif()
+
+# TensorRT backend (optional — requires TensorRT SDK + ENABLE_NEURAL)
+option(ENABLE_TENSORRT "Build TensorRT inference backend" OFF)
+
+if(ENABLE_TENSORRT)
+    if(NOT ENABLE_NEURAL)
+        message(FATAL_ERROR "ENABLE_TENSORRT requires ENABLE_NEURAL=ON (TRT evaluator reuses neural/BatchRequest/BatchResult types)")
+    endif()
+
+    if(DEFINED ENV{TENSORRT_PATH})
+        set(TENSORRT_ROOT "$ENV{TENSORRT_PATH}")
+    elseif(NOT TENSORRT_ROOT)
+        message(FATAL_ERROR "ENABLE_TENSORRT=ON but TENSORRT_PATH env var / TENSORRT_ROOT CMake var is not set. Point it at your TensorRT SDK root (e.g. C:/TensorRT-10.16.1.11)")
+    endif()
+
+    find_path(TENSORRT_INCLUDE_DIR NvInfer.h HINTS "${TENSORRT_ROOT}/include" REQUIRED)
+    find_library(TENSORRT_LIB_NVINFER     NAMES nvinfer_10 nvinfer  HINTS "${TENSORRT_ROOT}/lib" REQUIRED)
+    find_library(TENSORRT_LIB_ONNXPARSER  NAMES nvonnxparser_10 nvonnxparser HINTS "${TENSORRT_ROOT}/lib" REQUIRED)
+
+    target_sources(chess_neural PRIVATE src/neural/trt_evaluator.cpp)
+    target_include_directories(chess_neural PUBLIC "${TENSORRT_INCLUDE_DIR}")
+    target_link_libraries(chess_neural PUBLIC
+        "${TENSORRT_LIB_NVINFER}"
+        "${TENSORRT_LIB_ONNXPARSER}"
+    )
+    target_compile_definitions(chess_neural PUBLIC HAS_TENSORRT)
+    target_compile_definitions(chess_engine PRIVATE HAS_TENSORRT)
+
+    if(BUILD_TESTS)
+        target_compile_definitions(chess_tests PRIVATE HAS_TENSORRT)
+    endif()
+
+    # Copy TRT DLLs on Windows alongside every exe/module that links TRT.
+    if(MSVC)
+        file(GLOB TRT_DLLS "${TENSORRT_ROOT}/bin/*.dll")
+        add_custom_command(TARGET chess_engine POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            ${TRT_DLLS} $<TARGET_FILE_DIR:chess_engine>)
+        if(BUILD_TESTS)
+            add_custom_command(TARGET chess_tests POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                ${TRT_DLLS} $<TARGET_FILE_DIR:chess_tests>)
+        endif()
+    endif()
+
+    message(STATUS "TensorRT: enabled (${TENSORRT_ROOT})")
 endif()
 
 # Python bindings (requires pybind11 and LibTorch)
 option(BUILD_PYTHON "Build Python bindings" OFF)
 if(BUILD_PYTHON AND ENABLE_NEURAL)
-    find_package(Python COMPONENTS Interpreter Development REQUIRED)
-    find_package(pybind11 REQUIRED)
-    pybind11_add_module(chess_mcts src/python/bindings.cpp)
-    target_link_libraries(chess_mcts PRIVATE chess_core chess_neural)
-    target_compile_definitions(chess_mcts PRIVATE HAS_LIBTORCH)
+    find_package(Python COMPONENTS Interpreter Development.Module REQUIRED)
+    find_package(pybind11 CONFIG REQUIRED)
 
-    # Copy DLLs on Windows
-    if(MSVC)
+    # The extension lives inside the `chess_mcts` Python package as `_core`.
+    # User code does `import chess_mcts`; the package's __init__.py handles
+    # DLL registration before re-exporting from ._core.
+    pybind11_add_module(_core src/python/bindings.cpp)
+    target_link_libraries(_core PRIVATE chess_core chess_neural)
+    target_compile_definitions(_core PRIVATE HAS_LIBTORCH)
+
+    if(ENABLE_TENSORRT)
+        target_compile_definitions(_core PRIVATE HAS_TENSORRT)
+    endif()
+
+    # Bake LibTorch / TensorRT paths into _paths.py so chess_mcts/__init__.py
+    # can register them with os.add_dll_directory on Windows. Paths are
+    # captured at configure time from the same find_package() state the
+    # extension itself was built against, so there's no environment drift.
+    set(CHESS_MCTS_LIBTORCH_LIB "${TORCH_INSTALL_PREFIX}/lib")
+    if(ENABLE_TENSORRT)
+        set(CHESS_MCTS_TENSORRT_BIN "${TENSORRT_ROOT}/bin")
+    else()
+        set(CHESS_MCTS_TENSORRT_BIN "")
+    endif()
+    configure_file(
+        "${CMAKE_SOURCE_DIR}/src/python/chess_mcts/_paths.py.in"
+        "${CMAKE_CURRENT_BINARY_DIR}/chess_mcts_generated/_paths.py"
+        @ONLY
+    )
+
+    # Install rules for scikit-build-core. The `python` component bundles
+    # _core.pyd + _paths.py into the chess_mcts package directory inside
+    # the wheel (or the editable-install redirect tree).
+    install(TARGETS _core
+            LIBRARY DESTINATION chess_mcts COMPONENT python
+            RUNTIME DESTINATION chess_mcts COMPONENT python)
+    install(FILES "${CMAKE_CURRENT_BINARY_DIR}/chess_mcts_generated/_paths.py"
+            DESTINATION chess_mcts COMPONENT python)
+
+    # build.ps1 / non-scikit-build path: keep copying DLLs next to the
+    # extension for legacy direct-import workflows. Under scikit-build-core
+    # the package's __init__.py handles DLL resolution via os.add_dll_directory,
+    # so this copy is unnecessary (but harmless).
+    if(MSVC AND NOT SKBUILD)
         file(GLOB TORCH_DLLS "${TORCH_INSTALL_PREFIX}/lib/*.dll")
-        add_custom_command(TARGET chess_mcts POST_BUILD
+        add_custom_command(TARGET _core POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            ${TORCH_DLLS} $<TARGET_FILE_DIR:chess_mcts>)
+            ${TORCH_DLLS} $<TARGET_FILE_DIR:_core>)
+        if(ENABLE_TENSORRT)
+            file(GLOB TRT_DLLS "${TENSORRT_ROOT}/bin/*.dll")
+            add_custom_command(TARGET _core POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                ${TRT_DLLS} $<TARGET_FILE_DIR:_core>)
+        endif()
     endif()
 endif()

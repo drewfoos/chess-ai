@@ -495,7 +495,7 @@ Benchmark at batch sizes 64, 128, 256, and 512 to find the sweet spot. Lc0's def
 
 **Files to change:** `src/mcts/search.h` (`SearchParams::batch_size`).
 
-#### 7b. Multivisit optimization (MEDIUM IMPACT)
+#### 7b. Multivisit optimization (MEDIUM IMPACT) — **DONE (single-level)**
 
 When PUCT selects a leaf, instead of claiming 1 visit, calculate how many visits the leaf would receive before PUCT switches to a different child. Claim all those visits at once:
 
@@ -506,6 +506,8 @@ best_child->apply_virtual_loss(max_visits);  // Apply N virtual losses at once
 ```
 
 This reduces the number of tree traversals needed to fill a batch. Lc0 implements this as the `maxvisit` field in `NodeToProcess`.
+
+**Status:** Implemented in `GameManager::compute_collapse_visits()` at the leaf's parent (single-level lookahead). `Node::update/apply_virtual_loss/revert_virtual_loss` accept a count multiplier; `PendingLeaf.multivisit` folds N visits into one backprop/revert. Skipped at root (Dirichlet breaks smoothness) and terminal children. Cap configurable via `SearchParams::max_collapse_visits` (default 8).
 
 **Estimated impact:** 20-50% reduction in tree traversal overhead for large batch sizes.
 

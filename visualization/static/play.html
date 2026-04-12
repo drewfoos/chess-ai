@@ -25,6 +25,9 @@
             --success: #4ecdc4;
             --danger: #ff6b6b;
             --warning: #ffd93d;
+            --arrow-green: rgba(21, 181, 88, 0.85);
+            --arrow-red: rgba(235, 81, 81, 0.85);
+            --premove-color: rgba(255, 140, 0, 0.55);
         }
 
         * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -36,7 +39,6 @@
             min-height: 100vh;
         }
 
-        /* Header */
         .header {
             display: flex;
             align-items: center;
@@ -48,7 +50,6 @@
         .header h1 {
             font-size: 1.5em;
             font-weight: 700;
-            color: var(--text);
             letter-spacing: -0.02em;
         }
         .header h1 span { color: var(--accent); }
@@ -57,15 +58,11 @@
             color: var(--text-muted);
             text-decoration: none;
             transition: color 0.2s;
-            display: flex;
-            align-items: center;
-            gap: 6px;
         }
         .header .back-link:hover { color: var(--accent-light); }
 
-        /* Main layout */
         .main {
-            max-width: 1100px;
+            max-width: 1180px;
             margin: 28px auto;
             padding: 0 24px;
             display: flex;
@@ -73,7 +70,6 @@
             align-items: flex-start;
         }
 
-        /* Board area */
         .board-area {
             display: flex;
             gap: 8px;
@@ -83,12 +79,24 @@
         #board-wrapper {
             width: 480px;
             flex-shrink: 0;
+            position: relative;
         }
         #board { width: 100%; }
 
-        /* Eval bar */
+        /* SVG overlay for arrows + highlight circles */
+        #board-overlay {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            pointer-events: none;
+            z-index: 10;
+        }
+
+        /* Eval bars */
         .eval-bar {
-            width: 28px;
+            width: 24px;
             height: 480px;
             background: #333;
             border-radius: 6px;
@@ -97,13 +105,28 @@
             border: 1px solid var(--border);
             flex-shrink: 0;
         }
+        .eval-label {
+            position: absolute;
+            top: 3px;
+            left: 50%;
+            transform: translateX(-50%);
+            font-size: 8px;
+            font-weight: 700;
+            letter-spacing: 0.08em;
+            color: rgba(200, 200, 220, 0.85);
+            text-transform: uppercase;
+            white-space: nowrap;
+            z-index: 3;
+            text-shadow: 0 0 3px rgba(0,0,0,0.9);
+            pointer-events: none;
+        }
         .eval-fill {
             position: absolute;
             bottom: 0;
             width: 100%;
             height: 50%;
             background: #e8e8f0;
-            transition: height 0.5s ease;
+            transition: height 0.4s ease;
         }
         .eval-black {
             position: absolute;
@@ -111,7 +134,7 @@
             width: 100%;
             height: 50%;
             background: #222;
-            transition: height 0.5s ease;
+            transition: height 0.4s ease;
         }
         .eval-score {
             position: absolute;
@@ -121,11 +144,16 @@
             font-size: 10px;
             font-weight: 700;
             z-index: 2;
-            color: #999;
+            color: #ffffff;
+            background: rgba(20, 20, 35, 0.85);
+            border: 1px solid rgba(108, 99, 255, 0.45);
+            border-radius: 4px;
+            padding: 3px 2px;
             writing-mode: vertical-lr;
             text-orientation: mixed;
             white-space: nowrap;
-            text-shadow: 0 0 4px rgba(0,0,0,0.8);
+            letter-spacing: 0.04em;
+            pointer-events: none;
         }
         .eval-mid-line {
             position: absolute;
@@ -136,7 +164,6 @@
             z-index: 1;
         }
 
-        /* Side panel */
         .side-panel {
             flex: 1;
             min-width: 260px;
@@ -164,15 +191,12 @@
             border-bottom: 1px solid var(--border);
         }
 
-        /* Engine info */
         .engine-stats {
             display: grid;
             grid-template-columns: 1fr 1fr;
             gap: 10px;
         }
-        .engine-stat {
-            text-align: center;
-        }
+        .engine-stat { text-align: center; }
         .engine-stat .label {
             font-size: 0.7em;
             text-transform: uppercase;
@@ -188,7 +212,6 @@
         .engine-stat .value.score-negative { color: var(--danger); }
         .engine-stat .value.score-neutral { color: var(--text-muted); }
 
-        /* Thinking indicator */
         .thinking {
             display: none;
             align-items: center;
@@ -215,7 +238,6 @@
             40% { transform: scale(1); opacity: 1; }
         }
 
-        /* Move history */
         .move-history {
             max-height: 220px;
             overflow-y: auto;
@@ -228,10 +250,7 @@
             background: var(--border-accent);
             border-radius: 3px;
         }
-        .move-history table {
-            width: 100%;
-            border-collapse: collapse;
-        }
+        .move-history table { width: 100%; border-collapse: collapse; }
         .move-history td {
             padding: 4px 8px;
             font-size: 0.85em;
@@ -240,10 +259,7 @@
             transition: background 0.15s;
         }
         .move-history td:hover { background: var(--accent-glow); }
-        .move-history td.active {
-            background: var(--accent);
-            color: white;
-        }
+        .move-history td.active { background: var(--accent); color: white; }
         .move-history .move-num {
             color: var(--text-dim);
             width: 32px;
@@ -257,7 +273,6 @@
         .move-history .empty { color: transparent; cursor: default; }
         .move-history .empty:hover { background: transparent; }
 
-        /* Game status */
         .game-status {
             text-align: center;
             font-size: 0.9em;
@@ -278,7 +293,6 @@
             border: 1px solid rgba(108, 99, 255, 0.3);
         }
 
-        /* Controls */
         .controls-grid {
             display: flex;
             flex-direction: column;
@@ -308,14 +322,8 @@
             color: var(--accent-light);
             border-color: var(--accent);
         }
-        .btn:active {
-            background: var(--accent);
-            color: white;
-        }
-        .btn:disabled {
-            opacity: 0.4;
-            cursor: not-allowed;
-        }
+        .btn:active { background: var(--accent); color: white; }
+        .btn:disabled { opacity: 0.4; cursor: not-allowed; }
         .btn:disabled:hover {
             background: var(--bg-primary);
             color: var(--text-muted);
@@ -341,6 +349,8 @@
             font-size: 0.82em;
             cursor: pointer;
             transition: border-color 0.2s;
+            min-width: 0;
+            max-width: 100%;
         }
         .control-select:hover { border-color: var(--accent); }
         .control-select:focus { outline: none; border-color: var(--accent); }
@@ -353,7 +363,6 @@
             margin-right: 2px;
         }
 
-        /* Radio buttons */
         .radio-group {
             display: flex;
             gap: 2px;
@@ -381,12 +390,85 @@
             color: var(--accent-light);
         }
 
-        /* Last move highlight */
-        .highlight-move {
-            background-color: rgba(108, 99, 255, 0.3) !important;
+        .highlight-move { background-color: rgba(108, 99, 255, 0.3) !important; }
+
+        /* Selected square (click-to-highlight) + legal-move indicators */
+        .highlight-selected { background-color: rgba(108, 99, 255, 0.45) !important; }
+        .legal-move, .legal-capture { position: relative; }
+        .legal-move::after {
+            content: '';
+            position: absolute;
+            top: 50%; left: 50%;
+            width: 32%; height: 32%;
+            transform: translate(-50%, -50%);
+            background: rgba(30, 30, 30, 0.35);
+            border-radius: 50%;
+            pointer-events: none;
+            z-index: 1;
+        }
+        .legal-capture::after {
+            content: '';
+            position: absolute;
+            inset: 0;
+            box-shadow: inset 0 0 0 4px rgba(235, 81, 81, 0.75);
+            border-radius: 50%;
+            pointer-events: none;
+            z-index: 1;
         }
 
-        /* Error toast */
+        /* Clocks */
+        .clock-row {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 10px;
+        }
+        .clock-box {
+            background: var(--bg-primary);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 10px 12px;
+            text-align: center;
+            transition: all 0.15s;
+        }
+        .clock-box.active {
+            border-color: var(--accent);
+            background: var(--accent-glow);
+            box-shadow: 0 0 0 1px var(--accent);
+        }
+        .clock-box.low .clock-time { color: var(--warning); }
+        .clock-box.critical .clock-time {
+            color: var(--danger);
+            animation: clock-pulse 1s ease-in-out infinite;
+        }
+        .clock-box.flagged .clock-time { color: var(--danger); }
+        @keyframes clock-pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+        .clock-label {
+            font-size: 0.7em;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            color: var(--text-dim);
+            margin-bottom: 2px;
+        }
+        .clock-time {
+            font-family: 'Consolas', 'Menlo', monospace;
+            font-size: 1.8em;
+            font-weight: 700;
+            font-variant-numeric: tabular-nums;
+            letter-spacing: -0.02em;
+        }
+
+        /* Premove highlight — distinct from last-move */
+        .highlight-premove {
+            background-color: var(--premove-color) !important;
+            box-shadow: inset 0 0 0 3px rgba(255, 165, 0, 0.7);
+        }
+
+        /* Disable native context menu on the board */
+        #board-wrapper { user-select: none; -webkit-user-select: none; }
+
         .error-toast {
             position: fixed;
             bottom: 24px;
@@ -404,21 +486,27 @@
         }
         .error-toast.active { display: block; }
 
-        /* Responsive */
+        .hint {
+            font-size: 0.7em;
+            color: var(--text-dim);
+            line-height: 1.5;
+            margin-top: 4px;
+        }
+        .hint kbd {
+            background: var(--bg-primary);
+            border: 1px solid var(--border);
+            border-radius: 3px;
+            padding: 1px 5px;
+            font-family: inherit;
+            font-size: 0.95em;
+        }
+
         @media (max-width: 900px) {
-            .main {
-                flex-direction: column;
-                align-items: center;
-            }
-            .board-area {
-                justify-content: center;
-            }
+            .main { flex-direction: column; align-items: center; }
+            .board-area { justify-content: center; }
             #board-wrapper { width: 360px; }
             .eval-bar { height: 360px; }
-            .side-panel {
-                width: 100%;
-                max-width: 480px;
-            }
+            .side-panel { width: 100%; max-width: 480px; }
         }
         @media (max-width: 500px) {
             .header { padding: 14px 16px; }
@@ -437,25 +525,38 @@
 
     <div class="main">
         <div class="board-area">
-            <div id="board-wrapper">
-                <div id="board"></div>
-            </div>
-            <div class="eval-bar" id="eval-bar">
+            <div class="eval-bar" id="eval-bar" title="Our engine">
+                <span class="eval-label">OUR</span>
                 <div class="eval-black" id="eval-black"></div>
                 <div class="eval-fill" id="eval-fill"></div>
                 <div class="eval-mid-line"></div>
                 <span class="eval-score" id="eval-score">0.0</span>
             </div>
+            <div id="board-wrapper">
+                <div id="board"></div>
+                <svg id="board-overlay"></svg>
+            </div>
+            <div class="eval-bar" id="sf-bar" title="Stockfish reference">
+                <span class="eval-label">SF</span>
+                <div class="eval-black" id="sf-black"></div>
+                <div class="eval-fill" id="sf-fill"></div>
+                <div class="eval-mid-line"></div>
+                <span class="eval-score" id="sf-score">--</span>
+            </div>
         </div>
 
         <div class="side-panel">
             <div class="card">
-                <h2>Engine Info</h2>
+                <h2>Engine</h2>
+                <div class="controls-row" style="margin-bottom: 10px;">
+                    <span class="control-label">Model:</span>
+                    <select class="control-select" id="model-select" style="flex: 1; min-width: 200px;">
+                        <option value="random">-- random fallback --</option>
+                    </select>
+                </div>
                 <div class="thinking" id="thinking">
                     Engine thinking
-                    <div class="thinking-dots">
-                        <span></span><span></span><span></span>
-                    </div>
+                    <div class="thinking-dots"><span></span><span></span><span></span></div>
                 </div>
                 <div class="engine-stats">
                     <div class="engine-stat">
@@ -479,12 +580,24 @@
 
             <div class="game-status" id="game-status"></div>
 
+            <div class="card" id="clock-card" style="display:none;">
+                <h2>Clock</h2>
+                <div class="clock-row">
+                    <div class="clock-box" id="clock-black">
+                        <div class="clock-label">Black</div>
+                        <div class="clock-time" id="clock-black-time">--:--</div>
+                    </div>
+                    <div class="clock-box" id="clock-white">
+                        <div class="clock-label">White</div>
+                        <div class="clock-time" id="clock-white-time">--:--</div>
+                    </div>
+                </div>
+            </div>
+
             <div class="card">
                 <h2>Move History</h2>
                 <div class="move-history" id="move-history">
-                    <table id="move-table">
-                        <tbody></tbody>
-                    </table>
+                    <table id="move-table"><tbody></tbody></table>
                 </div>
             </div>
 
@@ -497,6 +610,21 @@
                         <button class="btn" id="btn-undo">Undo</button>
                     </div>
                     <div class="controls-row">
+                        <span class="control-label">Time:</span>
+                        <select class="control-select" id="time-control">
+                            <option value="fixed" selected>Fixed think</option>
+                            <option value="60|0">1+0 bullet</option>
+                            <option value="180|0">3+0 blitz</option>
+                            <option value="180|2">3+2 blitz</option>
+                            <option value="300|0">5+0 blitz</option>
+                            <option value="300|3">5+3 blitz</option>
+                            <option value="600|0">10+0 rapid</option>
+                            <option value="600|5">10+5 rapid</option>
+                            <option value="900|10">15+10 rapid</option>
+                            <option value="1800|0">30+0 classical</option>
+                        </select>
+                    </div>
+                    <div class="controls-row" id="think-row">
                         <span class="control-label">Think:</span>
                         <select class="control-select" id="think-time">
                             <option value="500">0.5s</option>
@@ -504,6 +632,16 @@
                             <option value="2000">2s</option>
                             <option value="5000">5s</option>
                             <option value="10000">10s</option>
+                        </select>
+                    </div>
+                    <div class="controls-row">
+                        <span class="control-label">SF depth:</span>
+                        <select class="control-select" id="sf-depth">
+                            <option value="0">off</option>
+                            <option value="8">8</option>
+                            <option value="12" selected>12</option>
+                            <option value="16">16</option>
+                            <option value="20">20</option>
                         </select>
                     </div>
                     <div class="controls-row">
@@ -515,6 +653,12 @@
                             <label for="color-black">Black</label>
                         </div>
                     </div>
+                    <div class="hint">
+                        <kbd>Right-click</kbd> a square to mark it red.
+                        <kbd>Right-drag</kbd> between two squares to draw an arrow.
+                        <kbd>Left-click</kbd> anywhere on the board to clear marks.
+                        Drag a piece while the engine is thinking to queue a <b>premove</b>.
+                    </div>
                 </div>
             </div>
         </div>
@@ -523,17 +667,43 @@
     <div class="error-toast" id="error-toast"></div>
 
 <script>
-// --- State ---
+// ---------- State ----------
 var chess = new Chess();
 var board = null;
 var playerColor = 'white';
 var engineBusy = false;
 var thinkTime = 1000;
+var sfDepth = 12;
 var lastMoveFrom = null;
 var lastMoveTo = null;
-var viewingMoveIdx = -1; // -1 means viewing current position
+var viewingMoveIdx = -1;
+var currentModel = 'random';
 
-// --- Board setup ---
+// Clock state. When clockEnabled, every move consumes wall-clock time from the
+// active side and adds increment. Engine receives wtime/btime/winc/binc so it
+// can budget (falls back to ~1/30 of remaining via time_manager.h).
+var clockEnabled = false;
+var initialTimeMs = 0;
+var incrementMs = 0;
+var whiteClockMs = 0;
+var blackClockMs = 0;
+var activeClockSide = null;          // 'white' | 'black' | null
+var clockTickHandle = null;
+var clockTickAnchorWall = 0;         // performance.now() when we started tracking
+var clockTickAnchorSide = null;      // which side's clock is decaying from anchor
+var clockTickAnchorMs = 0;           // remaining ms on that side at anchor
+var gameFlagged = false;             // someone's clock hit 0
+
+// Arrows/highlights: {type:'arrow', from, to, color} or {type:'circle', square, color}
+var shapes = [];
+// Drag state for right-click
+var rightDown = null; // {square: 'e4'}
+// Premove: {from, to, promotion?}
+var premove = null;
+// Click-selected source square (for legal-move highlights + click-to-move)
+var selectedSquare = null;
+
+// ---------- Board ----------
 function createBoard() {
     if (board) board.destroy();
     board = Chessboard('board', {
@@ -545,68 +715,220 @@ function createBoard() {
         onDrop: onDrop,
         onSnapEnd: onSnapEnd
     });
+    setTimeout(resizeOverlay, 50);
 }
 
 function onDragStart(source, piece, position, orientation) {
-    // Prevent moves when game is over, engine is thinking, or viewing history
     if (chess.game_over()) return false;
-    if (engineBusy) return false;
+    if (gameFlagged) return false;
     if (viewingMoveIdx >= 0) return false;
-
     // Only allow moving own pieces
     if (playerColor === 'white' && piece.search(/^b/) !== -1) return false;
     if (playerColor === 'black' && piece.search(/^w/) !== -1) return false;
-
-    // Only move when it's player's turn
+    // Premove: allow dragging during engine thinking, but only if it's opponent's turn now
     var turn = chess.turn() === 'w' ? 'white' : 'black';
+    if (engineBusy) {
+        return turn !== playerColor; // queue a premove (no legal-move highlights during premove)
+    }
     if (turn !== playerColor) return false;
-
+    showLegalMoves(source);
     return true;
 }
 
 function onDrop(source, target) {
-    // Try the move -- handle promotion
-    var moveObj = {from: source, to: target};
-
-    // Check if this is a pawn promotion
+    if (source === target) return 'snapback';
     var piece = chess.get(source);
+    var promotion = undefined;
     if (piece && piece.type === 'p') {
         var rank = target.charAt(1);
         if ((piece.color === 'w' && rank === '8') || (piece.color === 'b' && rank === '1')) {
-            moveObj.promotion = 'q'; // Auto-promote to queen
+            promotion = 'q';
         }
     }
 
+    // If engine busy: this is a premove candidate — just store it.
+    if (engineBusy) {
+        premove = {from: source, to: target, promotion: promotion};
+        highlightPremove();
+        return 'snapback';
+    }
+
+    var moveObj = {from: source, to: target};
+    if (promotion) moveObj.promotion = promotion;
     var move = chess.move(moveObj);
     if (move === null) return 'snapback';
 
+    afterPlayerMove(source, target);
+}
+
+function afterPlayerMove(source, target) {
     lastMoveFrom = source;
     lastMoveTo = target;
     viewingMoveIdx = -1;
+    shapes = [];
+    redrawOverlay();
+    clearPremoveHighlight();
+    clearLegalMoves();
+    premove = null;
     updateMoveHistory();
     updateHighlights();
     updateGameStatus();
-
-    if (!chess.game_over()) {
+    fetchStockfishEval();
+    afterMoveClockTransition(playerColor);
+    if (!chess.game_over() && (whiteClockMs > 0 && blackClockMs > 0 || !clockEnabled)) {
         engineThink();
     }
 }
 
 function onSnapEnd() {
     board.position(chess.fen());
+    // Re-draw highlights since chessboard.js may regenerate squares
+    updateHighlights();
+    clearLegalMoves();
+    if (premove) highlightPremove();
+    setTimeout(redrawOverlay, 0);
 }
 
-// --- Engine communication ---
+// ---------- Clocks ----------
+// Format ms as a clock string. Under 10s we show tenths so the burn is visible.
+function clockText(ms) {
+    if (ms <= 0) return '0.0';
+    var totalSec = ms / 1000;
+    if (totalSec < 10) return totalSec.toFixed(1);
+    var s = Math.ceil(totalSec);
+    var h = Math.floor(s / 3600);
+    var m = Math.floor((s % 3600) / 60);
+    var sec = s % 60;
+    var pad = function(n) { return n < 10 ? '0' + n : '' + n; };
+    if (h > 0) return h + ':' + pad(m) + ':' + pad(sec);
+    return m + ':' + pad(sec);
+}
+
+function renderClocks() {
+    document.getElementById('clock-white-time').textContent = clockText(whiteClockMs);
+    document.getElementById('clock-black-time').textContent = clockText(blackClockMs);
+
+    var whiteBox = document.getElementById('clock-white');
+    var blackBox = document.getElementById('clock-black');
+    whiteBox.classList.toggle('active', activeClockSide === 'white');
+    blackBox.classList.toggle('active', activeClockSide === 'black');
+
+    function lowClass(box, ms) {
+        box.classList.remove('low', 'critical', 'flagged');
+        if (ms <= 0) box.classList.add('flagged');
+        else if (ms < 10000) box.classList.add('critical');
+        else if (ms < 30000) box.classList.add('low');
+    }
+    lowClass(whiteBox, whiteClockMs);
+    lowClass(blackBox, blackClockMs);
+}
+
+function startClockTicker() {
+    if (clockTickHandle) clearInterval(clockTickHandle);
+    clockTickAnchorWall = performance.now();
+    clockTickAnchorSide = activeClockSide;
+    clockTickAnchorMs = (activeClockSide === 'white') ? whiteClockMs : blackClockMs;
+    clockTickHandle = setInterval(function() {
+        if (!clockEnabled || !clockTickAnchorSide) return;
+        var elapsed = performance.now() - clockTickAnchorWall;
+        var remaining = clockTickAnchorMs - elapsed;
+        if (clockTickAnchorSide === 'white') whiteClockMs = remaining;
+        else blackClockMs = remaining;
+        renderClocks();
+        if (remaining <= 0) {
+            onFlagged(clockTickAnchorSide);
+        }
+    }, 100);
+}
+
+function stopClockTicker() {
+    if (clockTickHandle) { clearInterval(clockTickHandle); clockTickHandle = null; }
+    clockTickAnchorSide = null;
+}
+
+// Called when we transition from side X moving → X just moved, add increment + switch to Y.
+function afterMoveClockTransition(sideWhoMoved) {
+    if (!clockEnabled) return;
+    // Snap the active side's remaining time from the ticker's live value.
+    if (sideWhoMoved === 'white') whiteClockMs = Math.max(0, whiteClockMs);
+    else blackClockMs = Math.max(0, blackClockMs);
+    // Apply increment (Fischer: after the move).
+    if (sideWhoMoved === 'white') whiteClockMs += incrementMs;
+    else blackClockMs += incrementMs;
+    activeClockSide = (sideWhoMoved === 'white') ? 'black' : 'white';
+    renderClocks();
+    if (!chess.game_over()) startClockTicker();
+    else stopClockTicker();
+}
+
+function onFlagged(side) {
+    if (gameFlagged) return;
+    gameFlagged = true;
+    stopClockTicker();
+    if (side === 'white') whiteClockMs = 0; else blackClockMs = 0;
+    renderClocks();
+    var winner = side === 'white' ? 'Black' : 'White';
+    var statusEl = document.getElementById('game-status');
+    statusEl.textContent = 'Flag fell — ' + winner + ' wins on time.';
+    statusEl.className = 'game-status active gameover';
+    // Freeze further moves. chess.js doesn't know about clocks, so we guard
+    // onDragStart and the engine-response handler against further play.
+    engineBusy = true;
+    document.getElementById('thinking').classList.remove('active');
+}
+
+function applyTimeControlSelection(value) {
+    if (value === 'fixed' || !value) {
+        clockEnabled = false;
+        initialTimeMs = 0; incrementMs = 0;
+        whiteClockMs = 0; blackClockMs = 0;
+        activeClockSide = null;
+        stopClockTicker();
+        document.getElementById('clock-card').style.display = 'none';
+        document.getElementById('think-row').style.display = '';
+        return;
+    }
+    var parts = value.split('|');
+    initialTimeMs = parseInt(parts[0]) * 1000;
+    incrementMs = parseInt(parts[1]) * 1000;
+    clockEnabled = true;
+    document.getElementById('clock-card').style.display = '';
+    document.getElementById('think-row').style.display = 'none';
+    // Applied on next New Game — don't retroactively reset running game.
+}
+
+function resetClocksForNewGame() {
+    if (!clockEnabled) return;
+    whiteClockMs = initialTimeMs;
+    blackClockMs = initialTimeMs;
+    activeClockSide = 'white';
+    renderClocks();
+    startClockTicker();
+}
+
+// ---------- Engine thinking ----------
 function engineThink() {
     engineBusy = true;
     document.getElementById('thinking').classList.add('active');
 
     var moves = getUCIMoves();
 
+    var body = {moves: moves, model: currentModel};
+    if (clockEnabled) {
+        body.tc = {
+            wtime: Math.max(1, Math.round(whiteClockMs)),
+            btime: Math.max(1, Math.round(blackClockMs)),
+            winc: incrementMs,
+            binc: incrementMs,
+        };
+    } else {
+        body.think_time = thinkTime;
+    }
+
     fetch('/api/play/move', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({moves: moves, think_time: thinkTime})
+        body: JSON.stringify(body)
     })
     .then(function(r) {
         if (!r.ok) return r.json().then(function(d) { throw new Error(d.error || 'Engine error'); });
@@ -615,6 +937,7 @@ function engineThink() {
     .then(function(data) {
         engineBusy = false;
         document.getElementById('thinking').classList.remove('active');
+        if (gameFlagged) return; // ignore late bestmove after a flag
 
         if (data.bestmove && data.bestmove !== '(none)' && data.bestmove !== '0000') {
             var from = data.bestmove.substring(0, 2);
@@ -630,13 +953,31 @@ function engineThink() {
             updateEngineInfo(data);
             updateEvalBar(data.score_cp, data.mate);
             updateGameStatus();
+            fetchStockfishEval();
+            var engineSide = playerColor === 'white' ? 'black' : 'white';
+            afterMoveClockTransition(engineSide);
+            tryApplyPremove();
         }
     })
     .catch(function(err) {
         engineBusy = false;
         document.getElementById('thinking').classList.remove('active');
+        premove = null;
+        clearPremoveHighlight();
         showError(err.message || 'Failed to communicate with engine');
     });
+}
+
+function tryApplyPremove() {
+    if (!premove) return;
+    var mv = {from: premove.from, to: premove.to};
+    if (premove.promotion) mv.promotion = premove.promotion;
+    premove = null;
+    clearPremoveHighlight();
+    var applied = chess.move(mv);
+    if (applied === null) return; // premove was illegal now — silently drop
+    board.position(chess.fen());
+    afterPlayerMove(mv.from, mv.to);
 }
 
 function getUCIMoves() {
@@ -649,35 +990,53 @@ function getUCIMoves() {
     return moves;
 }
 
-// --- Eval bar ---
-function updateEvalBar(scoreCp, mate) {
-    var evalFill = document.getElementById('eval-fill');
-    var evalBlack = document.getElementById('eval-black');
-    var evalScore = document.getElementById('eval-score');
-    var pct;
-    var scoreText;
-
-    if (mate !== undefined && mate !== null) {
-        pct = mate > 0 ? 98 : 2;
-        scoreText = (mate > 0 ? 'M' : '-M') + Math.abs(mate);
-    } else if (scoreCp !== null && scoreCp !== undefined) {
-        // Sigmoid mapping: 50% at 0, ~95% at +400cp
-        pct = 50 + 50 * (2 / (1 + Math.exp(-scoreCp / 200)) - 1);
-        pct = Math.max(2, Math.min(98, pct));
-        var pawns = scoreCp / 100;
-        scoreText = (pawns >= 0 ? '+' : '') + pawns.toFixed(1);
-    } else {
-        pct = 50;
-        scoreText = '0.0';
+// ---------- Stockfish reference eval ----------
+function fetchStockfishEval() {
+    if (sfDepth <= 0) {
+        setSfBar(null, null);
+        return;
     }
-
-    // White fill goes up from bottom (white winning = taller)
-    evalFill.style.height = pct + '%';
-    evalBlack.style.height = (100 - pct) + '%';
-    evalScore.textContent = scoreText;
+    var moves = getUCIMoves();
+    fetch('/api/play/stockfish_eval', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({moves: moves, depth: sfDepth})
+    })
+    .then(function(r) { return r.ok ? r.json() : null; })
+    .then(function(data) {
+        if (!data) return;
+        setSfBar(data.score_cp, data.mate);
+    })
+    .catch(function() { /* silent */ });
 }
 
-// --- Engine info panel ---
+// ---------- Eval bars ----------
+function cpToPercent(scoreCp, mate) {
+    if (mate !== undefined && mate !== null) return mate > 0 ? 98 : 2;
+    if (scoreCp === null || scoreCp === undefined) return 50;
+    var pct = 50 + 50 * (2 / (1 + Math.exp(-scoreCp / 200)) - 1);
+    return Math.max(2, Math.min(98, pct));
+}
+function scoreText(scoreCp, mate) {
+    if (mate !== undefined && mate !== null) return (mate > 0 ? 'M' : '-M') + Math.abs(mate);
+    if (scoreCp === null || scoreCp === undefined) return '--';
+    var pawns = scoreCp / 100;
+    return (pawns >= 0 ? '+' : '') + pawns.toFixed(1);
+}
+function updateEvalBar(scoreCp, mate) {
+    var pct = cpToPercent(scoreCp, mate);
+    document.getElementById('eval-fill').style.height = pct + '%';
+    document.getElementById('eval-black').style.height = (100 - pct) + '%';
+    document.getElementById('eval-score').textContent = scoreText(scoreCp, mate);
+}
+function setSfBar(scoreCp, mate) {
+    var pct = cpToPercent(scoreCp, mate);
+    document.getElementById('sf-fill').style.height = pct + '%';
+    document.getElementById('sf-black').style.height = (100 - pct) + '%';
+    document.getElementById('sf-score').textContent = scoreText(scoreCp, mate);
+}
+
+// ---------- Engine info panel ----------
 function updateEngineInfo(data) {
     var scoreEl = document.getElementById('info-score');
     if (data.mate !== undefined && data.mate !== null) {
@@ -690,24 +1049,18 @@ function updateEngineInfo(data) {
         else if (pawns < -0.1) scoreEl.className = 'value score-negative';
         else scoreEl.className = 'value score-neutral';
     }
-
-    var nodesEl = document.getElementById('info-nodes');
-    if (data.nodes > 0) {
-        nodesEl.textContent = data.nodes >= 1000 ? (data.nodes / 1000).toFixed(1) + 'k' : data.nodes;
-    }
-
-    var npsEl = document.getElementById('info-nps');
-    if (data.nps > 0) {
-        npsEl.textContent = data.nps >= 1000 ? (data.nps / 1000).toFixed(1) + 'k' : data.nps;
-    }
+    document.getElementById('info-nodes').textContent =
+        data.nodes > 0 ? (data.nodes >= 1000 ? (data.nodes/1000).toFixed(1)+'k' : data.nodes) : '--';
+    document.getElementById('info-nps').textContent =
+        data.nps > 0 ? (data.nps >= 1000 ? (data.nps/1000).toFixed(1)+'k' : data.nps) : '--';
+    document.getElementById('info-depth').textContent = data.depth || '--';
 }
 
-// --- Move history ---
+// ---------- Move history ----------
 function updateMoveHistory() {
     var history = chess.history();
     var tbody = document.querySelector('#move-table tbody');
     tbody.innerHTML = '';
-
     for (var i = 0; i < history.length; i += 2) {
         var tr = document.createElement('tr');
 
@@ -736,11 +1089,8 @@ function updateMoveHistory() {
             blackTd.innerHTML = '&nbsp;';
         }
         tr.appendChild(blackTd);
-
         tbody.appendChild(tr);
     }
-
-    // Auto-scroll to bottom
     var histDiv = document.getElementById('move-history');
     histDiv.scrollTop = histDiv.scrollHeight;
 }
@@ -754,36 +1104,28 @@ function onMoveClick(e) {
 function navigateToMove(idx) {
     var history = chess.history({verbose: true});
     if (idx < 0 || idx >= history.length) return;
-
     viewingMoveIdx = idx;
     var tempChess = new Chess();
-    for (var i = 0; i <= idx; i++) {
-        tempChess.move(history[i].san);
-    }
+    for (var i = 0; i <= idx; i++) tempChess.move(history[i].san);
     board.position(tempChess.fen());
-
     lastMoveFrom = history[idx].from;
     lastMoveTo = history[idx].to;
     updateHighlights();
-
-    // Highlight active move in table
+    setTimeout(redrawOverlay, 0);
     var cells = document.querySelectorAll('#move-table td.white-move, #move-table td.black-move');
     for (var j = 0; j < cells.length; j++) {
         cells[j].classList.remove('active');
-        if (parseInt(cells[j].dataset.moveIdx) === idx) {
-            cells[j].classList.add('active');
-        }
+        if (parseInt(cells[j].dataset.moveIdx) === idx) cells[j].classList.add('active');
     }
 }
 
-// --- Highlights ---
+// ---------- Last-move + premove square highlights ----------
+function clearClass(cls) {
+    var els = document.querySelectorAll('#board .' + cls);
+    for (var i = 0; i < els.length; i++) els[i].classList.remove(cls);
+}
 function updateHighlights() {
-    // Remove all highlights
-    var squares = document.querySelectorAll('#board .square-55d63');
-    for (var i = 0; i < squares.length; i++) {
-        squares[i].classList.remove('highlight-move');
-    }
-
+    clearClass('highlight-move');
     if (lastMoveFrom && lastMoveTo) {
         var fromSq = document.querySelector('#board .square-' + lastMoveFrom);
         var toSq = document.querySelector('#board .square-' + lastMoveTo);
@@ -791,11 +1133,387 @@ function updateHighlights() {
         if (toSq) toSq.classList.add('highlight-move');
     }
 }
+function highlightPremove() {
+    clearClass('highlight-premove');
+    if (!premove) return;
+    var a = document.querySelector('#board .square-' + premove.from);
+    var b = document.querySelector('#board .square-' + premove.to);
+    if (a) a.classList.add('highlight-premove');
+    if (b) b.classList.add('highlight-premove');
+}
+function clearPremoveHighlight() { clearClass('highlight-premove'); }
 
-// --- Game status ---
+// ---------- Legal-move highlights (click-to-select) ----------
+function clearLegalMoves() {
+    clearClass('highlight-selected');
+    clearClass('legal-move');
+    clearClass('legal-capture');
+    selectedSquare = null;
+}
+
+// Highlight legal destinations for a piece on `square`. Only shows moves
+// when the piece belongs to the player and it's their turn (no premoves).
+// Uses chess.js `moves({verbose:true})` so illegal moves are never shown —
+// pins, king-safety, en-passant legality are all handled by chess.js.
+function showLegalMoves(square) {
+    clearLegalMoves();
+    if (viewingMoveIdx >= 0 || gameFlagged || chess.game_over()) return;
+    var piece = chess.get(square);
+    if (!piece) return;
+    var pieceColor = piece.color === 'w' ? 'white' : 'black';
+    if (pieceColor !== playerColor) return;
+    var turn = chess.turn() === 'w' ? 'white' : 'black';
+    if (turn !== playerColor) return;
+    var moves = chess.moves({square: square, verbose: true});
+    if (moves.length === 0) return;
+    selectedSquare = square;
+    var fromEl = document.querySelector('#board .square-' + square);
+    if (fromEl) fromEl.classList.add('highlight-selected');
+    for (var i = 0; i < moves.length; i++) {
+        var toEl = document.querySelector('#board .square-' + moves[i].to);
+        if (!toEl) continue;
+        var flags = moves[i].flags || '';
+        if (flags.indexOf('c') >= 0 || flags.indexOf('e') >= 0) {
+            toEl.classList.add('legal-capture');
+        } else {
+            toEl.classList.add('legal-move');
+        }
+    }
+}
+
+// Try to execute a click-to-move from selectedSquare to target.
+// Returns true if a move was made (or premoved).
+function tryClickMove(target) {
+    if (!selectedSquare || selectedSquare === target) return false;
+    var moves = chess.moves({square: selectedSquare, verbose: true});
+    var match = null;
+    for (var i = 0; i < moves.length; i++) {
+        if (moves[i].to === target) { match = moves[i]; break; }
+    }
+    if (!match) return false;
+    var source = selectedSquare;
+    clearLegalMoves();
+    var promotion = match.promotion ? 'q' : undefined;
+    if (engineBusy) {
+        premove = {from: source, to: target, promotion: promotion};
+        highlightPremove();
+        return true;
+    }
+    var mv = chess.move({from: source, to: target, promotion: promotion});
+    if (mv === null) return false;
+    board.position(chess.fen());
+    afterPlayerMove(source, target);
+    return true;
+}
+
+// ---------- Arrow/circle overlay ----------
+function resizeOverlay() {
+    var boardEl = document.getElementById('board');
+    var overlay = document.getElementById('board-overlay');
+    if (!boardEl || !overlay) return;
+    overlay.setAttribute('width', boardEl.offsetWidth);
+    overlay.setAttribute('height', boardEl.offsetHeight);
+    overlay.setAttribute('viewBox', '0 0 ' + boardEl.offsetWidth + ' ' + boardEl.offsetHeight);
+    redrawOverlay();
+}
+function squareCenter(square) {
+    var sq = document.querySelector('#board .square-' + square);
+    var boardEl = document.getElementById('board');
+    if (!sq || !boardEl) return null;
+    var r = sq.getBoundingClientRect();
+    var br = boardEl.getBoundingClientRect();
+    return {
+        x: r.left - br.left + r.width / 2,
+        y: r.top - br.top + r.height / 2,
+        size: r.width,
+    };
+}
+function redrawOverlay() {
+    var overlay = document.getElementById('board-overlay');
+    if (!overlay) return;
+    overlay.innerHTML = '';
+    // defs for arrowheads (one per color)
+    var colors = {};
+    for (var i = 0; i < shapes.length; i++) colors[shapes[i].color] = true;
+    var defs = '<defs>';
+    Object.keys(colors).forEach(function(c, idx) {
+        var id = 'arrowhead-' + idx;
+        defs += '<marker id="' + id + '" markerWidth="4" markerHeight="4" '
+             + 'refX="2.2" refY="2" orient="auto" markerUnits="strokeWidth">'
+             + '<path d="M0,0 L4,2 L0,4 z" fill="' + c + '"/></marker>';
+        colors[c] = id;
+    });
+    defs += '</defs>';
+    overlay.insertAdjacentHTML('beforeend', defs);
+
+    for (var j = 0; j < shapes.length; j++) {
+        var s = shapes[j];
+        if (s.type === 'arrow') {
+            var a = squareCenter(s.from);
+            var b = squareCenter(s.to);
+            if (!a || !b) continue;
+            var dx = b.x - a.x, dy = b.y - a.y;
+            var len = Math.sqrt(dx * dx + dy * dy);
+            if (len < 1) continue;
+            // Shorten so the arrowhead sits just before the target center
+            var shorten = a.size * 0.32;
+            var bx = b.x - dx / len * shorten;
+            var by = b.y - dy / len * shorten;
+            // Start slightly in from the from-center so the tail doesn't cover the piece
+            var startShorten = a.size * 0.15;
+            var ax = a.x + dx / len * startShorten;
+            var ay = a.y + dy / len * startShorten;
+            var stroke = a.size * 0.18;
+            overlay.insertAdjacentHTML('beforeend',
+                '<line x1="' + ax + '" y1="' + ay + '" x2="' + bx + '" y2="' + by + '" '
+                + 'stroke="' + s.color + '" stroke-width="' + stroke + '" '
+                + 'stroke-linecap="round" marker-end="url(#' + colors[s.color] + ')"/>');
+        } else if (s.type === 'circle') {
+            var c = squareCenter(s.square);
+            if (!c) continue;
+            var r = c.size * 0.44;
+            var sw = c.size * 0.07;
+            overlay.insertAdjacentHTML('beforeend',
+                '<circle cx="' + c.x + '" cy="' + c.y + '" r="' + r + '" '
+                + 'fill="none" stroke="' + s.color + '" stroke-width="' + sw + '"/>');
+        }
+    }
+}
+
+// Convert a mouse event to a square name, or null if outside the board.
+function squareFromEvent(e) {
+    var el = e.target;
+    while (el && el.classList) {
+        if (el.classList.contains('square-55d63')) {
+            var cls = el.className.split(' ');
+            for (var i = 0; i < cls.length; i++) {
+                if (cls[i].length === 9 && cls[i].slice(0, 7) === 'square-' && cls[i] !== 'square-55d63') {
+                    return cls[i].slice(7);
+                }
+            }
+            return null;
+        }
+        el = el.parentElement;
+    }
+    return null;
+}
+
+function toggleShape(newShape) {
+    // Remove existing matching shape; otherwise add.
+    for (var i = 0; i < shapes.length; i++) {
+        var s = shapes[i];
+        if (s.type === newShape.type && s.color === newShape.color) {
+            if (s.type === 'arrow' && s.from === newShape.from && s.to === newShape.to) {
+                shapes.splice(i, 1);
+                return;
+            }
+            if (s.type === 'circle' && s.square === newShape.square) {
+                shapes.splice(i, 1);
+                return;
+            }
+        }
+    }
+    shapes.push(newShape);
+}
+
+function installBoardMouseHandlers() {
+    var wrapper = document.getElementById('board-wrapper');
+
+    // Block native context menu everywhere inside the board — capture phase so
+    // it fires before any child element (including piece <img> tags) can claim it.
+    var blockMenu = function(e) {
+        if (wrapper.contains(e.target)) { e.preventDefault(); return false; }
+    };
+    wrapper.addEventListener('contextmenu', blockMenu, true);
+    document.addEventListener('contextmenu', blockMenu, true);
+
+    wrapper.addEventListener('mousedown', function(e) {
+        if (e.button === 2) {
+            var sq = squareFromEvent(e);
+            rightDown = sq ? {square: sq} : null;
+            e.preventDefault();
+            e.stopPropagation();
+        } else if (e.button === 0) {
+            // Any left-click clears drawn shapes (arrows/circles).
+            if (shapes.length > 0) { shapes = []; redrawOverlay(); }
+
+            var sq = squareFromEvent(e);
+            if (!sq) {
+                // Click outside the board: clear everything.
+                if (premove) { premove = null; clearPremoveHighlight(); }
+                clearLegalMoves();
+                return;
+            }
+
+            // If we have a selected source and this square is a legal target,
+            // execute the click-to-move and suppress dragstart.
+            if (selectedSquare && tryClickMove(sq)) {
+                e.preventDefault();
+                return;
+            }
+
+            // Otherwise: try to select this square (if it's the player's piece).
+            var piece = chess.get(sq);
+            var pieceColor = piece ? (piece.color === 'w' ? 'white' : 'black') : null;
+            if (piece && pieceColor === playerColor) {
+                // Clicking the same selected square toggles it off.
+                if (selectedSquare === sq) {
+                    clearLegalMoves();
+                } else {
+                    showLegalMoves(sq);
+                }
+            } else {
+                // Clicked empty or enemy square with no selection — clear state.
+                clearLegalMoves();
+                if (premove) { premove = null; clearPremoveHighlight(); }
+            }
+        }
+    });
+
+    wrapper.addEventListener('mouseup', function(e) {
+        if (e.button === 2 && rightDown) {
+            var endSq = squareFromEvent(e);
+            var start = rightDown.square;
+            rightDown = null;
+            if (!endSq) return;
+            var color = 'rgba(235, 81, 81, 0.85)'; // red — the style the user asked for
+            if (start === endSq) {
+                toggleShape({type: 'circle', square: start, color: color});
+            } else {
+                toggleShape({type: 'arrow', from: start, to: endSq, color: color});
+            }
+            redrawOverlay();
+            e.preventDefault();
+        }
+    });
+}
+
+// ---------- Models ----------
+function loadModels() {
+    fetch('/api/models').then(function(r) { return r.json(); }).then(function(data) {
+        var sel = document.getElementById('model-select');
+        // keep "random" as first option
+        sel.innerHTML = '<option value="random">-- random fallback --</option>';
+        if (!data.models || data.models.length === 0) return;
+        // Group by run for readability
+        var groups = {};
+        data.models.forEach(function(m) {
+            var key = m.run || 'other';
+            if (!groups[key]) groups[key] = [];
+            groups[key].push(m);
+        });
+        Object.keys(groups).sort().forEach(function(run) {
+            var og = document.createElement('optgroup');
+            og.label = run;
+            groups[run].forEach(function(m) {
+                var opt = document.createElement('option');
+                opt.value = m.id;
+                opt.textContent = m.name + (m.type === 'trt' ? '  [TRT]' : '');
+                og.appendChild(opt);
+            });
+            sel.appendChild(og);
+        });
+        // Auto-select the first TRT model if any, else first PT
+        var trt = data.models.find(function(m) { return m.type === 'trt'; });
+        var auto = trt || data.models[0];
+        if (auto) {
+            sel.value = auto.id;
+            currentModel = auto.id;
+        }
+    }).catch(function() {});
+}
+
+// ---------- Controls ----------
+document.getElementById('btn-new').addEventListener('click', function() { newGame(); });
+document.getElementById('btn-flip').addEventListener('click', function() {
+    board.flip();
+    setTimeout(function() { updateHighlights(); redrawOverlay(); }, 0);
+});
+document.getElementById('btn-undo').addEventListener('click', function() {
+    if (engineBusy) return;
+    if (viewingMoveIdx >= 0) {
+        viewingMoveIdx = -1;
+        board.position(chess.fen());
+        updateMoveHistory();
+        updateHighlights();
+        setTimeout(redrawOverlay, 0);
+        return;
+    }
+    chess.undo();
+    chess.undo();
+    board.position(chess.fen());
+    var hist = chess.history({verbose: true});
+    if (hist.length > 0) {
+        var last = hist[hist.length - 1];
+        lastMoveFrom = last.from;
+        lastMoveTo = last.to;
+    } else { lastMoveFrom = null; lastMoveTo = null; }
+    viewingMoveIdx = -1;
+    shapes = [];
+    premove = null;
+    updateMoveHistory();
+    updateHighlights();
+    updateGameStatus();
+    redrawOverlay();
+    clearPremoveHighlight();
+    clearLegalMoves();
+    fetchStockfishEval();
+});
+
+document.getElementById('think-time').addEventListener('change', function() {
+    thinkTime = parseInt(this.value);
+});
+document.getElementById('time-control').addEventListener('change', function() {
+    applyTimeControlSelection(this.value);
+    // Reset the game so the new clock takes effect cleanly.
+    newGame();
+});
+document.getElementById('sf-depth').addEventListener('change', function() {
+    sfDepth = parseInt(this.value);
+    fetchStockfishEval();
+});
+document.getElementById('model-select').addEventListener('change', function() {
+    currentModel = this.value;
+    // Kick a new-game request so the server preloads the model now
+    fetch('/api/play/new', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({model: currentModel})
+    }).catch(function() {});
+});
+document.querySelectorAll('input[name="color"]').forEach(function(radio) {
+    radio.addEventListener('change', function() {
+        playerColor = this.value;
+        newGame();
+    });
+});
+
+document.getElementById('board-wrapper').addEventListener('dblclick', function() {
+    if (viewingMoveIdx >= 0) {
+        viewingMoveIdx = -1;
+        board.position(chess.fen());
+        var hist = chess.history({verbose: true});
+        if (hist.length > 0) {
+            var last = hist[hist.length - 1];
+            lastMoveFrom = last.from;
+            lastMoveTo = last.to;
+        }
+        updateMoveHistory();
+        updateHighlights();
+        setTimeout(redrawOverlay, 0);
+    }
+});
+
+document.addEventListener('keydown', function(e) {
+    if (e.key === 'Escape') {
+        if (shapes.length > 0) { shapes = []; redrawOverlay(); }
+        if (premove) { premove = null; clearPremoveHighlight(); }
+    }
+});
+
+// ---------- Game status ----------
 function updateGameStatus() {
     var statusEl = document.getElementById('game-status');
-
     if (chess.in_checkmate()) {
         var winner = chess.turn() === 'w' ? 'Black' : 'White';
         statusEl.textContent = 'Checkmate! ' + winner + ' wins.';
@@ -820,86 +1538,26 @@ function updateGameStatus() {
     }
 }
 
-// --- Controls ---
-document.getElementById('btn-new').addEventListener('click', function() {
-    newGame();
-});
-
-document.getElementById('btn-flip').addEventListener('click', function() {
-    board.flip();
-});
-
-document.getElementById('btn-undo').addEventListener('click', function() {
-    if (engineBusy) return;
-    // Return to current position if viewing history
-    if (viewingMoveIdx >= 0) {
-        viewingMoveIdx = -1;
-        board.position(chess.fen());
-        updateMoveHistory();
-        updateHighlights();
-        return;
-    }
-    // Undo both engine and player move
-    chess.undo(); // engine move
-    chess.undo(); // player move
-    board.position(chess.fen());
-    var hist = chess.history({verbose: true});
-    if (hist.length > 0) {
-        var last = hist[hist.length - 1];
-        lastMoveFrom = last.from;
-        lastMoveTo = last.to;
-    } else {
-        lastMoveFrom = null;
-        lastMoveTo = null;
-    }
-    viewingMoveIdx = -1;
-    updateMoveHistory();
-    updateHighlights();
-    updateGameStatus();
-});
-
-document.getElementById('think-time').addEventListener('change', function() {
-    thinkTime = parseInt(this.value);
-});
-
-document.querySelectorAll('input[name="color"]').forEach(function(radio) {
-    radio.addEventListener('change', function() {
-        playerColor = this.value;
-        newGame();
-    });
-});
-
-// Click on board to return to current position
-document.getElementById('board-wrapper').addEventListener('dblclick', function() {
-    if (viewingMoveIdx >= 0) {
-        viewingMoveIdx = -1;
-        board.position(chess.fen());
-        var hist = chess.history({verbose: true});
-        if (hist.length > 0) {
-            var last = hist[hist.length - 1];
-            lastMoveFrom = last.from;
-            lastMoveTo = last.to;
-        }
-        updateMoveHistory();
-        updateHighlights();
-    }
-});
-
-// --- New game ---
+// ---------- New game ----------
 function newGame() {
     chess = new Chess();
     lastMoveFrom = null;
     lastMoveTo = null;
     viewingMoveIdx = -1;
     engineBusy = false;
+    shapes = [];
+    premove = null;
+    gameFlagged = false;
+    selectedSquare = null;
 
     createBoard();
     updateMoveHistory();
     updateHighlights();
+    clearLegalMoves();
     updateEvalBar(0, null);
+    setSfBar(null, null);
     updateGameStatus();
 
-    // Reset engine info
     document.getElementById('info-score').textContent = '0.00';
     document.getElementById('info-score').className = 'value score-neutral';
     document.getElementById('info-nodes').textContent = '--';
@@ -907,16 +1565,18 @@ function newGame() {
     document.getElementById('info-depth').textContent = '--';
     document.getElementById('thinking').classList.remove('active');
 
-    // Tell server to reset engine
-    fetch('/api/play/new', {method: 'POST'}).catch(function() {});
+    fetch('/api/play/new', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({model: currentModel})
+    }).catch(function() {});
 
-    // If playing as black, engine moves first
-    if (playerColor === 'black') {
-        engineThink();
-    }
+    resetClocksForNewGame();
+    fetchStockfishEval();
+    if (playerColor === 'black') engineThink();
 }
 
-// --- Error toast ---
+// ---------- Error toast ----------
 function showError(msg) {
     var toast = document.getElementById('error-toast');
     toast.textContent = msg;
@@ -924,28 +1584,33 @@ function showError(msg) {
     setTimeout(function() { toast.classList.remove('active'); }, 5000);
 }
 
-// --- Window resize ---
+// ---------- Resize ----------
 $(window).resize(function() {
     if (board) board.resize();
-    // Update eval bar height to match board
     var boardEl = document.getElementById('board');
     if (boardEl) {
         var h = boardEl.offsetHeight;
         document.getElementById('eval-bar').style.height = h + 'px';
+        document.getElementById('sf-bar').style.height = h + 'px';
     }
+    resizeOverlay();
 });
 
-// --- Init ---
+// ---------- Init ----------
 createBoard();
+installBoardMouseHandlers();
 updateEvalBar(0, null);
-
-// Match eval bar height to board after render
+setSfBar(null, null);
+loadModels();
 setTimeout(function() {
     var boardEl = document.getElementById('board');
     if (boardEl) {
         var h = boardEl.offsetHeight;
         document.getElementById('eval-bar').style.height = h + 'px';
+        document.getElementById('sf-bar').style.height = h + 'px';
     }
+    resizeOverlay();
+    fetchStockfishEval();
 }, 100);
 </script>
 </body>

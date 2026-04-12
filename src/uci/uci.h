@@ -48,6 +48,7 @@ private:
     std::atomic<bool> stop_flag_{false};
     std::atomic<bool> searching_{false};
     int nps_estimate_ = 500;
+    int move_overhead_ms_ = 50;  // safety buffer subtracted from allocated wall-clock time
 };
 
 } // namespace uci

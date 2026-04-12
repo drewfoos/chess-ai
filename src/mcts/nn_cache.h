@@ -9,6 +9,7 @@ struct CacheEntry {
     std::vector<float> policy;  // Per legal move priors (normalized)
     float value;                // Position value [-1, 1]
     int num_moves;              // Number of legal moves (policy.size())
+    float mlh = 0.0f;           // Moves-left head estimate (0 when model lacks MLH)
 };
 
 class NNCache {

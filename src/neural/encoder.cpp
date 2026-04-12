@@ -112,4 +112,74 @@ void encode_position(const Position& pos, float* output) {
     encode_position(hist, output);
 }
 
+// Bitpacked variant. Mirrors the logic of encode_position but writes one
+// uint64 per piece plane (bit per square) instead of 64 floats. The scalar
+// feature planes are reduced to a few bytes of metadata.
+static void encode_pieces_packed(const Position& pos, uint64_t* step_planes, bool is_white) {
+    for (int sq = 0; sq < 64; sq++) {
+        PieceType pt = pos.piece_on(Square(sq));
+        if (pt == NO_PIECE_TYPE) continue;
+        Color c = pos.color_on(Square(sq));
+        int plane_in_step;
+        if (c == (is_white ? WHITE : BLACK)) {
+            plane_in_step = int(pt);        // 0-5 : current player's pieces
+        } else {
+            plane_in_step = 6 + int(pt);    // 6-11 : opponent pieces
+        }
+        int actual_sq;
+        if (!is_white) {
+            int sq_file = sq & 7;
+            int sq_rank = sq >> 3;
+            actual_sq = (7 - sq_rank) * 8 + sq_file;
+        } else {
+            actual_sq = sq;
+        }
+        step_planes[plane_in_step] |= (uint64_t(1) << actual_sq);
+    }
+}
+
+void encode_position_packed(const PositionHistory& history, PackedPosition& out) {
+    std::memset(&out, 0, sizeof(PackedPosition));
+
+    const Position& current = history.current();
+    bool is_white = (current.side_to_move() == WHITE);
+    out.stm = is_white ? 1 : 0;
+
+    for (int t = 0; t < 8; t++) {
+        const Position& pos = history.at(t);
+        uint64_t* step = out.planes + t * 13;
+        encode_pieces_packed(pos, step, is_white);
+        // Plane 12: repetition indicator. Matches dense encoder: only step 0
+        // marks a 2-fold repetition; other steps are left zero.
+        if (t == 0 && history.is_repetition(2)) {
+            step[12] = ~uint64_t(0);
+        }
+    }
+
+    // Metadata derived from current position (STM-canonical castling order).
+    out.fullmove = static_cast<uint16_t>(current.fullmove_number());
+    out.rule50   = static_cast<uint8_t>(current.halfmove_clock());
+
+    CastlingRight cr = current.castling_rights();
+    uint8_t castling = 0;
+    if (is_white) {
+        if (cr & WHITE_OO)  castling |= 0x1;
+        if (cr & WHITE_OOO) castling |= 0x2;
+        if (cr & BLACK_OO)  castling |= 0x4;
+        if (cr & BLACK_OOO) castling |= 0x8;
+    } else {
+        if (cr & BLACK_OO)  castling |= 0x1;
+        if (cr & BLACK_OOO) castling |= 0x2;
+        if (cr & WHITE_OO)  castling |= 0x4;
+        if (cr & WHITE_OOO) castling |= 0x8;
+    }
+    out.castling = castling;
+}
+
+void encode_position_packed(const Position& pos, PackedPosition& out) {
+    PositionHistory hist;
+    hist.reset(pos);
+    encode_position_packed(hist, out);
+}
+
 } // namespace neural

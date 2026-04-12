@@ -20,11 +20,20 @@ struct BatchResult {
     std::vector<float> policy;       // Per legal move priors (normalized)
     float value;                     // Win - Loss scalar
     std::vector<float> full_policy;  // Full 1858-dim policy (for raw_policy tracking)
+    float mlh = 0.0f;                // Moves-left head estimate (0 when model lacks MLH output)
+};
+
+// Minimal abstract interface for the GameManager's batched path. Allows
+// swapping NeuralEvaluator (LibTorch) for TRTEvaluator (TensorRT) at runtime.
+class RawBatchEvaluator {
+public:
+    virtual ~RawBatchEvaluator() = default;
+    virtual std::vector<BatchResult> evaluate_batch_raw(const std::vector<BatchRequest>& requests) = 0;
 };
 
 // NOT thread-safe: encode_buffer_ is reused across calls.
 // For multi-threaded MCTS, use one evaluator per thread or add synchronization.
-class NeuralEvaluator : public mcts::Evaluator {
+class NeuralEvaluator : public mcts::Evaluator, public RawBatchEvaluator {
 public:
     explicit NeuralEvaluator(const std::string& model_path, const std::string& device = "cpu",
                              float policy_softmax_temp = 2.2f, bool use_fp16 = false,
@@ -36,7 +45,7 @@ public:
 
     // Batch evaluation with full policy output (for training data)
     // Callers must pre-encode positions into encoded_planes buffers.
-    std::vector<BatchResult> evaluate_batch_raw(const std::vector<BatchRequest>& requests);
+    std::vector<BatchResult> evaluate_batch_raw(const std::vector<BatchRequest>& requests) override;
 
 private:
     torch::jit::script::Module model_;

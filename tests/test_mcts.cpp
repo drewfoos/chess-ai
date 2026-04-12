@@ -442,6 +442,35 @@ TEST_F(MCTSTest, VirtualLossApplyRevert) {
     EXPECT_EQ(node.pending_evals(), 0);
 }
 
+TEST_F(MCTSTest, MultivisitIncrementN) {
+    // update(v, n) folds N equivalent updates into one call: visit += n,
+    // total_value += n*v, sum_sq_value += n*v*v.
+    mcts::Node node;
+    node.update(0.2f);               // visit=1, total=0.2, sum_sq=0.04
+    node.update(0.5f, 3);            // visit=4, total=0.2 + 3*0.5=1.7, sum_sq=0.04 + 3*0.25=0.79
+    EXPECT_EQ(node.visit_count(), 4);
+    EXPECT_FLOAT_EQ(node.total_value(), 1.7f);
+    EXPECT_NEAR(node.mean_value(), 0.425f, 1e-6f);
+    // variance = mean_sq - mean^2 = 0.79/4 - 0.425^2 = 0.1975 - 0.180625 = 0.016875
+    EXPECT_NEAR(node.value_variance(), 0.016875f, 1e-5f);
+}
+
+TEST_F(MCTSTest, MultivisitVirtualLossN) {
+    // apply_virtual_loss(n) / revert_virtual_loss(n) must be symmetric.
+    mcts::Node node;
+    node.update(0.0f);
+    EXPECT_EQ(node.visit_count(), 1);
+    EXPECT_EQ(node.pending_evals(), 0);
+
+    node.apply_virtual_loss(5);
+    EXPECT_EQ(node.visit_count(), 6);
+    EXPECT_EQ(node.pending_evals(), 5);
+
+    node.revert_virtual_loss(5);
+    EXPECT_EQ(node.visit_count(), 1);
+    EXPECT_EQ(node.pending_evals(), 0);
+}
+
 TEST_F(MCTSTest, ValueVariance) {
     mcts::Node node;
     // < 2 visits -> 0 variance

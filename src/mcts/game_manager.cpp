@@ -14,14 +14,14 @@
 
 namespace mcts {
 
-// Helper: revert virtual loss on all nodes in a path
-static void revert_virtual_loss_path(const std::vector<Node*>& path_nodes) {
-    for (Node* n : path_nodes) {
-        n->revert_virtual_loss();
+// Helper: revert virtual loss on all nodes in a path. n counts multivisit claims.
+static void revert_virtual_loss_path(const std::vector<Node*>& path_nodes, int n = 1) {
+    for (Node* node : path_nodes) {
+        node->revert_virtual_loss(n);
     }
 }
 
-GameManager::GameManager(neural::NeuralEvaluator& evaluator, const SearchParams& params)
+GameManager::GameManager(neural::RawBatchEvaluator& evaluator, const SearchParams& params)
     : evaluator_(evaluator), params_(params), cache_(params.nn_cache_size) {
     int max_batch = std::max(1, params.batch_size);
     flat_encode_buffer_.resize(max_batch * neural::TENSOR_SIZE);
@@ -145,6 +145,7 @@ void GameManager::expand_root(GameState& game) {
     // Expand root node with edges
     game.root->create_edges(moves, br.policy.data(), num_moves);
     game.root->sort_edges_by_prior();
+    game.root->set_mlh(br.mlh);
     game.root->update(br.value);
 
     // Cache root evaluation
@@ -153,6 +154,7 @@ void GameManager::expand_root(GameState& game) {
     entry.policy = br.policy;
     entry.value = br.value;
     entry.num_moves = num_moves;
+    entry.mlh = br.mlh;
     cache_.put(root_hash, std::move(entry));
 
     // Add Dirichlet noise
@@ -177,9 +179,9 @@ void GameManager::replay_moves(const Position& root_pos, const std::vector<Move>
     }
 }
 
-void GameManager::backpropagate(Node* node, float value) {
+void GameManager::backpropagate(Node* node, float value, int n) {
     while (node != nullptr) {
-        node->update(value);
+        node->update(value, n);
         value = -value;
         node = node->parent();
     }
@@ -233,10 +235,17 @@ void GameManager::propagate_terminal(Node* node) {
 }
 
 Node* GameManager::select_child_advanced(Node* node, bool is_root) {
+    return select_child_advanced(node, is_root, nullptr);
+}
+
+Node* GameManager::select_child_advanced(Node* node, bool is_root, int* out_idx) {
     assert(!node->is_leaf());
 
+    bool absolute_fpu_at_root = is_root && params_.fpu_absolute_root;
     float fpu_red = is_root ? params_.fpu_reduction_root : params_.fpu_reduction;
-    float fpu_value = node->mean_value() - fpu_red;
+    float fpu_value = absolute_fpu_at_root
+        ? params_.fpu_absolute_root_value
+        : node->mean_value() - fpu_red;
     float c_puct = dynamic_cpuct(node->visit_count());
 
     // Variance-scaled cPUCT
@@ -249,9 +258,10 @@ Node* GameManager::select_child_advanced(Node* node, bool is_root) {
 
     float sqrt_parent = std::sqrt(static_cast<float>(node->visit_count()));
 
-    // Sibling blending
+    // Sibling blending — skip at root when absolute-FPU is on: the whole point
+    // is to force visiting every root child, which sibling blending would defeat.
     float sibling_fpu = fpu_value;
-    if (params_.sibling_blending) {
+    if (params_.sibling_blending && !absolute_fpu_at_root) {
         float visited_sum = 0.0f;
         int visited_count = 0;
         for (int i = 0; i < node->num_edges(); i++) {
@@ -276,6 +286,7 @@ Node* GameManager::select_child_advanced(Node* node, bool is_root) {
 
         // MCTS-solver
         if (child && child->terminal_status() == 1) {
+            if (out_idx) *out_idx = i;
             return node->ensure_child(i, &pool_);
         }
         if (child && child->terminal_status() == -1) {
@@ -286,7 +297,7 @@ Node* GameManager::select_child_advanced(Node* node, bool is_root) {
         if (!child || child->visit_count() == 0) {
             float child_fpu = sibling_fpu;
 
-            if (params_.sibling_blending) {
+            if (params_.sibling_blending && !absolute_fpu_at_root) {
                 float child_prior = edge_prior;
                 float sim_sum = 0.0f;
                 int sim_count = 0;
@@ -311,6 +322,17 @@ Node* GameManager::select_child_advanced(Node* node, bool is_root) {
             if (params_.uncertainty_weight > 0.0f && child->visit_count() > 1) {
                 score += params_.uncertainty_weight * std::sqrt(child->value_variance());
             }
+
+            // Lc0-style MLH bonus: when the parent is confident (|q| > threshold),
+            // prefer shorter wins / longer losses by rewarding the child whose
+            // moves-left is below the parent's. delta_m = parent.m - child.m - 1
+            // (the -1 accounts for the move we just played).
+            if (params_.mlh_weight > 0.0f && std::abs(q) > params_.mlh_q_threshold) {
+                float delta_m = node->mlh() - child->mlh() - 1.0f;
+                float bonus = params_.mlh_weight * (q >= 0.0f ? 1.0f : -1.0f) * delta_m;
+                bonus = std::max(-params_.mlh_cap, std::min(params_.mlh_cap, bonus));
+                score += bonus;
+            }
         }
 
         if (score > best_score) {
@@ -323,7 +345,116 @@ Node* GameManager::select_child_advanced(Node* node, bool is_root) {
         best_idx = 0;
     }
 
+    if (out_idx) *out_idx = best_idx;
     return node->ensure_child(best_idx, &pool_);
+}
+
+// Project how many additional visits the already-selected child (best_idx) would
+// receive before PUCT switches to a different sibling. Single-level lookahead at
+// the leaf's parent; caller ensures this is not the root and the selected child
+// is non-terminal.
+int GameManager::compute_collapse_visits(Node* parent, int best_idx, bool is_root) {
+    int cap = params_.max_collapse_visits;
+    if (cap <= 1 || is_root) return 1;
+    assert(!parent->is_leaf());
+    assert(best_idx >= 0 && best_idx < parent->num_edges());
+
+    Node* selected = parent->child_node(best_idx);
+    if (selected && selected->terminal_status() != 0) return 1;
+
+    // Recompute parent-level knobs (mirrors select_child_advanced but with +m visits on selected)
+    float fpu_red = is_root ? params_.fpu_reduction_root : params_.fpu_reduction;
+    float fpu_value = parent->mean_value() - fpu_red;
+
+    // Sibling blending FPU for unvisited siblings (computed from current state, doesn't change with m)
+    float sibling_fpu = fpu_value;
+    if (params_.sibling_blending) {
+        float visited_sum = 0.0f;
+        int visited_count = 0;
+        for (int i = 0; i < parent->num_edges(); i++) {
+            Node* child = parent->child_node(i);
+            if (child && child->visit_count() > 0) {
+                visited_sum += child->mean_value();
+                visited_count++;
+            }
+        }
+        if (visited_count > 0) {
+            sibling_fpu = visited_sum / visited_count;
+            sibling_fpu = std::min(sibling_fpu, fpu_value + fpu_red * 0.5f);
+        }
+    }
+
+    float selected_prior = parent->edge(best_idx).prior();
+    int selected_N = selected ? selected->visit_count() : 0;
+    float selected_Q = (selected && selected->visit_count() > 0) ? selected->mean_value() : sibling_fpu;
+    int parent_N_base = parent->visit_count();
+
+    // Try increasing collapse counts until a sibling would win at the projected state.
+    // We already applied 1 virtual loss during the real descent, so m=1 is the baseline.
+    // Return the largest m in [1, cap] for which selected still wins.
+    int best_m = 1;
+    for (int m = 2; m <= cap; m++) {
+        int parent_N = parent_N_base + (m - 1); // (m-1) extra virtual losses beyond the one already applied
+        float sqrt_parent = std::sqrt(static_cast<float>(std::max(1, parent_N)));
+        float c_puct = params_.c_puct_init + params_.c_puct_factor * std::log(
+            (parent_N + params_.c_puct_base) / params_.c_puct_base);
+        if (params_.variance_scaling && parent_N > 1) {
+            float var = parent->value_variance();
+            float scale = std::sqrt(var) / 0.5f;
+            scale = std::max(0.5f, std::min(2.0f, scale));
+            c_puct *= scale;
+        }
+
+        // Selected child's projected score at +m total visits
+        int sel_N_proj = selected_N + m;
+        float sel_u = c_puct * selected_prior * sqrt_parent / (1.0f + sel_N_proj);
+        float sel_score = selected_Q + sel_u;
+        // Uncertainty bonus only applies for visited children; selected was visited (we just descended through it).
+        if (params_.uncertainty_weight > 0.0f && selected && selected->visit_count() > 1) {
+            sel_score += params_.uncertainty_weight * std::sqrt(selected->value_variance());
+        }
+
+        // Scan siblings — use current siblings' state (unchanged by virtual loss on selected).
+        float best_sibling = -std::numeric_limits<float>::infinity();
+        for (int i = 0; i < parent->num_edges(); i++) {
+            if (i == best_idx) continue;
+            Node* child = parent->child_node(i);
+            if (child && child->terminal_status() == -1) continue;  // losing, skip
+            float edge_prior = parent->edge(i).prior();
+            float score;
+            if (!child || child->visit_count() == 0) {
+                float child_fpu = sibling_fpu;
+                if (params_.sibling_blending) {
+                    float child_prior = edge_prior;
+                    float sim_sum = 0.0f;
+                    int sim_count = 0;
+                    for (int j = 0; j < parent->num_edges(); j++) {
+                        Node* sib = parent->child_node(j);
+                        if (sib && sib->visit_count() > 0 &&
+                                std::abs(parent->edge(j).prior() - child_prior) < 0.10f) {
+                            sim_sum += sib->mean_value();
+                            sim_count++;
+                        }
+                    }
+                    if (sim_count > 0) child_fpu = sim_sum / sim_count;
+                }
+                score = child_fpu + c_puct * edge_prior * sqrt_parent;
+            } else {
+                float q = child->mean_value();
+                float u = c_puct * edge_prior * sqrt_parent / (1.0f + child->visit_count());
+                score = q + u;
+                if (params_.uncertainty_weight > 0.0f && child->visit_count() > 1) {
+                    score += params_.uncertainty_weight * std::sqrt(child->value_variance());
+                }
+            }
+            if (score > best_sibling) best_sibling = score;
+        }
+
+        if (sel_score < best_sibling) break;  // sibling would win at m; stop at previous best
+        best_m = m;
+    }
+
+    return best_m;
 }
 
 bool GameManager::is_two_fold_repetition(uint64_t hash, const std::vector<uint64_t>& path_hashes,
@@ -359,9 +490,10 @@ void GameManager::expand_node(Node* node, const Position& pos, const EvalResult&
 
     node->create_edges(moves, priors.data(), num_moves);
     node->sort_edges_by_prior();
+    node->set_mlh(eval_result.mlh);
 }
 
-bool GameManager::gather_leaf_from_game(int game_idx, std::vector<PendingLeaf>& batch) {
+int GameManager::gather_leaf_from_game(int game_idx, std::vector<PendingLeaf>& batch) {
     auto& game = games_[game_idx];
     Node* node = game.root;
     std::vector<Move> path_moves;
@@ -372,9 +504,21 @@ bool GameManager::gather_leaf_from_game(int game_idx, std::vector<PendingLeaf>& 
     Position current_pos = game.history.current();
     path_hashes.push_back(neural::PositionHistory::compute_hash(current_pos));
 
+    // Track the leaf's parent and which edge we descended through from it,
+    // for multivisit collapse computation.
+    Node* leaf_parent = nullptr;
+    int leaf_parent_best_idx = -1;
+    bool leaf_parent_is_root = false;
+
     while (!node->is_leaf()) {
         bool is_root = (node->parent() == nullptr);
-        Node* child = select_child_advanced(node, is_root);
+        int best_idx = -1;
+        Node* child = select_child_advanced(node, is_root, &best_idx);
+
+        leaf_parent = node;
+        leaf_parent_best_idx = best_idx;
+        leaf_parent_is_root = is_root;
+
         path_moves.push_back(child->move());
 
         child->apply_virtual_loss();
@@ -392,7 +536,7 @@ bool GameManager::gather_leaf_from_game(int game_idx, std::vector<PendingLeaf>& 
                 child->set_terminal_status(2);
                 backpropagate(child, 0.0f);
                 propagate_terminal(child);
-                return false;
+                return 1;
             }
 
             path_hashes.push_back(child_hash);
@@ -410,7 +554,7 @@ bool GameManager::gather_leaf_from_game(int game_idx, std::vector<PendingLeaf>& 
         else if (node->terminal_status() == -1) value = -1.0f;
         revert_virtual_loss_path(path_nodes);
         backpropagate(node, -value);
-        return false;
+        return 1;
     }
 
     // NN cache check
@@ -420,6 +564,7 @@ bool GameManager::gather_leaf_from_game(int game_idx, std::vector<PendingLeaf>& 
         EvalResult eval_result;
         eval_result.policy = cached->policy;
         eval_result.value = cached->value;
+        eval_result.mlh = cached->mlh;
 
         expand_node(node, current_pos, eval_result);
 
@@ -430,12 +575,26 @@ bool GameManager::gather_leaf_from_game(int game_idx, std::vector<PendingLeaf>& 
             revert_virtual_loss_path(path_nodes);
             backpropagate(node, -value);
             propagate_terminal(node);
-            return false;
+            return 1;
         }
 
         revert_virtual_loss_path(path_nodes);
         backpropagate(node, -eval_result.value);
-        return false;
+        return 1;
+    }
+
+    // Multivisit collapse: project how many extra visits PUCT would route through
+    // the same leaf before switching siblings. Apply (M-1) extra virtual losses
+    // on the path, and stamp pl.multivisit so batch-return backprops N at once.
+    int M = 1;
+    if (leaf_parent != nullptr && params_.max_collapse_visits > 1) {
+        M = compute_collapse_visits(leaf_parent, leaf_parent_best_idx, leaf_parent_is_root);
+        if (M > 1) {
+            int extra = M - 1;
+            for (Node* n : path_nodes) {
+                n->apply_virtual_loss(extra);
+            }
+        }
     }
 
     // Queue for batch evaluation
@@ -444,8 +603,9 @@ bool GameManager::gather_leaf_from_game(int game_idx, std::vector<PendingLeaf>& 
     pl.leaf = node;
     pl.position = current_pos;
     pl.path_nodes = std::move(path_nodes);
+    pl.multivisit = M;
     batch.push_back(std::move(pl));
-    return true;
+    return M;
 }
 
 bool GameManager::should_prune(const GameState& game) const {
@@ -602,18 +762,53 @@ int GameManager::step() {
         }
 
         int leaves_this_game = std::min(per_game, game.target_sims - game.sims_done);
+        int sims_accumulated = 0;
         for (int i = 0; i < leaves_this_game; i++) {
-            gather_leaf_from_game(g, batch);
+            // Each descent contributes >=1 sim (1 for early-exit, M for multivisit)
+            int contrib = gather_leaf_from_game(g, batch);
+            sims_accumulated += std::max(1, contrib);
+            // Stop early if multivisit collapse has already covered the target
+            if (game.sims_done + sims_accumulated >= game.target_sims) break;
         }
 
-        // Count sims for this game (including cache hits / terminals handled in gather)
-        game.sims_done += leaves_this_game;
+        game.sims_done += sims_accumulated;
 
         // Check completion
         if (game.sims_done >= game.target_sims) {
             game.search_complete = true;
             newly_completed++;
         }
+    }
+
+    // Top-up pass: fill the batch if cache hits / terminals / repetitions in the
+    // proportional pass left it short. Without this, a step where many games hit
+    // the NN cache sends a half-empty batch to the GPU and wastes throughput.
+    int safety_iterations = total_batch * 2;
+    while (static_cast<int>(batch.size()) < total_batch && safety_iterations-- > 0) {
+        bool made_progress = false;
+        for (int g = 0; g < static_cast<int>(games_.size()); g++) {
+            if (static_cast<int>(batch.size()) >= total_batch) break;
+            auto& game = games_[g];
+            if (game.search_complete) continue;
+            if (game.sims_done >= game.target_sims) {
+                game.search_complete = true;
+                newly_completed++;
+                continue;
+            }
+            if (game.root->terminal_status() != 0) {
+                game.search_complete = true;
+                newly_completed++;
+                continue;
+            }
+            int contrib = gather_leaf_from_game(g, batch);
+            game.sims_done += std::max(1, contrib);
+            made_progress = true;
+            if (game.sims_done >= game.target_sims) {
+                game.search_complete = true;
+                newly_completed++;
+            }
+        }
+        if (!made_progress) break;
     }
 
     // Batch evaluate all pending leaves
@@ -648,6 +843,7 @@ int GameManager::step() {
             EvalResult eval_result;
             eval_result.policy = results[b].policy;
             eval_result.value = results[b].value;
+            eval_result.mlh = results[b].mlh;
 
             // Expand the leaf
             expand_node(pl.leaf, pl.position, eval_result);
@@ -657,12 +853,12 @@ int GameManager::step() {
                 float value = 0.0f;
                 if (pl.leaf->terminal_status() == 1) value = 1.0f;
                 else if (pl.leaf->terminal_status() == -1) value = -1.0f;
-                revert_virtual_loss_path(pl.path_nodes);
-                backpropagate(pl.leaf, -value);
+                revert_virtual_loss_path(pl.path_nodes, pl.multivisit);
+                backpropagate(pl.leaf, -value, pl.multivisit);
                 propagate_terminal(pl.leaf);
             } else {
-                revert_virtual_loss_path(pl.path_nodes);
-                backpropagate(pl.leaf, -eval_result.value);
+                revert_virtual_loss_path(pl.path_nodes, pl.multivisit);
+                backpropagate(pl.leaf, -eval_result.value, pl.multivisit);
 
                 // Cache
                 uint64_t pos_hash = neural::PositionHistory::compute_hash(pl.position);
@@ -670,6 +866,7 @@ int GameManager::step() {
                 entry.policy = eval_result.policy;
                 entry.value = eval_result.value;
                 entry.num_moves = num_legal_moves_vec_[b];
+                entry.mlh = eval_result.mlh;
                 cache_.put(pos_hash, std::move(entry));
 
                 propagate_terminal(pl.leaf);

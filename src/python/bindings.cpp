@@ -12,6 +12,10 @@
 #include "neural/neural_evaluator.h"
 #include "neural/position_history.h"
 #include "neural/policy_map.h"
+#include "neural/encoder.h"
+#ifdef HAS_TENSORRT
+#include "neural/trt_evaluator.h"
+#endif
 
 #include <string>
 #include <map>
@@ -69,6 +73,12 @@ void apply_config(mcts::SearchParams& params, const py::dict& config) {
         else if (key == "contempt")        params.contempt = item.second.cast<float>();
         else if (key == "sibling_blending") params.sibling_blending = item.second.cast<bool>();
         else if (key == "nn_cache_size")   params.nn_cache_size = item.second.cast<int>();
+        else if (key == "max_collapse_visits") params.max_collapse_visits = item.second.cast<int>();
+        else if (key == "fpu_absolute_root") params.fpu_absolute_root = item.second.cast<bool>();
+        else if (key == "fpu_absolute_root_value") params.fpu_absolute_root_value = item.second.cast<float>();
+        else if (key == "mlh_weight")      params.mlh_weight = item.second.cast<float>();
+        else if (key == "mlh_cap")         params.mlh_cap = item.second.cast<float>();
+        else if (key == "mlh_q_threshold") params.mlh_q_threshold = item.second.cast<float>();
         else {
             throw std::runtime_error("Unknown config key: " + key);
         }
@@ -79,13 +89,25 @@ void apply_config(mcts::SearchParams& params, const py::dict& config) {
 class SearchEngine {
 public:
     SearchEngine(const std::string& model_path, const std::string& device,
-                 py::dict config = py::dict(), bool use_fp16 = false) {
+                 py::dict config = py::dict(), bool use_fp16 = false,
+                 bool use_trt = false, const std::string& trt_engine_path = "") {
         params_ = mcts::SearchParams{};
         apply_config(params_, config);
 
-        evaluator_ = std::make_unique<neural::NeuralEvaluator>(
-            model_path, device, params_.policy_softmax_temp, use_fp16);
-        search_ = std::make_unique<mcts::Search>(*evaluator_, params_);
+        if (use_trt) {
+#ifdef HAS_TENSORRT
+            const std::string& eng = trt_engine_path.empty() ? model_path : trt_engine_path;
+            trt_evaluator_ = std::make_unique<neural::TRTEvaluator>(
+                eng, params_.policy_softmax_temp, std::max(1, params_.batch_size));
+            search_ = std::make_unique<mcts::Search>(*trt_evaluator_, params_);
+#else
+            throw std::runtime_error("SearchEngine: use_trt=True but build lacks HAS_TENSORRT");
+#endif
+        } else {
+            evaluator_ = std::make_unique<neural::NeuralEvaluator>(
+                model_path, device, params_.policy_softmax_temp, use_fp16);
+            search_ = std::make_unique<mcts::Search>(*evaluator_, params_);
+        }
     }
 
     PySearchResult search(const std::string& fen,
@@ -128,12 +150,22 @@ public:
     void set_config(const py::dict& config) {
         apply_config(params_, config);
         // Recreate search with updated params
-        search_ = std::make_unique<mcts::Search>(*evaluator_, params_);
+        if (evaluator_) {
+            search_ = std::make_unique<mcts::Search>(*evaluator_, params_);
+        }
+#ifdef HAS_TENSORRT
+        else if (trt_evaluator_) {
+            search_ = std::make_unique<mcts::Search>(*trt_evaluator_, params_);
+        }
+#endif
     }
 
 private:
     mcts::SearchParams params_;
     std::unique_ptr<neural::NeuralEvaluator> evaluator_;
+#ifdef HAS_TENSORRT
+    std::unique_ptr<neural::TRTEvaluator> trt_evaluator_;
+#endif
     std::unique_ptr<mcts::Search> search_;
 };
 
@@ -141,13 +173,25 @@ private:
 class PyGameManager {
 public:
     PyGameManager(const std::string& model_path, const std::string& device,
-                  py::dict config = py::dict(), bool use_fp16 = false) {
+                  py::dict config = py::dict(), bool use_fp16 = false,
+                  bool use_trt = false, const std::string& trt_engine_path = "") {
         params_ = mcts::SearchParams{};
         apply_config(params_, config);
 
-        evaluator_ = std::make_unique<neural::NeuralEvaluator>(
-            model_path, device, params_.policy_softmax_temp, use_fp16);
-        manager_ = std::make_unique<mcts::GameManager>(*evaluator_, params_);
+        if (use_trt) {
+#ifdef HAS_TENSORRT
+            const std::string& eng = trt_engine_path.empty() ? model_path : trt_engine_path;
+            trt_evaluator_ = std::make_unique<neural::TRTEvaluator>(
+                eng, params_.policy_softmax_temp, std::max(1, params_.batch_size));
+            manager_ = std::make_unique<mcts::GameManager>(*trt_evaluator_, params_);
+#else
+            throw std::runtime_error("GameManager: use_trt=True but build lacks HAS_TENSORRT");
+#endif
+        } else {
+            evaluator_ = std::make_unique<neural::NeuralEvaluator>(
+                model_path, device, params_.policy_softmax_temp, use_fp16);
+            manager_ = std::make_unique<mcts::GameManager>(*evaluator_, params_);
+        }
     }
 
     void init_games(int num_games, int num_sims) {
@@ -197,12 +241,15 @@ public:
 private:
     mcts::SearchParams params_;
     std::unique_ptr<neural::NeuralEvaluator> evaluator_;
+#ifdef HAS_TENSORRT
+    std::unique_ptr<neural::TRTEvaluator> trt_evaluator_;
+#endif
     std::unique_ptr<mcts::GameManager> manager_;
 };
 
 } // anonymous namespace
 
-PYBIND11_MODULE(chess_mcts, m) {
+PYBIND11_MODULE(_core, m) {
     m.doc() = "C++ MCTS search engine for chess AI";
 
     // Initialize attack tables once at module load
@@ -220,11 +267,13 @@ PYBIND11_MODULE(chess_mcts, m) {
 
     // Expose SearchEngine
     py::class_<SearchEngine>(m, "SearchEngine")
-        .def(py::init<const std::string&, const std::string&, py::dict, bool>(),
+        .def(py::init<const std::string&, const std::string&, py::dict, bool, bool, const std::string&>(),
              py::arg("model_path"),
              py::arg("device") = "cpu",
              py::arg("config") = py::dict(),
-             py::arg("use_fp16") = false)
+             py::arg("use_fp16") = false,
+             py::arg("use_trt") = false,
+             py::arg("trt_engine_path") = "")
         .def("search", &SearchEngine::search,
              py::arg("fen"),
              py::arg("moves") = std::vector<std::string>{},
@@ -233,13 +282,55 @@ PYBIND11_MODULE(chess_mcts, m) {
              py::arg("config"),
              "Update search configuration parameters");
 
+    // Module-level encode_packed: replays uci_moves from start_fen and encodes
+    // the resulting position (with 8-step history) into Lc0-style bitpacked
+    // planes + a few bytes of metadata. Returns a tuple:
+    //   (bitboards: np.ndarray(uint64)[104], stm: bool,
+    //    castling: int, rule50: int, fullmove: int).
+    // Castling bits: 0=STM-K, 1=STM-Q, 2=OPP-K, 3=OPP-Q.
+    m.def("encode_packed",
+        [](const std::string& start_fen,
+           const std::vector<std::string>& uci_moves) -> py::tuple {
+            Position pos;
+            pos.set_fen(start_fen);
+            neural::PositionHistory hist;
+            hist.reset(pos);
+            for (const auto& uci : uci_moves) {
+                Move mv = parse_uci_move(pos, uci);
+                UndoInfo undo;
+                pos.make_move(mv, undo);
+                hist.push(pos);
+            }
+            neural::PackedPosition pp;
+            neural::encode_position_packed(hist, pp);
+
+            auto bb = py::array_t<uint64_t>(neural::PACKED_PLANES);
+            auto buf = bb.mutable_unchecked<1>();
+            for (int i = 0; i < neural::PACKED_PLANES; i++) {
+                buf(i) = pp.planes[i];
+            }
+            return py::make_tuple(
+                bb,
+                py::bool_(pp.stm != 0),
+                py::int_(pp.castling),
+                py::int_(pp.rule50),
+                py::int_(pp.fullmove)
+            );
+        },
+        py::arg("start_fen"),
+        py::arg("uci_moves") = std::vector<std::string>{},
+        "Encode position + 8-step history into bitpacked planes. "
+        "Returns (bitboards[104] uint64, stm bool, castling int, rule50 int, fullmove int).");
+
     // Expose GameManager for cross-game batched search
     py::class_<PyGameManager>(m, "GameManager")
-        .def(py::init<const std::string&, const std::string&, py::dict, bool>(),
+        .def(py::init<const std::string&, const std::string&, py::dict, bool, bool, const std::string&>(),
              py::arg("model_path"),
              py::arg("device") = "cpu",
              py::arg("config") = py::dict(),
-             py::arg("use_fp16") = false)
+             py::arg("use_fp16") = false,
+             py::arg("use_trt") = false,
+             py::arg("trt_engine_path") = "")
         .def("init_games", &PyGameManager::init_games,
              py::arg("num_games"),
              py::arg("num_sims"),

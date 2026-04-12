@@ -252,6 +252,101 @@ TEST_F(NeuralTest, Encoder_RepetitionPlaneZero) {
         EXPECT_FLOAT_EQ(buf[12 * 64 + i], 0.0f);
 }
 
+// ---- Packed (bitboard) encoder ----
+//
+// Round-trip: pack, then expand the bitboards back into a dense tensor and
+// compare element-wise with encode_position on planes 0-103. Scalars 104-110
+// are checked via the metadata fields (plane 111 is always ones and not
+// stored). Bit layout: bit i of plane p = dense plane p at square i, where
+// square index uses the STM-canonical orientation already applied in
+// encode_pieces.
+static void expand_packed(const neural::PackedPosition& pp, float* out_dense_112) {
+    std::memset(out_dense_112, 0, neural::TENSOR_SIZE * sizeof(float));
+    for (int p = 0; p < neural::PACKED_PLANES; p++) {
+        uint64_t bb = pp.planes[p];
+        for (int sq = 0; sq < 64; sq++) {
+            if (bb & (uint64_t(1) << sq)) {
+                out_dense_112[p * 64 + sq] = 1.0f;
+            }
+        }
+    }
+    // Scalar planes 104-111
+    float stm_val = pp.stm ? 1.0f : 0.0f;
+    float fm_val = pp.fullmove / 200.0f;
+    float rule50_val = pp.rule50 / 100.0f;
+    for (int i = 0; i < 64; i++) {
+        out_dense_112[104 * 64 + i] = stm_val;
+        out_dense_112[105 * 64 + i] = fm_val;
+        out_dense_112[106 * 64 + i] = (pp.castling & 0x1) ? 1.0f : 0.0f;
+        out_dense_112[107 * 64 + i] = (pp.castling & 0x2) ? 1.0f : 0.0f;
+        out_dense_112[108 * 64 + i] = (pp.castling & 0x4) ? 1.0f : 0.0f;
+        out_dense_112[109 * 64 + i] = (pp.castling & 0x8) ? 1.0f : 0.0f;
+        out_dense_112[110 * 64 + i] = rule50_val;
+        out_dense_112[111 * 64 + i] = 1.0f;
+    }
+}
+
+TEST_F(NeuralTest, EncoderPacked_MatchesDenseStartPos) {
+    Position pos;
+    pos.set_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+    float dense[neural::TENSOR_SIZE] = {};
+    neural::encode_position(pos, dense);
+    neural::PackedPosition pp{};
+    neural::encode_position_packed(pos, pp);
+    float expanded[neural::TENSOR_SIZE] = {};
+    expand_packed(pp, expanded);
+    for (int i = 0; i < neural::TENSOR_SIZE; i++) {
+        ASSERT_FLOAT_EQ(expanded[i], dense[i]) << "Mismatch at offset " << i;
+    }
+}
+
+TEST_F(NeuralTest, EncoderPacked_MatchesDenseBlackToMove) {
+    Position pos;
+    pos.set_fen("rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq - 0 1");
+    float dense[neural::TENSOR_SIZE] = {};
+    neural::encode_position(pos, dense);
+    neural::PackedPosition pp{};
+    neural::encode_position_packed(pos, pp);
+    float expanded[neural::TENSOR_SIZE] = {};
+    expand_packed(pp, expanded);
+    for (int i = 0; i < neural::TENSOR_SIZE; i++) {
+        ASSERT_FLOAT_EQ(expanded[i], dense[i]) << "Mismatch at offset " << i;
+    }
+}
+
+TEST_F(NeuralTest, EncoderPacked_MatchesDensePartialCastling) {
+    Position pos;
+    pos.set_fen("r3k3/8/8/8/8/8/8/4K2R w K - 5 42");
+    float dense[neural::TENSOR_SIZE] = {};
+    neural::encode_position(pos, dense);
+    neural::PackedPosition pp{};
+    neural::encode_position_packed(pos, pp);
+    EXPECT_EQ(pp.castling, 0x1u);  // STM-K only
+    EXPECT_EQ(pp.rule50, 5u);
+    EXPECT_EQ(pp.fullmove, 42u);
+    EXPECT_EQ(pp.stm, 1u);
+    float expanded[neural::TENSOR_SIZE] = {};
+    expand_packed(pp, expanded);
+    for (int i = 0; i < neural::TENSOR_SIZE; i++) {
+        ASSERT_FLOAT_EQ(expanded[i], dense[i]) << "Mismatch at offset " << i;
+    }
+}
+
+TEST_F(NeuralTest, EncoderPacked_HistoryTimeSteps) {
+    // All 8 history steps duplicate the current position when history is
+    // seeded from a single Position — matches the dense encoder behavior.
+    Position pos;
+    pos.set_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+    neural::PackedPosition pp{};
+    neural::encode_position_packed(pos, pp);
+    for (int t = 1; t < 8; t++) {
+        for (int p = 0; p < 13; p++) {
+            EXPECT_EQ(pp.planes[t * 13 + p], pp.planes[p])
+                << "Mismatch at step " << t << ", plane " << p;
+        }
+    }
+}
+
 #ifdef HAS_LIBTORCH
 #include "neural/neural_evaluator.h"
 
@@ -477,3 +572,69 @@ TEST_F(NeuralTest, FP16FlagDisabledOnCPU) {
 }
 
 #endif // HAS_LIBTORCH
+
+#ifdef HAS_TENSORRT
+#include "neural/trt_evaluator.h"
+#include <filesystem>
+
+// Build fixture with:
+// python -m training.build_trt_engine --onnx tests/fixtures/test_model.onnx --output tests/fixtures/test_model.trt
+static const char* TEST_TRT_ENGINE = "tests/fixtures/test_model.trt";
+
+static bool trt_fixture_available() {
+    return std::filesystem::exists(TEST_TRT_ENGINE);
+}
+
+TEST_F(NeuralTest, TRT_LoadEngine) {
+    if (!trt_fixture_available()) GTEST_SKIP() << "TRT fixture missing: " << TEST_TRT_ENGINE;
+    ASSERT_NO_THROW(neural::TRTEvaluator eval(TEST_TRT_ENGINE));
+}
+
+TEST_F(NeuralTest, TRT_SinglePosition) {
+    if (!trt_fixture_available()) GTEST_SKIP() << "TRT fixture missing: " << TEST_TRT_ENGINE;
+    neural::TRTEvaluator eval(TEST_TRT_ENGINE);
+    Position pos;
+    pos.set_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+    Move moves[MAX_MOVES];
+    int n = generate_legal_moves(pos, moves);
+    ASSERT_EQ(n, 20);
+
+    auto result = eval.evaluate(pos, moves, n);
+    EXPECT_EQ(result.policy.size(), 20u);
+    EXPECT_GE(result.value, -1.0f);
+    EXPECT_LE(result.value, 1.0f);
+
+    float sum = 0;
+    for (float p : result.policy) sum += p;
+    EXPECT_NEAR(sum, 1.0f, 1e-4f);
+}
+
+TEST_F(NeuralTest, TRT_MatchesLibTorch) {
+    if (!trt_fixture_available()) GTEST_SKIP() << "TRT fixture missing: " << TEST_TRT_ENGINE;
+    neural::TRTEvaluator trt_eval(TEST_TRT_ENGINE);
+    neural::NeuralEvaluator nn_eval(TEST_MODEL, "cpu");
+
+    const char* fens[] = {
+        "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+        "r1bqkbnr/pppppppp/2n5/8/4P3/8/PPPP1PPP/RNBQKBNR w KQkq - 1 2",
+        "rnbqkb1r/pppppppp/5n2/8/8/5N2/PPPPPPPP/RNBQKB1R w KQkq - 2 2",
+    };
+    for (const char* fen : fens) {
+        Position pos;
+        pos.set_fen(fen);
+        Move moves[MAX_MOVES];
+        int n = generate_legal_moves(pos, moves);
+        auto r_trt = trt_eval.evaluate(pos, moves, n);
+        auto r_nn  = nn_eval.evaluate(pos, moves, n);
+        // FP16 drift budget — argmax should still agree; value within a loose band.
+        int argmax_trt = 0, argmax_nn = 0;
+        for (size_t i = 1; i < r_trt.policy.size(); i++) {
+            if (r_trt.policy[i] > r_trt.policy[argmax_trt]) argmax_trt = static_cast<int>(i);
+            if (r_nn.policy[i]  > r_nn.policy[argmax_nn])  argmax_nn  = static_cast<int>(i);
+        }
+        EXPECT_EQ(argmax_trt, argmax_nn) << "argmax disagreement at " << fen;
+        EXPECT_NEAR(r_trt.value, r_nn.value, 0.05f) << "value drift at " << fen;
+    }
+}
+
+#endif // HAS_TENSORRT

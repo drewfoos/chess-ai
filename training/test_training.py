@@ -399,6 +399,126 @@ def test_chess_dataset_mirror_augmentation():
     assert flipped[0, 0, 7] == 1.0  # h1
 
 
+def test_packed_roundtrip_matches_dense():
+    """Packing a dense encoding and expanding it back must preserve planes 0-103
+    exactly (binary) and planes 104-110 to within scalar quantization."""
+    from training.encoder import encode_position
+    from training.dataset import _pack_dense_planes, _extract_metadata_from_dense, unpack_bitboards
+
+    fens = [
+        "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+        "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+        "r1bqkbnr/pp1p1ppp/2n5/2p1p3/4P3/2N2N2/PPPP1PPP/R1BQKB1R b KQkq - 0 4",
+    ]
+    planes_list = [encode_position(f) for f in fens]
+    planes = np.stack(planes_list)  # (3, 112, 8, 8)
+
+    bb = _pack_dense_planes(planes)
+    assert bb.shape == (3, 104)
+    assert bb.dtype == np.uint64
+
+    expanded = unpack_bitboards(bb)  # (3, 104, 8, 8)
+    np.testing.assert_array_equal(expanded, (planes[:, :104] > 0.5).astype(np.float32))
+
+    meta = _extract_metadata_from_dense(planes)
+    # Reconstruct scalar planes from metadata and compare against original.
+    for i in range(len(fens)):
+        assert meta['stm'][i] == (planes[i, 104, 0, 0] > 0.5)
+        if meta['castling'][i] & 0x1: assert planes[i, 106, 0, 0] > 0.5
+        if meta['castling'][i] & 0x2: assert planes[i, 107, 0, 0] > 0.5
+
+
+def test_mirror_bitboards_matches_mirror_planes():
+    """Mirroring packed bitboards and expanding must equal expanding then flipping."""
+    from training.encoder import encode_position
+    from training.dataset import (
+        _pack_dense_planes, mirror_bitboards, mirror_planes, unpack_bitboards,
+    )
+    planes = encode_position("r1bqkbnr/pp1p1ppp/2n5/2p1p3/4P3/2N2N2/PPPP1PPP/R1BQKB1R b KQkq - 0 4")
+    bb = _pack_dense_planes(planes[None])[0]  # (104,)
+    mirrored = unpack_bitboards(mirror_bitboards(bb))  # (104, 8, 8)
+    expected = mirror_planes(planes)[:104]
+    np.testing.assert_array_equal(mirrored, expected)
+
+
+def test_mirror_castling_swaps_sides():
+    """Kingside↔queenside swap for both colors under horizontal mirror."""
+    from training.dataset import mirror_castling
+    # all four rights set: 0b1111
+    assert int(mirror_castling(np.array([0xF]))[0]) == 0xF
+    # STM-K only (bit 0) → STM-Q (bit 1)
+    assert int(mirror_castling(np.array([0x1]))[0]) == 0x2
+    # OPP-Q only (bit 3) → OPP-K (bit 2)
+    assert int(mirror_castling(np.array([0x8]))[0]) == 0x4
+
+
+def test_dataset_reads_legacy_and_packed():
+    """ChessDataset should load both legacy dense and packed-v2 npz files and
+    produce identical (112,8,8) tensors for the same source positions."""
+    from training.dataset import ChessDataset, _pack_dense_planes, _extract_metadata_from_dense
+    from training.encoder import encode_position
+    with tempfile.TemporaryDirectory() as tmpdir:
+        fens = [
+            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+            "r1bqkbnr/pp1p1ppp/2n5/2p1p3/4P3/2N2N2/PPPP1PPP/R1BQKB1R b KQkq - 0 4",
+        ]
+        planes = np.stack([encode_position(f) for f in fens]).astype(np.float32)
+        policies = np.full((len(fens), POLICY_SIZE), 1.0 / POLICY_SIZE, dtype=np.float32)
+        values = np.tile(np.array([[0.0, 1.0, 0.0]], dtype=np.float32), (len(fens), 1))
+
+        legacy = os.path.join(tmpdir, 'legacy.npz')
+        np.savez(legacy, planes=planes, policies=policies, values=values)
+
+        packed = os.path.join(tmpdir, 'packed.npz')
+        bb = _pack_dense_planes(planes)
+        meta = _extract_metadata_from_dense(planes)
+        np.savez_compressed(
+            packed,
+            format_version=np.uint8(2),
+            bitboards=bb, stm=meta['stm'], castling=meta['castling'],
+            rule50=meta['rule50'], fullmove=meta['fullmove'],
+            policies=policies, values=values,
+        )
+
+        ds_legacy = ChessDataset([legacy])
+        ds_packed = ChessDataset([packed])
+        assert len(ds_legacy) == len(ds_packed) == len(fens)
+        for i in range(len(fens)):
+            p_legacy = ds_legacy[i][0]
+            p_packed = ds_packed[i][0]
+            assert p_legacy.shape == p_packed.shape == (112, 8, 8)
+            # Binary piece planes match exactly, scalar planes match up to
+            # metadata quantization (exact for our test positions).
+            torch.testing.assert_close(p_legacy, p_packed, rtol=0, atol=0)
+
+
+def test_convert_npz_script_roundtrip():
+    """The one-shot conversion script rewrites a legacy npz in place and the
+    rewritten file loads identically via ChessDataset."""
+    from training.dataset import ChessDataset
+    from training.encoder import encode_position
+    from scripts.convert_npz_to_bitboards import main as convert_main
+    with tempfile.TemporaryDirectory() as tmpdir:
+        fens = ["rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"] * 3
+        planes = np.stack([encode_position(f) for f in fens]).astype(np.float32)
+        policies = np.full((3, POLICY_SIZE), 1.0 / POLICY_SIZE, dtype=np.float32)
+        values = np.tile(np.array([[0.0, 1.0, 0.0]], dtype=np.float32), (3, 1))
+        src = os.path.join(tmpdir, 'gen_001.npz')
+        np.savez(src, planes=planes, policies=policies, values=values)
+
+        before = ChessDataset([src])[0][0].clone()
+        rc = convert_main(['--data-dir', tmpdir, '--verify'])
+        assert rc == 0
+
+        # File rewritten in place as packed v2.
+        with np.load(src) as d:
+            assert 'bitboards' in d.files
+            assert 'planes' not in d.files
+
+        after = ChessDataset([src])[0][0]
+        torch.testing.assert_close(before, after, rtol=0, atol=0)
+
+
 from training.train import train_step, create_optimizer
 
 
@@ -457,14 +577,15 @@ def test_export_torchscript():
         model.eval()
         x = torch.randn(1, 112, 8, 8)
         with torch.no_grad():
-            orig_policy, orig_value_logits, _ = model(x)
-            loaded_policy, loaded_value_probs = loaded(x)  # export wrapper returns 2
+            orig_policy, orig_value_logits, orig_mlh = model(x)
+            loaded_policy, loaded_value_probs, loaded_mlh = loaded(x)  # export wrapper returns 3
 
         # Policy logits should match exactly
         assert torch.allclose(orig_policy, loaded_policy, atol=1e-5)
         # Exported model applies softmax to value head
         orig_value_probs = torch.softmax(orig_value_logits, dim=1)
         assert torch.allclose(orig_value_probs, loaded_value_probs, atol=1e-5)
+        assert torch.allclose(orig_mlh, loaded_mlh, atol=1e-5)
 
 
 def test_export_torchscript_gpu():
@@ -483,12 +604,13 @@ def test_export_torchscript_gpu():
         model_cpu = model.cpu()
         model_cpu.eval()
         with torch.no_grad():
-            orig_policy, orig_value_logits, _ = model_cpu(x)
-            loaded_policy, loaded_value_probs = loaded(x)  # export wrapper returns 2
+            orig_policy, orig_value_logits, orig_mlh = model_cpu(x)
+            loaded_policy, loaded_value_probs, loaded_mlh = loaded(x)  # export wrapper returns 3
 
         assert torch.allclose(orig_policy, loaded_policy, atol=1e-5)
         orig_value_probs = torch.softmax(orig_value_logits, dim=1)
         assert torch.allclose(orig_value_probs, loaded_value_probs, atol=1e-5)
+        assert torch.allclose(orig_mlh, loaded_mlh, atol=1e-5)
 
 
 def test_end_to_end_pipeline():
@@ -527,11 +649,12 @@ def test_end_to_end_pipeline():
         model.eval()
         x = torch.randn(1, 112, 8, 8)
         with torch.no_grad():
-            orig_p, orig_v_logits, _ = model(x)
-            load_p, load_v_probs = loaded(x)  # export wrapper returns 2
+            orig_p, orig_v_logits, orig_mlh = model(x)
+            load_p, load_v_probs, load_mlh = loaded(x)  # export wrapper returns 3
         assert torch.allclose(orig_p, load_p, atol=1e-5)
         orig_v_probs = torch.softmax(orig_v_logits, dim=1)
         assert torch.allclose(orig_v_probs, load_v_probs, atol=1e-5)
+        assert torch.allclose(orig_mlh, load_mlh, atol=1e-5)
 
 
 def test_gpu_training():
@@ -983,7 +1106,7 @@ def test_updated_search_params():
     """MCTSConfig should have updated Lc0 defaults."""
     cfg = MCTSConfig()
     assert cfg.c_puct_init == 3.0
-    assert cfg.policy_softmax_temperature == 2.2
+    assert cfg.policy_softmax_temperature == 1.61
     assert cfg.fpu_reduction == 1.2
     assert cfg.fpu_reduction_root == 1.2
 
@@ -1480,7 +1603,7 @@ def test_selfplay_npz_has_surprise():
         )
         with np.load(output_path) as data:
             assert 'surprise' in data
-            assert len(data['surprise']) == len(data['planes'])
+            assert len(data['surprise']) == len(data['bitboards'])
 
 
 def test_training_loop_one_generation():
@@ -1565,11 +1688,17 @@ def test_selfplay_npz_format():
                        mcts_config=mcts_cfg, selfplay_config=sp_cfg)
 
         with np.load(data_path) as data:
-            assert 'planes' in data
+            assert 'bitboards' in data
             assert 'policies' in data
             assert 'values' in data
-            n = data['planes'].shape[0]
-            assert data['planes'].shape == (n, 112, 8, 8)
+            assert int(data['format_version']) == 2
+            n = data['bitboards'].shape[0]
+            assert data['bitboards'].shape == (n, 104)
+            assert data['bitboards'].dtype == np.uint64
+            assert data['stm'].shape == (n,)
+            assert data['castling'].shape == (n,)
+            assert data['rule50'].shape == (n,)
+            assert data['fullmove'].shape == (n,)
             assert data['policies'].shape == (n, 1858)
             assert data['values'].shape == (n, 3)
             # Policy targets should sum to ~1
@@ -2078,3 +2207,187 @@ class TestAdaptiveConfig:
         # gen=16 is full
         sims16, _, _ = get_gen_settings(16, cfg)
         assert sims16 == cfg.full_sims
+
+
+class TestONNXExport:
+    def test_onnx_export_roundtrip(self, tmp_path):
+        """A tiny model exported to ONNX must load via onnxruntime and match PyTorch outputs."""
+        pytest.importorskip("onnx")
+        ort = pytest.importorskip("onnxruntime")
+        import numpy as np
+        import torch
+        from training.config import NetworkConfig
+        from training.model import ChessNetwork
+        from training.export import export_onnx
+
+        cfg = NetworkConfig(num_blocks=2, num_filters=16)
+        model = ChessNetwork(cfg).eval()
+        onnx_path = tmp_path / "tiny.onnx"
+        export_onnx(model, str(onnx_path))
+        assert onnx_path.exists()
+
+        # Compare outputs on a fixed random input.
+        torch.manual_seed(0)
+        x = torch.randn(1, cfg.input_planes, 8, 8)
+        with torch.no_grad():
+            p_torch, v_torch, _ = model(x)
+            v_torch_probs = torch.softmax(v_torch, dim=1)
+
+        session = ort.InferenceSession(str(onnx_path), providers=['CPUExecutionProvider'])
+        out = session.run(None, {'input': x.numpy()})
+        # Output order: (policy, value)
+        p_onnx = out[0]
+        v_onnx = out[1]
+
+        np.testing.assert_allclose(p_onnx, p_torch.numpy(), rtol=1e-3, atol=1e-4)
+        np.testing.assert_allclose(v_onnx, v_torch_probs.numpy(), rtol=1e-3, atol=1e-4)
+
+    def test_onnx_export_dynamic_batch(self, tmp_path):
+        """Exported ONNX model must accept variable batch sizes."""
+        pytest.importorskip("onnx")
+        ort = pytest.importorskip("onnxruntime")
+        import numpy as np
+        import torch
+        from training.config import NetworkConfig
+        from training.model import ChessNetwork
+        from training.export import export_onnx
+
+        cfg = NetworkConfig(num_blocks=2, num_filters=16)
+        model = ChessNetwork(cfg).eval()
+        onnx_path = tmp_path / "dyn.onnx"
+        export_onnx(model, str(onnx_path))
+
+        session = ort.InferenceSession(str(onnx_path), providers=['CPUExecutionProvider'])
+        for bs in (1, 4, 16):
+            x = np.random.randn(bs, cfg.input_planes, 8, 8).astype(np.float32)
+            out = session.run(None, {'input': x})
+            assert out[0].shape == (bs, cfg.policy_size)
+            assert out[1].shape == (bs, cfg.value_size)
+
+
+class TestTRTEngineBuilder:
+    def test_build_engine_produces_loadable_plan(self, tmp_path):
+        """ONNX → TRT engine → load via TRT runtime; build + round-trip smoke test."""
+        trt = pytest.importorskip("tensorrt")
+        import torch
+        from training.config import NetworkConfig
+        from training.model import ChessNetwork
+        from training.export import export_onnx
+        from training.build_trt_engine import build_engine
+
+        # Tiny model so the build finishes quickly.
+        cfg = NetworkConfig(num_blocks=2, num_filters=16)
+        model = ChessNetwork(cfg).eval()
+        onnx_path = tmp_path / "tiny.onnx"
+        trt_path = tmp_path / "tiny.trt"
+        export_onnx(model, str(onnx_path))
+
+        build_engine(
+            str(onnx_path),
+            str(trt_path),
+            fp16=True,
+            min_batch=1, opt_batch=4, max_batch=8,
+            workspace_mb=512,
+        )
+        assert trt_path.exists()
+        assert trt_path.stat().st_size > 0
+
+        # Load the serialized engine back in and confirm bindings match our I/O names.
+        logger = trt.Logger(trt.Logger.WARNING)
+        runtime = trt.Runtime(logger)
+        with open(trt_path, 'rb') as f:
+            engine = runtime.deserialize_cuda_engine(f.read())
+        assert engine is not None
+        io_names = [engine.get_tensor_name(i) for i in range(engine.num_io_tensors)]
+        assert 'input' in io_names
+        assert 'policy' in io_names
+        assert 'value' in io_names
+
+
+class TestTieredNetworkSchedule:
+    def test_resolve_tier_returns_defaults_when_no_schedule(self):
+        from training.selfplay import resolve_tier
+
+        blocks, filters = resolve_tier(5, None, default_blocks=10, default_filters=128)
+        assert blocks == 10
+        assert filters == 128
+
+    def test_resolve_tier_returns_active_tier(self):
+        from training.selfplay import resolve_tier
+
+        schedule = [(0, 6, 64), (20, 10, 128)]
+        # Before first transition: first tier active
+        assert resolve_tier(0, schedule, 1, 1) == (6, 64)
+        assert resolve_tier(19, schedule, 1, 1) == (6, 64)
+        # At/after transition: second tier active
+        assert resolve_tier(20, schedule, 1, 1) == (10, 128)
+        assert resolve_tier(100, schedule, 1, 1) == (10, 128)
+
+    def test_resolve_tier_multiple_tiers(self):
+        from training.selfplay import resolve_tier
+
+        schedule = [(0, 4, 32), (5, 6, 64), (15, 10, 128)]
+        assert resolve_tier(4, schedule, 1, 1) == (4, 32)
+        assert resolve_tier(5, schedule, 1, 1) == (6, 64)
+        assert resolve_tier(14, schedule, 1, 1) == (6, 64)
+        assert resolve_tier(15, schedule, 1, 1) == (10, 128)
+
+    def test_resume_with_mismatched_args_ignores_args(self, tmp_path):
+        """load_state_dict must not crash when user passes wrong blocks/filters."""
+        import torch
+        from training.config import NetworkConfig
+        from training.model import ChessNetwork
+        from training.selfplay import load_checkpoint_with_config
+
+        saved_cfg = NetworkConfig(num_blocks=4, num_filters=32)
+        saved_model = ChessNetwork(saved_cfg)
+        ckpt_path = tmp_path / 'ckpt.pt'
+        torch.save({
+            'generation': 1,
+            'model_state_dict': saved_model.state_dict(),
+            'config': saved_cfg,
+        }, ckpt_path)
+
+        # Would crash with shape mismatch if saved config were ignored.
+        model, cfg, _ = load_checkpoint_with_config(
+            str(ckpt_path),
+            default_blocks=20,
+            default_filters=256,
+            device='cpu',
+        )
+        # Round-trip produces identical outputs.
+        x = torch.zeros(1, cfg.input_planes, 8, 8)
+        with torch.no_grad():
+            p_saved, v_saved, _ = saved_model(x)
+            p_loaded, v_loaded, _ = model(x)
+        assert torch.allclose(p_saved, p_loaded)
+        assert torch.allclose(v_saved, v_loaded)
+
+    def test_resume_honors_saved_architecture(self, tmp_path):
+        """A checkpoint saved at 6b64f must load as 6b64f even if user passes 10b128f."""
+        import torch
+        from training.config import NetworkConfig
+        from training.model import ChessNetwork
+        from training.selfplay import load_checkpoint_with_config
+
+        saved_cfg = NetworkConfig(num_blocks=6, num_filters=64)
+        saved_model = ChessNetwork(saved_cfg)
+        ckpt_path = tmp_path / 'ckpt.pt'
+        torch.save({
+            'generation': 3,
+            'model_state_dict': saved_model.state_dict(),
+            'config': saved_cfg,
+        }, ckpt_path)
+
+        # User passes mismatched args — saved config must win.
+        model, cfg, start_gen = load_checkpoint_with_config(
+            str(ckpt_path),
+            default_blocks=10,
+            default_filters=128,
+            device='cpu',
+        )
+        assert cfg.num_blocks == 6
+        assert cfg.num_filters == 64
+        assert model.config.num_blocks == 6
+        assert model.config.num_filters == 64
+        assert start_gen == 4

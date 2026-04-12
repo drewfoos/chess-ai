@@ -1,0 +1,31 @@
+[build-system]
+requires = ["scikit-build-core>=0.8", "pybind11>=2.12"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "chess-ai"
+version = "0.1.0"
+description = "From-scratch AlphaZero-style chess AI (C++ MCTS + PyTorch training)"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "numpy",
+    "torch",
+    "chess",
+    "flask",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+# TensorRT is enabled by default in cmake.args below. The Python `tensorrt`
+# package is installed separately from NVIDIA's SDK (vendor wheel). Requires
+# TENSORRT_PATH env var pointing at the SDK root (e.g. C:\TensorRT-10.16.1.11)
+# at `pip install` time. To build WITHOUT TensorRT, override CMake args:
+#   pip install -e . --config-settings=cmake.define.ENABLE_TENSORRT=OFF
+
+[tool.scikit-build]
+cmake.version = ">=3.20"
+cmake.build-type = "Release"
+cmake.args = ["-DBUILD_PYTHON=ON", "-DENABLE_NEURAL=ON", "-DENABLE_TENSORRT=ON"]
+build-dir = "build/{wheel_tag}"
+wheel.packages = ["src/python/chess_mcts"]
+install.components = ["python"]

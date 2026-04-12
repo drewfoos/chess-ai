@@ -59,21 +59,27 @@ public:
         return std::max(0.0f, mean_sq - mean * mean);
     }
 
-    // Virtual loss for batched MCTS
-    void apply_virtual_loss() { visit_count_++; pending_evals_++; }
-    void revert_virtual_loss() { visit_count_--; pending_evals_--; }
+    // Virtual loss for batched MCTS. n > 1 supports multivisit collapse
+    // (claim N visits in a single descent when PUCT would pick the same child N times).
+    void apply_virtual_loss(int n = 1) { visit_count_ += n; pending_evals_ += static_cast<int16_t>(n); }
+    void revert_virtual_loss(int n = 1) { visit_count_ -= n; pending_evals_ -= static_cast<int16_t>(n); }
     int pending_evals() const { return pending_evals_; }
 
     // Terminal status for MCTS-solver
     int8_t terminal_status() const { return terminal_status_; }
     void set_terminal_status(int8_t s) { terminal_status_ = s; }
 
+    // Moves-left head output (network's estimate of remaining plies from this position).
+    // 0 until the node is expanded via the evaluator. Used as a PUCT bonus term.
+    float mlh() const { return mlh_; }
+    void set_mlh(float m) { mlh_ = m; }
+
     // Edge/child management
     void create_edges(const Move* moves, const float* priors, int count);
     void sort_edges_by_prior();
 
-    // Modification
-    void update(float value);
+    // Modification. n > 1 applies N visits at once (multivisit backprop).
+    void update(float value, int n = 1);
 
     // For backward compat — sets the node's own prior
     void set_prior(float p) { prior_bits_ = float_to_half(p); }
@@ -131,6 +137,7 @@ private:
         sum_sq_value_ = 0.0f;
         terminal_status_ = 0;
         pending_evals_ = 0;
+        mlh_ = 0.0f;
         parent_ = nullptr;
         if (edges_) {
             delete[] edges_;
@@ -153,6 +160,7 @@ private:
 
     int8_t terminal_status_ = 0;
     int16_t pending_evals_ = 0;
+    float mlh_ = 0.0f;
 
     Node* parent_ = nullptr;
 

@@ -19,7 +19,7 @@ namespace mcts {
 
 class GameManager {
 public:
-    GameManager(neural::NeuralEvaluator& evaluator, const SearchParams& params);
+    GameManager(neural::RawBatchEvaluator& evaluator, const SearchParams& params);
 
     // Initialize a game at index with a position and history
     void init_game(int idx, const neural::PositionHistory& history, int num_sims);
@@ -65,9 +65,10 @@ private:
         Node* leaf;
         Position position;
         std::vector<Node*> path_nodes;  // For virtual loss reversal
+        int multivisit = 1;             // Number of collapsed visits (multivisit optimization)
     };
 
-    neural::NeuralEvaluator& evaluator_;
+    neural::RawBatchEvaluator& evaluator_;
     SearchParams params_;
     NNCache cache_;
     NodePool pool_;
@@ -78,17 +79,23 @@ private:
     std::vector<std::vector<Move>> legal_moves_vec_;
     std::vector<int> num_legal_moves_vec_;
 
-    // Gather a leaf from one game (returns true if a leaf was queued for eval)
-    bool gather_leaf_from_game(int game_idx, std::vector<PendingLeaf>& batch);
+    // Gather a leaf from one game. Returns the number of simulations this descent
+    // contributed (0 = early-exit without NN queue, 1 = standard, N = multivisit collapse).
+    int gather_leaf_from_game(int game_idx, std::vector<PendingLeaf>& batch);
 
     // Expand root for a game using single-position evaluation
     void expand_root(GameState& game);
 
-    // Selection with advanced features (duplicated from Search)
+    // Selection with advanced features (duplicated from Search). Optionally returns edge index.
     Node* select_child_advanced(Node* node, bool is_root);
+    Node* select_child_advanced(Node* node, bool is_root, int* out_idx);
 
-    // Backpropagate value up the tree
-    void backpropagate(Node* node, float value);
+    // Compute how many additional visits PUCT would route to the selected child
+    // before switching to a sibling. Returns value in [1, max_collapse_visits].
+    int compute_collapse_visits(Node* parent, int best_idx, bool is_root);
+
+    // Backpropagate value up the tree. n > 1 folds N multivisit updates into one walk.
+    void backpropagate(Node* node, float value, int n = 1);
 
     // Propagate terminal status up the tree
     void propagate_terminal(Node* node);

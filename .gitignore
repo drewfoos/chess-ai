@@ -37,6 +37,10 @@ venv/
 *.onnx
 *.pth
 
+# scikit-build-core / compiled Python extensions
+_skbuild/
+*.pyd
+
 # Training data & output
 *.gz
 *.npz
@@ -44,6 +48,7 @@ data/
 checkpoints/
 runs/
 selfplay_output/
+models/
 
 # Playwright / screenshots
 .playwright-mcp/
@@ -58,6 +63,19 @@ libtorch.zip
 
 # Lichess bot (cloned external repo)
 lichess-bot/
+
+# External engines (Stockfish etc. for eval gauntlets)
+engines/
+
+# Syzygy endgame tablebases (downloaded on demand, ~940MB for 3-4-5 piece)
+syzygy/
+
+# Binary test fixtures (ONNX / TorchScript / TRT engines — generated on demand)
+tests/fixtures/
+
+# Build logs
+build_trt.log
+*.log
 
 # OS
 Thumbs.db

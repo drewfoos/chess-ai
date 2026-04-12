@@ -251,6 +251,44 @@ Browser polls /api/summary every 10s → Chart.js + chessboard.js
 
 **Implementation status:** Complete. Lightweight stack: Flask + CDN-hosted Chart.js/chessboard.js. No React, no npm, no WebSocket — just JSON files + polling.
 
+### 6.5 Python Packaging (scikit-build-core)
+
+`chess_mcts` is distributed as a proper Python package so that `import
+chess_mcts` resolves reliably from any shell / CWD without `PYTHONPATH`
+tricks or manually placed `.pyd` files.
+
+```
+pyproject.toml                       # scikit-build-core backend, project metadata
+src/python/
+├── bindings.cpp                     # PYBIND11_MODULE(_core, m) — compiled to _core.pyd
+└── chess_mcts/
+    ├── __init__.py                  # DLL registration + re-export from ._core
+    └── _paths.py.in                 # CMake-configured: LIBTORCH_LIB, TENSORRT_BIN
+```
+
+**Install once, use anywhere:**
+```
+$env:TENSORRT_PATH = "C:\TensorRT-10.16.1.11"
+pip install -e .
+```
+
+**How DLLs resolve on Windows:**
+1. CMake `configure_file()` bakes the absolute LibTorch + TensorRT
+   directories into `chess_mcts/_paths.py` at build time.
+2. `chess_mcts/__init__.py` calls `os.add_dll_directory(...)` on each
+   baked path before `from ._core import *`.
+3. The CPython import machinery (Python 3.8+) uses
+   `LOAD_LIBRARY_SEARCH_DEFAULT_DIRS`, which honors `os.add_dll_directory`
+   but ignores `%PATH%` — so this registration is what actually makes
+   `_core.pyd`'s dependent DLLs load.
+
+The CMake `BUILD_PYTHON` target is renamed to `_core` so that the
+extension's canonical import path is `chess_mcts._core`. The legacy
+`build.ps1` / `ctest` workflow still gets LibTorch + TensorRT DLLs
+copied next to the built extension via a `POST_BUILD` step guarded by
+`if(NOT SKBUILD)` — under scikit-build-core the package handles DLL
+resolution itself and the copy is skipped.
+
 ### 7. UCI Protocol — Plan 7
 
 Universal Chess Interface support for GUI integration and tournament play.
@@ -319,6 +357,7 @@ GUI → stdin → UCIHandler::loop() → parse command
 ```
 chess-ai/
 ├── CMakeLists.txt              Root build config
+├── pyproject.toml              scikit-build-core backend + project metadata
 ├── README.md
 ├── src/
 │   ├── core/                   Board, moves, attacks (Plan 1)
@@ -326,6 +365,9 @@ chess-ai/
 │   ├── neural/                 C++ inference (Plan 5)
 │   ├── selfplay/               Game generation (Plan 4)
 │   ├── uci/                    UCI protocol (Plan 7)
+│   ├── python/
+│   │   ├── bindings.cpp        pybind11 entry → chess_mcts._core
+│   │   └── chess_mcts/         Python package (DLL registration + re-exports)
 │   └── main.cpp                CLI entry point
 ├── training/                   Python/PyTorch (Plan 3)
 │   ├── config.py
