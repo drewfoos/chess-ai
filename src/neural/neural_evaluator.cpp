@@ -3,16 +3,22 @@
 #include "neural/neural_evaluator.h"
 #include "neural/encoder.h"
 #include "neural/policy_map.h"
+#include <torch/cuda.h>
 #include <algorithm>
 #include <cmath>
 
 namespace neural {
 
 NeuralEvaluator::NeuralEvaluator(const std::string& model_path, const std::string& device)
-    : model_(torch::jit::load(model_path))
-    , device_(device == "cuda" ? torch::kCUDA : torch::kCPU)
+    : device_(device == "cuda" && torch::cuda::is_available() ? torch::kCUDA : torch::kCPU)
     , encode_buffer_(TENSOR_SIZE)
 {
+    try {
+        model_ = torch::jit::load(model_path);
+    } catch (const c10::Error& e) {
+        throw std::runtime_error(
+            "NeuralEvaluator: failed to load model from '" + model_path + "': " + e.what());
+    }
     model_.to(device_);
     model_.eval();
 }
