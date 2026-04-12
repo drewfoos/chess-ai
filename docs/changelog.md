@@ -12,6 +12,14 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 - `training_loop()` now persists `network_schedule` in each checkpoint dict; on resume (including auto-resume) the schedule is restored from the checkpoint if the caller didn't pass one — prevents silently dropping the scale-up plan on restart
 - New `--network-schedule "1:6:64,20:10:128"` CLI flag for `python -m training loop` (parses comma-separated `gen_start:blocks:filters` tiers)
 
+### Fixed — Resume Preserves Run Configuration
+- Tier transitions now run a warm-up training pass on the existing sliding window before self-play, so the freshly-built (randomly-initialized) larger net isn't used to generate a generation's worth of noise games
+- Checkpoints now persist a `run_params` dict (games/gen, batch size, LR, window size, sims, max moves, parallel games, train epochs, syzygy/opening book paths, adaptive config, use_trt, etc.)
+- `--adaptive` / `--no-adaptive` / `--use-trt` / `--no-use-trt` CLI flags now use `argparse.SUPPRESS` defaults: when omitted, the CLI auto-restores the saved value from the resumed checkpoint instead of silently reverting to the hardcoded default
+- `training_loop(restore_from_checkpoint=['adaptive', 'use_trt'])` opts individual run params into the auto-restore path
+- On resume, any saved hyperparameter that differs from the current run prints a `[warn] saved=X current=Y` line so silent config drift is visible without forcing overrides
+- Refactored per-generation training into `_build_window_dataloader()` + `_train_one_cycle()` helpers; tier warm-up reuses them to train on prior-gen data before the transition generation's self-play
+
 ### Changed — Python Packaging via scikit-build-core
 - New `pyproject.toml` at repo root wires the project to the `scikit_build_core.build` backend; `pip install -e .` now produces a proper editable site-packages install of `chess_mcts` with auto-rebuild on C++ source change
 - Compiled pybind11 extension renamed `chess_mcts` → `chess_mcts._core` (i.e. the `.pyd` now lives *inside* the Python package); user-facing API is unchanged — `import chess_mcts` still re-exports `SearchEngine`, `GameManager`, `SearchResult`, `encode_packed`

@@ -9,7 +9,7 @@ import argparse
 import os
 import random
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 
 import chess
 import numpy as np
@@ -884,6 +884,85 @@ def _build_trt_engine_for_self_play(model, cpp_model_path: str) -> str:
     return trt_path
 
 
+def _build_window_dataloader(
+    data_dir: str,
+    window_start: int,
+    window_end: int,
+    batch_size: int,
+):
+    """Build a DataLoader over gen_{start..end}.npz with diff-focus sampling.
+
+    Returns None if no usable npz files exist in the window (lets callers skip
+    warm-up for early generations with no prior data).
+    """
+    from torch.utils.data import DataLoader, WeightedRandomSampler
+    from training.dataset import ChessDataset
+
+    npz_paths = [
+        os.path.join(data_dir, f'gen_{g:03d}.npz')
+        for g in range(window_start, window_end + 1)
+    ]
+    npz_paths = [p for p in npz_paths if os.path.exists(p)]
+    if not npz_paths:
+        return None, None
+    dataset = ChessDataset(npz_paths, mirror=True)
+    if dataset.surprise_weights is not None:
+        weights = dataset.surprise_weights + 1e-6
+        sampler = WeightedRandomSampler(weights, len(dataset), replacement=True)
+        loader = DataLoader(dataset, batch_size=batch_size, sampler=sampler, drop_last=True)
+    else:
+        loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=True)
+    return dataset, loader
+
+
+def _train_one_cycle(model, optimizer, dataloader, device, train_epochs):
+    """Run `train_epochs` epochs over `dataloader`. Returns (tot, pol, val, nb)."""
+    from training.train import compute_loss
+
+    model.train()
+    total_loss_sum = 0.0
+    policy_loss_sum = 0.0
+    value_loss_sum = 0.0
+    num_batches = 0
+
+    use_amp = (device == 'cuda')
+    scaler = torch.amp.GradScaler(enabled=use_amp)
+
+    for _ in range(train_epochs):
+        for batch in dataloader:
+            planes = batch[0].to(device)
+            policy_target = batch[1].to(device)
+            value_target = batch[2].to(device)
+            mlh_target = None
+            policy_mask = None
+            bi = 3
+            if bi < len(batch) and batch[bi].dtype in (torch.float32, torch.float64):
+                mlh_target = batch[bi].to(device)
+                bi += 1
+            if bi < len(batch) and batch[bi].dtype == torch.bool:
+                policy_mask = batch[bi].to(device)
+
+            optimizer.zero_grad()
+            with torch.amp.autocast(device_type=device, enabled=use_amp):
+                policy_logits, value_logits, mlh_pred = model(planes)
+                total_loss, policy_loss, value_loss = compute_loss(
+                    policy_logits, value_logits, policy_target, value_target,
+                    mlh_pred, mlh_target, policy_mask,
+                )
+            scaler.scale(total_loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
+            scaler.step(optimizer)
+            scaler.update()
+
+            total_loss_sum += total_loss.item()
+            policy_loss_sum += policy_loss.item()
+            value_loss_sum += value_loss.item()
+            num_batches += 1
+
+    return total_loss_sum, policy_loss_sum, value_loss_sum, num_batches
+
+
 def training_loop(
     generations: int = 10,
     games_per_gen: int = 400,
@@ -908,6 +987,7 @@ def training_loop(
     parallel_games: int = 128,
     network_schedule: list[tuple[int, int, int]] | None = None,
     use_trt: bool = True,
+    restore_from_checkpoint: list[str] | None = None,
 ):
     """Full reinforcement learning training loop.
 
@@ -991,6 +1071,35 @@ def training_loop(
         if network_schedule is None and saved_schedule:
             network_schedule = [tuple(t) for t in saved_schedule]
             print(f"  Restored network_schedule from checkpoint: {network_schedule}")
+
+        # Restore hyperparameters the caller didn't explicitly set.
+        # restore_from_checkpoint names the keys to auto-inherit; everything
+        # else is warned about on mismatch (visibility without auto-override).
+        saved_params = checkpoint.get('run_params') or {}
+        inherit = set(restore_from_checkpoint or ())
+        if 'adaptive' in inherit and saved_params.get('adaptive'):
+            adaptive = AdaptiveConfig(**saved_params['adaptive'])
+            print(f"  Restored adaptive config from checkpoint: enabled={adaptive.enabled}")
+        if 'use_trt' in inherit and 'use_trt' in saved_params:
+            use_trt = saved_params['use_trt']
+            print(f"  Restored use_trt={use_trt} from checkpoint")
+
+        # Warn on silent hyperparameter drift (values the user didn't
+        # actively restore but that differ from the saved run).
+        mismatches = []
+        for key, current in (
+            ('games_per_gen', games_per_gen), ('batch_size', batch_size),
+            ('lr', lr), ('window_size', window_size),
+            ('num_simulations', num_simulations), ('max_moves', max_moves),
+            ('parallel_games', parallel_games), ('train_epochs', train_epochs),
+        ):
+            if key in saved_params and saved_params[key] != current:
+                mismatches.append((key, saved_params[key], current))
+        if mismatches:
+            print("  [warn] hyperparameters differ from saved run (using current):")
+            for key, saved, cur in mismatches:
+                print(f"    {key}: saved={saved}, current={cur}")
+
         print(f"  Loaded generation {start_gen - 1} ({blocks}b{filters}f), resuming from gen {start_gen}")
     else:
         # Pick initial tier if schedule is set.
@@ -1057,6 +1166,22 @@ def training_loop(
                 swa_model = AveragedModel(model)
             blocks, filters = target_blocks, target_filters
 
+            # Warm-up: train the new (random) net on prior-gen data before
+            # self-play, so this generation's games aren't played by a fresh
+            # random network. Skipped when there's no prior data (gen==1).
+            warmup_start = max(1, gen - window_size + 1)
+            warmup_end = gen - 1
+            if warmup_end >= warmup_start:
+                _, warmup_loader = _build_window_dataloader(
+                    data_dir, warmup_start, warmup_end, batch_size,
+                )
+                if warmup_loader is not None:
+                    print(f"  Warm-up training new net on window {warmup_start}-{warmup_end}"
+                          f" ({train_epochs} epochs) before self-play")
+                    _train_one_cycle(model, optimizer, warmup_loader, device, train_epochs)
+                    if swa_model is not None:
+                        swa_model.update_parameters(model)
+
         # Adaptive settings: adjust sims/max_moves/games per generation
         gen_sims, gen_max_moves, gen_games = get_gen_settings(gen, adaptive)
         mcts_config.num_simulations = gen_sims
@@ -1105,60 +1230,14 @@ def training_loop(
 
         # 2. Load sliding window of recent generations
         window_start = max(1, gen - window_size + 1)
-        npz_paths = [
-            os.path.join(data_dir, f'gen_{g:03d}.npz')
-            for g in range(window_start, gen + 1)
-        ]
-        dataset = ChessDataset(npz_paths, mirror=True)
-        if dataset.surprise_weights is not None:
-            # Diff-focus sampling: oversample positions where MCTS disagreed with raw NN
-            weights = dataset.surprise_weights + 1e-6  # Avoid zero weights
-            sampler = WeightedRandomSampler(weights, len(dataset), replacement=True)
-            dataloader = DataLoader(dataset, batch_size=batch_size, sampler=sampler, drop_last=True)
-        else:
-            dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=True)
+        dataset, dataloader = _build_window_dataloader(
+            data_dir, window_start, gen, batch_size,
+        )
 
         # 3. Train for train_epochs epochs (with mixed precision on CUDA)
-        model.train()
-        total_loss_sum = 0.0
-        policy_loss_sum = 0.0
-        value_loss_sum = 0.0
-        num_batches = 0
-
-        use_amp = (device == 'cuda')
-        scaler = torch.amp.GradScaler(enabled=use_amp)
-
-        for epoch in range(train_epochs):
-            for batch in dataloader:
-                planes = batch[0].to(device)
-                policy_target = batch[1].to(device)
-                value_target = batch[2].to(device)
-                mlh_target = None
-                policy_mask = None
-                bi = 3
-                if bi < len(batch) and batch[bi].dtype in (torch.float32, torch.float64):
-                    mlh_target = batch[bi].to(device)
-                    bi += 1
-                if bi < len(batch) and batch[bi].dtype == torch.bool:
-                    policy_mask = batch[bi].to(device)
-
-                optimizer.zero_grad()
-                with torch.amp.autocast(device_type=device, enabled=use_amp):
-                    policy_logits, value_logits, mlh_pred = model(planes)
-                    total_loss, policy_loss, value_loss = compute_loss(
-                        policy_logits, value_logits, policy_target, value_target,
-                        mlh_pred, mlh_target, policy_mask,
-                    )
-                scaler.scale(total_loss).backward()
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
-                scaler.step(optimizer)
-                scaler.update()
-
-                total_loss_sum += total_loss.item()
-                policy_loss_sum += policy_loss.item()
-                value_loss_sum += value_loss.item()
-                num_batches += 1
+        total_loss_sum, policy_loss_sum, value_loss_sum, num_batches = _train_one_cycle(
+            model, optimizer, dataloader, device, train_epochs,
+        )
 
         # Update SWA model after training
         if swa_model is not None:
@@ -1166,12 +1245,31 @@ def training_loop(
 
         # 4. Save checkpoint
         checkpoint_path = os.path.join(checkpoint_dir, f'model_gen_{gen}.pt')
+        run_params = {
+            'games_per_gen': games_per_gen,
+            'train_epochs': train_epochs,
+            'batch_size': batch_size,
+            'lr': lr,
+            'weight_decay': weight_decay,
+            'num_simulations': num_simulations,
+            'window_size': window_size,
+            'max_moves': max_moves,
+            'resign_threshold': resign_threshold,
+            'use_swa': use_swa,
+            'syzygy_path': syzygy_path,
+            'opening_book_path': opening_book_path,
+            'opening_book_fraction': opening_book_fraction,
+            'adaptive': asdict(adaptive) if adaptive else None,
+            'parallel_games': parallel_games,
+            'use_trt': use_trt,
+        }
         torch.save({
             'generation': gen,
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'config': config,
             'network_schedule': network_schedule,
+            'run_params': run_params,
         }, checkpoint_path)
 
         # 5. Print per-generation stats
@@ -1235,15 +1333,15 @@ def main():
     loop_parser.add_argument('--syzygy', type=str, default=None, help='Path to Syzygy tablebase files')
     loop_parser.add_argument('--opening-book', type=str, default=None, help='Path to opening book FEN file (one FEN per line)')
     loop_parser.add_argument('--opening-book-fraction', type=float, default=0.5, help='Fraction of games seeded from book')
-    loop_parser.add_argument('--adaptive', action='store_true', default=False, help='Enable adaptive settings per generation')
-    loop_parser.add_argument('--no-adaptive', dest='adaptive', action='store_false')
+    loop_parser.add_argument('--adaptive', action='store_true', default=argparse.SUPPRESS, help='Enable adaptive settings per generation')
+    loop_parser.add_argument('--no-adaptive', dest='adaptive', action='store_false', default=argparse.SUPPRESS)
     loop_parser.add_argument('--early-sims', type=int, default=100, help='Simulations for early generations')
     loop_parser.add_argument('--early-max-moves', type=int, default=150, help='Max moves for early generations')
     loop_parser.add_argument('--early-games', type=int, default=200, help='Games per early generation')
     loop_parser.add_argument('--resume-from', type=str, default=None, help='Resume from a checkpoint file (e.g. selfplay_output/checkpoints/model_gen_5.pt)')
     loop_parser.add_argument('--parallel-games', type=int, default=128, help='Concurrent self-play games (C++ GameManager cross-game batching)')
-    loop_parser.add_argument('--use-trt', dest='use_trt', action='store_true', default=True, help='Export ONNX + build TensorRT engine per generation and run self-play through the TRT backend (default: on)')
-    loop_parser.add_argument('--no-use-trt', dest='use_trt', action='store_false', help='Disable TensorRT backend (use LibTorch only)')
+    loop_parser.add_argument('--use-trt', dest='use_trt', action='store_true', default=argparse.SUPPRESS, help='Export ONNX + build TensorRT engine per generation and run self-play through the TRT backend (default: on)')
+    loop_parser.add_argument('--no-use-trt', dest='use_trt', action='store_false', default=argparse.SUPPRESS, help='Disable TensorRT backend (use LibTorch only)')
     loop_parser.add_argument('--network-schedule', type=str, default=None,
                              help='Tiered net schedule, e.g. "1:6:64,20:10:128" (gen_start:blocks:filters, comma-separated)')
 
@@ -1285,8 +1383,14 @@ def main():
                     parser.error(f"--network-schedule tier '{tier}' must be gen_start:blocks:filters")
                 schedule.append((int(parts[0]), int(parts[1]), int(parts[2])))
 
+        # argparse.SUPPRESS means the flag only appears on the Namespace when
+        # the user passed it. Tracking explicitness lets us auto-restore from
+        # the checkpoint's run_params when the user didn't override.
+        adaptive_explicit = hasattr(args, 'adaptive')
+        use_trt_explicit = hasattr(args, 'use_trt')
+
         adaptive_config = None
-        if getattr(args, 'adaptive', False):
+        if adaptive_explicit and args.adaptive:
             adaptive_config = AdaptiveConfig(
                 enabled=True,
                 early_sims=getattr(args, 'early_sims', 100),
@@ -1296,6 +1400,13 @@ def main():
                 full_max_moves=args.max_moves,
                 full_games=args.games_per_gen,
             )
+
+        restore = []
+        if not adaptive_explicit:
+            restore.append('adaptive')
+        if not use_trt_explicit:
+            restore.append('use_trt')
+
         training_loop(
             generations=args.generations,
             games_per_gen=args.games_per_gen,
@@ -1317,6 +1428,7 @@ def main():
             parallel_games=getattr(args, 'parallel_games', 128),
             use_trt=getattr(args, 'use_trt', True),
             network_schedule=schedule,
+            restore_from_checkpoint=restore,
         )
 
 
