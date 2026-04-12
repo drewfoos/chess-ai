@@ -35,7 +35,8 @@ void GameManager::init_game(int idx, const neural::PositionHistory& history, int
     }
     auto& game = games_[idx];
     game.history = history;
-    game.root = std::make_unique<Node>();
+    game.root = pool_.allocate();
+    game.root->set_pool_managed(true);
     game.sims_done = 0;
     game.target_sims = num_sims;
     game.search_complete = false;
@@ -45,6 +46,7 @@ void GameManager::init_game(int idx, const neural::PositionHistory& history, int
 }
 
 void GameManager::init_games(int num_games, int num_sims) {
+    pool_.reset();
     games_.resize(num_games);
     for (int i = 0; i < num_games; i++) {
         Position start_pos;
@@ -53,7 +55,8 @@ void GameManager::init_games(int num_games, int num_sims) {
         history.reset(start_pos);
 
         games_[i].history = history;
-        games_[i].root = std::make_unique<Node>();
+        games_[i].root = pool_.allocate();
+        games_[i].root->set_pool_managed(true);
         games_[i].sims_done = 0;
         games_[i].target_sims = num_sims;
         games_[i].search_complete = false;
@@ -66,6 +69,7 @@ void GameManager::init_games(int num_games, int num_sims) {
 void GameManager::init_games_from_fen(const std::vector<std::string>& fens,
                                        const std::vector<std::vector<std::string>>& move_histories,
                                        int num_sims) {
+    pool_.reset();
     int num_games = static_cast<int>(fens.size());
     games_.resize(num_games);
 
@@ -86,7 +90,8 @@ void GameManager::init_games_from_fen(const std::vector<std::string>& fens,
         }
 
         games_[i].history = history;
-        games_[i].root = std::make_unique<Node>();
+        games_[i].root = pool_.allocate();
+        games_[i].root->set_pool_managed(true);
         games_[i].sims_done = 0;
         games_[i].target_sims = num_sims;
         games_[i].search_complete = false;
@@ -137,12 +142,9 @@ void GameManager::expand_root(GameState& game) {
         }
     }
 
-    // Expand root node
-    for (int i = 0; i < num_moves; i++) {
-        float prior = (i < static_cast<int>(br.policy.size())) ? br.policy[i] : 0.0f;
-        game.root->add_child(moves[i], prior);
-    }
-    game.root->sort_children_by_prior();
+    // Expand root node with edges
+    game.root->create_edges(moves, br.policy.data(), num_moves);
+    game.root->sort_edges_by_prior();
     game.root->update(br.value);
 
     // Cache root evaluation
@@ -155,7 +157,7 @@ void GameManager::expand_root(GameState& game) {
 
     // Add Dirichlet noise
     if (params_.add_noise) {
-        add_dirichlet_noise(game.root.get());
+        add_dirichlet_noise(game.root);
     }
 
     game.root_expanded = true;
@@ -195,8 +197,13 @@ void GameManager::propagate_terminal(Node* node) {
         bool any_draw = false;
         bool found_child_loss = false;
 
-        for (int i = 0; i < cur->num_children(); i++) {
-            int8_t cs = cur->child(i)->terminal_status();
+        for (int i = 0; i < cur->num_edges(); i++) {
+            Node* child = cur->child_node(i);
+            if (!child) {
+                all_resolved = false;
+                break;
+            }
+            int8_t cs = child->terminal_status();
             if (cs == 0) {
                 all_resolved = false;
                 break;
@@ -247,9 +254,9 @@ Node* GameManager::select_child_advanced(Node* node, bool is_root) {
     if (params_.sibling_blending) {
         float visited_sum = 0.0f;
         int visited_count = 0;
-        for (int i = 0; i < node->num_children(); i++) {
-            Node* child = node->child(i);
-            if (child->visit_count() > 0) {
+        for (int i = 0; i < node->num_edges(); i++) {
+            Node* child = node->child_node(i);
+            if (child && child->visit_count() > 0) {
                 visited_sum += child->mean_value();
                 visited_count++;
             }
@@ -260,31 +267,32 @@ Node* GameManager::select_child_advanced(Node* node, bool is_root) {
         }
     }
 
-    Node* best = nullptr;
+    int best_idx = -1;
     float best_score = -std::numeric_limits<float>::infinity();
 
-    for (int i = 0; i < node->num_children(); i++) {
-        Node* child = node->child(i);
+    for (int i = 0; i < node->num_edges(); i++) {
+        Node* child = node->child_node(i);
+        float edge_prior = node->edge(i).prior();
 
         // MCTS-solver
-        if (child->terminal_status() == 1) {
-            return child;
+        if (child && child->terminal_status() == 1) {
+            return node->ensure_child(i, &pool_);
         }
-        if (child->terminal_status() == -1) {
+        if (child && child->terminal_status() == -1) {
             continue;
         }
 
         float score;
-        if (child->visit_count() == 0) {
+        if (!child || child->visit_count() == 0) {
             float child_fpu = sibling_fpu;
 
             if (params_.sibling_blending) {
-                float child_prior = child->prior();
+                float child_prior = edge_prior;
                 float sim_sum = 0.0f;
                 int sim_count = 0;
-                for (int j = 0; j < node->num_children(); j++) {
-                    Node* sib = node->child(j);
-                    if (sib->visit_count() > 0 && std::abs(sib->prior() - child_prior) < 0.10f) {
+                for (int j = 0; j < node->num_edges(); j++) {
+                    Node* sib = node->child_node(j);
+                    if (sib && sib->visit_count() > 0 && std::abs(node->edge(j).prior() - child_prior) < 0.10f) {
                         sim_sum += sib->mean_value();
                         sim_count++;
                     }
@@ -294,10 +302,10 @@ Node* GameManager::select_child_advanced(Node* node, bool is_root) {
                 }
             }
 
-            score = child_fpu + c_puct * child->prior() * sqrt_parent / 1.0f;
+            score = child_fpu + c_puct * edge_prior * sqrt_parent / 1.0f;
         } else {
             float q = child->mean_value();
-            float u = c_puct * child->prior() * sqrt_parent / (1.0f + child->visit_count());
+            float u = c_puct * edge_prior * sqrt_parent / (1.0f + child->visit_count());
             score = q + u;
 
             if (params_.uncertainty_weight > 0.0f && child->visit_count() > 1) {
@@ -307,15 +315,15 @@ Node* GameManager::select_child_advanced(Node* node, bool is_root) {
 
         if (score > best_score) {
             best_score = score;
-            best = child;
+            best_idx = i;
         }
     }
 
-    if (best == nullptr) {
-        best = node->child(0);
+    if (best_idx < 0) {
+        best_idx = 0;
     }
 
-    return best;
+    return node->ensure_child(best_idx, &pool_);
 }
 
 bool GameManager::is_two_fold_repetition(uint64_t hash, const std::vector<uint64_t>& path_hashes,
@@ -343,16 +351,19 @@ void GameManager::expand_node(Node* node, const Position& pos, const EvalResult&
         return;
     }
 
+    // Build priors array
+    std::vector<float> priors(num_moves);
     for (int i = 0; i < num_moves; i++) {
-        float prior = (i < static_cast<int>(eval_result.policy.size())) ? eval_result.policy[i] : 0.0f;
-        node->add_child(moves[i], prior);
+        priors[i] = (i < static_cast<int>(eval_result.policy.size())) ? eval_result.policy[i] : 0.0f;
     }
-    node->sort_children_by_prior();
+
+    node->create_edges(moves, priors.data(), num_moves);
+    node->sort_edges_by_prior();
 }
 
 bool GameManager::gather_leaf_from_game(int game_idx, std::vector<PendingLeaf>& batch) {
     auto& game = games_[game_idx];
-    Node* node = game.root.get();
+    Node* node = game.root;
     std::vector<Move> path_moves;
     std::vector<uint64_t> path_hashes;
     std::vector<Node*> path_nodes;
@@ -439,13 +450,14 @@ bool GameManager::gather_leaf_from_game(int game_idx, std::vector<PendingLeaf>& 
 
 bool GameManager::should_prune(const GameState& game) const {
     if (!params_.smart_pruning) return false;
-    if (game.root->num_children() < 2) return false;
+    if (game.root->num_edges() < 2) return false;
     if (game.sims_done < params_.batch_size) return false;
 
     int remaining = game.target_sims - game.sims_done;
     int best_visits = 0, second_visits = 0;
-    for (int i = 0; i < game.root->num_children(); i++) {
-        int vc = game.root->child(i)->visit_count();
+    for (int i = 0; i < game.root->num_edges(); i++) {
+        Node* child = game.root->child_node(i);
+        int vc = child ? child->visit_count() : 0;
         if (vc > best_visits) {
             second_visits = best_visits;
             best_visits = vc;
@@ -464,59 +476,59 @@ void GameManager::add_dirichlet_noise(Node* root) {
         return;
     }
 
-    int num_children = root->num_children();
-    std::vector<float> noise(num_children);
+    int num_edges = root->num_edges();
+    std::vector<float> noise(num_edges);
 
     std::random_device rd;
     std::mt19937 gen(rd());
     std::gamma_distribution<float> gamma(params_.dirichlet_alpha, 1.0f);
 
     float noise_sum = 0.0f;
-    for (int i = 0; i < num_children; i++) {
+    for (int i = 0; i < num_edges; i++) {
         noise[i] = gamma(gen);
         noise_sum += noise[i];
     }
     if (noise_sum > 0.0f) {
-        for (int i = 0; i < num_children; i++) {
+        for (int i = 0; i < num_edges; i++) {
             noise[i] /= noise_sum;
         }
     }
 
     float eps = params_.dirichlet_epsilon;
-    for (int i = 0; i < num_children; i++) {
-        float old_prior = root->child(i)->prior();
+    for (int i = 0; i < num_edges; i++) {
+        float old_prior = root->edge(i).prior();
         float new_prior = (1.0f - eps) * old_prior + eps * noise[i];
-        root->child(i)->set_prior(new_prior);
+        root->edge(i).set_prior(new_prior);
     }
 }
 
 void GameManager::add_shaped_dirichlet_noise(Node* root) {
     if (root->is_leaf()) return;
 
-    int num_children = root->num_children();
+    int num_edges = root->num_edges();
 
-    std::vector<float> priors(num_children);
-    std::vector<float> log_priors(num_children);
+    std::vector<float> priors(num_edges);
+    std::vector<float> log_priors(num_edges);
     float max_log = -std::numeric_limits<float>::infinity();
 
-    for (int i = 0; i < num_children; i++) {
-        priors[i] = root->child(i)->prior();
+    for (int i = 0; i < num_edges; i++) {
+        priors[i] = root->edge(i).prior();
         log_priors[i] = std::log(priors[i] + 1e-8f);
         max_log = std::max(max_log, log_priors[i]);
     }
 
     float threshold = max_log - 2.0f;
 
-    std::vector<float> weights(num_children, 0.5f);
+    std::vector<float> weights(num_edges, 0.5f);
     float weight_sum = 0.0f;
-    for (int i = 0; i < num_children; i++) {
+    for (int i = 0; i < num_edges; i++) {
         if (log_priors[i] > threshold) {
             weights[i] += 0.5f * (log_priors[i] - threshold) / 2.0f;
         }
         weight_sum += weights[i];
     }
     if (weight_sum > 0.0f) {
-        for (int i = 0; i < num_children; i++) {
+        for (int i = 0; i < num_edges; i++) {
             weights[i] /= weight_sum;
         }
     }
@@ -524,25 +536,25 @@ void GameManager::add_shaped_dirichlet_noise(Node* root) {
     std::random_device rd;
     std::mt19937 gen(rd());
 
-    std::vector<float> noise(num_children);
+    std::vector<float> noise(num_edges);
     float noise_sum = 0.0f;
-    for (int i = 0; i < num_children; i++) {
-        float scaled_alpha = std::max(0.01f, params_.dirichlet_alpha * weights[i] * num_children);
+    for (int i = 0; i < num_edges; i++) {
+        float scaled_alpha = std::max(0.01f, params_.dirichlet_alpha * weights[i] * num_edges);
         std::gamma_distribution<float> gamma_dist(scaled_alpha, 1.0f);
         noise[i] = gamma_dist(gen);
         noise_sum += noise[i];
     }
     if (noise_sum > 0.0f) {
-        for (int i = 0; i < num_children; i++) {
+        for (int i = 0; i < num_edges; i++) {
             noise[i] /= noise_sum;
         }
     }
 
     float eps = params_.dirichlet_epsilon;
-    for (int i = 0; i < num_children; i++) {
-        float old_prior = root->child(i)->prior();
+    for (int i = 0; i < num_edges; i++) {
+        float old_prior = root->edge(i).prior();
         float new_prior = (1.0f - eps) * old_prior + eps * noise[i];
-        root->child(i)->set_prior(new_prior);
+        root->edge(i).set_prior(new_prior);
     }
 }
 
@@ -689,7 +701,7 @@ SearchResult GameManager::get_result(int idx) const {
 
 SearchResult GameManager::build_result(const GameState& game) const {
     SearchResult result;
-    Node* root = game.root.get();
+    Node* root = game.root;
     const Position& root_pos = game.history.current();
 
     result.best_move = root->is_leaf() ? Move::none() : root->best_move();
@@ -704,23 +716,24 @@ SearchResult GameManager::build_result(const GameState& game) const {
         result.root_value = std::max(-1.0f, std::min(1.0f, result.root_value + sign * shift));
     }
 
-    int num_children = root->num_children();
-    result.moves.resize(num_children);
-    result.visit_counts.resize(num_children);
+    int num_edges = root->num_edges();
+    result.moves.resize(num_edges);
+    result.visit_counts.resize(num_edges);
 
     int total_child_visits = 0;
     Color stm = root_pos.side_to_move();
 
-    for (int i = 0; i < num_children; i++) {
-        result.moves[i] = root->child(i)->move();
-        result.visit_counts[i] = root->child(i)->visit_count();
+    for (int i = 0; i < num_edges; i++) {
+        result.moves[i] = root->edge(i).move();
+        Node* child = root->child_node(i);
+        result.visit_counts[i] = child ? child->visit_count() : 0;
         total_child_visits += result.visit_counts[i];
     }
 
     // Build policy_target
     result.policy_target.fill(0.0f);
     if (total_child_visits > 0) {
-        for (int i = 0; i < num_children; i++) {
+        for (int i = 0; i < num_edges; i++) {
             if (result.visit_counts[i] > 0) {
                 int idx = neural::move_to_policy_index(result.moves[i], stm);
                 if (idx >= 0 && idx < neural::POLICY_SIZE) {

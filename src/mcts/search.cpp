@@ -97,8 +97,13 @@ void Search::propagate_terminal(Node* node) {
         bool any_draw = false;
         bool found_child_loss = false; // child loses = we win
 
-        for (int i = 0; i < cur->num_children(); i++) {
-            int8_t cs = cur->child(i)->terminal_status();
+        for (int i = 0; i < cur->num_edges(); i++) {
+            Node* child = cur->child_node(i);
+            if (!child) {
+                all_resolved = false;
+                break;
+            }
+            int8_t cs = child->terminal_status();
             if (cs == 0) {
                 all_resolved = false;
                 break;
@@ -151,9 +156,9 @@ Node* Search::select_child_advanced(Node* node, bool is_root) {
     if (params_.sibling_blending) {
         float visited_sum = 0.0f;
         int visited_count = 0;
-        for (int i = 0; i < node->num_children(); i++) {
-            Node* child = node->child(i);
-            if (child->visit_count() > 0) {
+        for (int i = 0; i < node->num_edges(); i++) {
+            Node* child = node->child_node(i);
+            if (child && child->visit_count() > 0) {
                 visited_sum += child->mean_value();
                 visited_count++;
             }
@@ -165,35 +170,36 @@ Node* Search::select_child_advanced(Node* node, bool is_root) {
         }
     }
 
-    Node* best = nullptr;
+    int best_idx = -1;
     float best_score = -std::numeric_limits<float>::infinity();
 
-    for (int i = 0; i < node->num_children(); i++) {
-        Node* child = node->child(i);
+    for (int i = 0; i < node->num_edges(); i++) {
+        Node* child = node->child_node(i);
+        float edge_prior = node->edge(i).prior();
 
         // MCTS-solver: child terminal_status == 1 means child loses (from child's perspective)
         // which means WE win by going here. Pick immediately.
-        if (child->terminal_status() == 1) {
-            return child;
+        if (child && child->terminal_status() == 1) {
+            return node->ensure_child(i, &pool_);
         }
         // Child wins (from child's perspective) = we lose. Skip.
-        if (child->terminal_status() == -1) {
+        if (child && child->terminal_status() == -1) {
             continue;
         }
 
         float score;
-        if (child->visit_count() == 0) {
+        if (!child || child->visit_count() == 0) {
             // Use sibling blending FPU for unvisited children
             float child_fpu = sibling_fpu;
 
             // Per-child sibling blending: use average of visited siblings with similar priors
             if (params_.sibling_blending) {
-                float child_prior = child->prior();
+                float child_prior = edge_prior;
                 float sim_sum = 0.0f;
                 int sim_count = 0;
-                for (int j = 0; j < node->num_children(); j++) {
-                    Node* sib = node->child(j);
-                    if (sib->visit_count() > 0 && std::abs(sib->prior() - child_prior) < 0.10f) {
+                for (int j = 0; j < node->num_edges(); j++) {
+                    Node* sib = node->child_node(j);
+                    if (sib && sib->visit_count() > 0 && std::abs(node->edge(j).prior() - child_prior) < 0.10f) {
                         sim_sum += sib->mean_value();
                         sim_count++;
                     }
@@ -203,11 +209,11 @@ Node* Search::select_child_advanced(Node* node, bool is_root) {
                 }
             }
 
-            score = child_fpu + c_puct * child->prior() * sqrt_parent / 1.0f;
+            score = child_fpu + c_puct * edge_prior * sqrt_parent / 1.0f;
         } else {
             // Q + U
             float q = child->mean_value();
-            float u = c_puct * child->prior() * sqrt_parent / (1.0f + child->visit_count());
+            float u = c_puct * edge_prior * sqrt_parent / (1.0f + child->visit_count());
             score = q + u;
 
             // Uncertainty boosting
@@ -218,16 +224,16 @@ Node* Search::select_child_advanced(Node* node, bool is_root) {
 
         if (score > best_score) {
             best_score = score;
-            best = child;
+            best_idx = i;
         }
     }
 
     // If all children are proven losses (terminal_status == -1), return first child
-    if (best == nullptr) {
-        best = node->child(0);
+    if (best_idx < 0) {
+        best_idx = 0;
     }
 
-    return best;
+    return node->ensure_child(best_idx, &pool_);
 }
 
 bool Search::is_two_fold_repetition(uint64_t hash, const std::vector<uint64_t>& path_hashes,
@@ -258,11 +264,14 @@ void Search::expand_node(Node* node, const Position& pos, const EvalResult& eval
         return;
     }
 
+    // Build priors array
+    std::vector<float> priors(num_moves);
     for (int i = 0; i < num_moves; i++) {
-        float prior = (i < static_cast<int>(eval_result.policy.size())) ? eval_result.policy[i] : 0.0f;
-        node->add_child(moves[i], prior);
+        priors[i] = (i < static_cast<int>(eval_result.policy.size())) ? eval_result.policy[i] : 0.0f;
     }
-    node->sort_children_by_prior();
+
+    node->create_edges(moves, priors.data(), num_moves);
+    node->sort_edges_by_prior();
 }
 
 // Helper: revert virtual loss on all nodes in the path
@@ -369,44 +378,44 @@ void Search::add_dirichlet_noise(Node* root) {
         return;
     }
 
-    int num_children = root->num_children();
-    std::vector<float> noise(num_children);
+    int num_edges = root->num_edges();
+    std::vector<float> noise(num_edges);
 
     std::random_device rd;
     std::mt19937 gen(rd());
     std::gamma_distribution<float> gamma(params_.dirichlet_alpha, 1.0f);
 
     float noise_sum = 0.0f;
-    for (int i = 0; i < num_children; i++) {
+    for (int i = 0; i < num_edges; i++) {
         noise[i] = gamma(gen);
         noise_sum += noise[i];
     }
     if (noise_sum > 0.0f) {
-        for (int i = 0; i < num_children; i++) {
+        for (int i = 0; i < num_edges; i++) {
             noise[i] /= noise_sum;
         }
     }
 
     float eps = params_.dirichlet_epsilon;
-    for (int i = 0; i < num_children; i++) {
-        float old_prior = root->child(i)->prior();
+    for (int i = 0; i < num_edges; i++) {
+        float old_prior = root->edge(i).prior();
         float new_prior = (1.0f - eps) * old_prior + eps * noise[i];
-        root->child(i)->set_prior(new_prior);
+        root->edge(i).set_prior(new_prior);
     }
 }
 
 void Search::add_shaped_dirichlet_noise(Node* root) {
     if (root->is_leaf()) return;
 
-    int num_children = root->num_children();
+    int num_edges = root->num_edges();
 
     // Collect priors and compute log-space thresholds
-    std::vector<float> priors(num_children);
-    std::vector<float> log_priors(num_children);
+    std::vector<float> priors(num_edges);
+    std::vector<float> log_priors(num_edges);
     float max_log = -std::numeric_limits<float>::infinity();
 
-    for (int i = 0; i < num_children; i++) {
-        priors[i] = root->child(i)->prior();
+    for (int i = 0; i < num_edges; i++) {
+        priors[i] = root->edge(i).prior();
         log_priors[i] = std::log(priors[i] + 1e-8f);
         max_log = std::max(max_log, log_priors[i]);
     }
@@ -414,16 +423,16 @@ void Search::add_shaped_dirichlet_noise(Node* root) {
     float threshold = max_log - 2.0f;
 
     // Compute per-move weights based on prior strength
-    std::vector<float> weights(num_children, 0.5f);
+    std::vector<float> weights(num_edges, 0.5f);
     float weight_sum = 0.0f;
-    for (int i = 0; i < num_children; i++) {
+    for (int i = 0; i < num_edges; i++) {
         if (log_priors[i] > threshold) {
             weights[i] += 0.5f * (log_priors[i] - threshold) / 2.0f;
         }
         weight_sum += weights[i];
     }
     if (weight_sum > 0.0f) {
-        for (int i = 0; i < num_children; i++) {
+        for (int i = 0; i < num_edges; i++) {
             weights[i] /= weight_sum;
         }
     }
@@ -432,25 +441,25 @@ void Search::add_shaped_dirichlet_noise(Node* root) {
     std::random_device rd;
     std::mt19937 gen(rd());
 
-    std::vector<float> noise(num_children);
+    std::vector<float> noise(num_edges);
     float noise_sum = 0.0f;
-    for (int i = 0; i < num_children; i++) {
-        float scaled_alpha = std::max(0.01f, params_.dirichlet_alpha * weights[i] * num_children);
+    for (int i = 0; i < num_edges; i++) {
+        float scaled_alpha = std::max(0.01f, params_.dirichlet_alpha * weights[i] * num_edges);
         std::gamma_distribution<float> gamma(scaled_alpha, 1.0f);
         noise[i] = gamma(gen);
         noise_sum += noise[i];
     }
     if (noise_sum > 0.0f) {
-        for (int i = 0; i < num_children; i++) {
+        for (int i = 0; i < num_edges; i++) {
             noise[i] /= noise_sum;
         }
     }
 
     float eps = params_.dirichlet_epsilon;
-    for (int i = 0; i < num_children; i++) {
-        float old_prior = root->child(i)->prior();
+    for (int i = 0; i < num_edges; i++) {
+        float old_prior = root->edge(i).prior();
         float new_prior = (1.0f - eps) * old_prior + eps * noise[i];
-        root->child(i)->set_prior(new_prior);
+        root->edge(i).set_prior(new_prior);
     }
 }
 
@@ -462,7 +471,10 @@ SearchResult Search::run(const Position& pos) {
 
 SearchResult Search::run(const neural::PositionHistory& history) {
     const Position& root_pos = history.current();
-    auto root = std::make_unique<Node>();
+
+    pool_.reset();
+    Node* root = pool_.allocate();
+    root->set_pool_managed(true);
 
     // Generate legal moves and evaluate root
     Move moves[MAX_MOVES];
@@ -496,11 +508,9 @@ SearchResult Search::run(const neural::PositionHistory& history) {
         }
     }
 
-    // Expand root
-    for (int i = 0; i < num_moves; i++) {
-        root->add_child(moves[i], root_eval.policy[i]);
-    }
-    root->sort_children_by_prior();
+    // Expand root with edges
+    root->create_edges(moves, root_eval.policy.data(), num_moves);
+    root->sort_edges_by_prior();
 
     // Initial root visit
     root->update(root_eval.value);
@@ -515,7 +525,7 @@ SearchResult Search::run(const neural::PositionHistory& history) {
 
     // Add Dirichlet noise at root for exploration
     if (params_.add_noise) {
-        add_dirichlet_noise(root.get());
+        add_dirichlet_noise(root);
     }
 
     // Main batched MCTS loop
@@ -528,12 +538,13 @@ SearchResult Search::run(const neural::PositionHistory& history) {
         }
 
         // Smart pruning check
-        if (params_.smart_pruning && root->num_children() >= 2 && sims_done > batch_size) {
+        if (params_.smart_pruning && root->num_edges() >= 2 && sims_done > batch_size) {
             int remaining = params_.num_iterations - sims_done;
             // Find best and second best visit counts
             int best_visits = 0, second_visits = 0;
-            for (int i = 0; i < root->num_children(); i++) {
-                int vc = root->child(i)->visit_count();
+            for (int i = 0; i < root->num_edges(); i++) {
+                Node* child = root->child_node(i);
+                int vc = child ? child->visit_count() : 0;
                 if (vc > best_visits) {
                     second_visits = best_visits;
                     best_visits = vc;
@@ -552,7 +563,7 @@ SearchResult Search::run(const neural::PositionHistory& history) {
 
         int gather_count = std::min(batch_size, params_.num_iterations - sims_done);
         for (int i = 0; i < gather_count; i++) {
-            gather_leaf(root.get(), history, batch);
+            gather_leaf(root, history, batch);
         }
 
         // Evaluate phase: build batch requests and evaluate all at once
@@ -603,7 +614,7 @@ SearchResult Search::run(const neural::PositionHistory& history) {
 
         sims_done += gather_count;
 
-        if (info_callback_ && root->num_children() > 0) {
+        if (info_callback_ && root->num_edges() > 0) {
             SearchInfo sinfo;
             sinfo.iterations = sims_done;
             sinfo.total_nodes = root->visit_count();
@@ -616,7 +627,7 @@ SearchResult Search::run(const neural::PositionHistory& history) {
         if (root->terminal_status() != 0) break;
     }
 
-    return build_result(root.get(), root_pos, raw_value, raw_policy);
+    return build_result(root, root_pos, raw_value, raw_policy);
 }
 
 SearchResult Search::build_result(Node* root, const Position& root_pos,
@@ -634,23 +645,24 @@ SearchResult Search::build_result(Node* root, const Position& root_pos,
         result.root_value = std::max(-1.0f, std::min(1.0f, result.root_value + sign * shift));
     }
 
-    int num_children = root->num_children();
-    result.moves.resize(num_children);
-    result.visit_counts.resize(num_children);
+    int num_edges = root->num_edges();
+    result.moves.resize(num_edges);
+    result.visit_counts.resize(num_edges);
 
     int total_child_visits = 0;
     Color stm = root_pos.side_to_move();
 
-    for (int i = 0; i < num_children; i++) {
-        result.moves[i] = root->child(i)->move();
-        result.visit_counts[i] = root->child(i)->visit_count();
+    for (int i = 0; i < num_edges; i++) {
+        result.moves[i] = root->edge(i).move();
+        Node* child = root->child_node(i);
+        result.visit_counts[i] = child ? child->visit_count() : 0;
         total_child_visits += result.visit_counts[i];
     }
 
     // Build policy_target: normalized visit distribution in 1858-dim space
     result.policy_target.fill(0.0f);
     if (total_child_visits > 0) {
-        for (int i = 0; i < num_children; i++) {
+        for (int i = 0; i < num_edges; i++) {
             if (result.visit_counts[i] > 0) {
                 int idx = neural::move_to_policy_index(result.moves[i], stm);
                 if (idx >= 0 && idx < neural::POLICY_SIZE) {

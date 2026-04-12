@@ -126,6 +126,7 @@ private:
     Evaluator& evaluator_;
     SearchParams params_;
     NNCache cache_;
+    NodePool pool_;
 
     // Batched search internals
     struct PendingEval {

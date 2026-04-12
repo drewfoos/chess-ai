@@ -6,19 +6,36 @@
 #include <cassert>
 #include <cstring>
 #include <algorithm>
+#include <deque>
+#include <numeric>
 
 namespace mcts {
+
+class NodePool;  // Forward declaration
+
+struct Edge {
+    uint16_t move_bits = 0;   // Raw Move data
+    uint16_t prior_bits = 0;  // FP16 prior
+
+    Move move() const { Move m; m.data = move_bits; return m; }
+    float prior() const;      // Defined after Node (uses half_to_float)
+    void set_prior(float p);  // Defined after Node (uses float_to_half)
+};
 
 class Node {
 public:
     Node();
-    Node(Move move, float prior);
+    ~Node();
 
     // Tree structure
-    bool is_leaf() const { return children_.empty(); }
-    int num_children() const { return static_cast<int>(children_.size()); }
-    Node* child(int i) { assert(i >= 0 && i < num_children()); return children_[i].get(); }
-    const Node* child(int i) const { assert(i >= 0 && i < num_children()); return children_[i].get(); }
+    bool is_leaf() const { return num_edges_ == 0; }
+    int num_children() const { return num_edges_; }
+    int num_edges() const { return num_edges_; }
+    Edge& edge(int i) { assert(i >= 0 && i < num_edges_); return edges_[i]; }
+    const Edge& edge(int i) const { assert(i >= 0 && i < num_edges_); return edges_[i]; }
+    Node* child_node(int i) const { assert(i >= 0 && i < num_edges_); return child_nodes_[i]; }
+    bool has_child_node(int i) const { assert(i >= 0 && i < num_edges_); return child_nodes_[i] != nullptr; }
+    Node* ensure_child(int i, NodePool* pool = nullptr);
     Node* parent() const { return parent_; }
 
     // Statistics
@@ -48,24 +65,23 @@ public:
     int8_t terminal_status() const { return terminal_status_; }
     void set_terminal_status(int8_t s) { terminal_status_ = s; }
 
+    // Edge/child management
+    void create_edges(const Move* moves, const float* priors, int count);
+    void sort_edges_by_prior();
+
     // Modification
-    void add_child(Move move, float prior);
     void update(float value);
 
     // Selection
     Node* select_child(float c_puct, float fpu_value) const;
     Move best_move() const;
 
-    // For Dirichlet noise
+    // For backward compat — sets the node's own prior
     void set_prior(float p) { prior_bits_ = float_to_half(p); }
 
-    // Sort children by prior descending (for cache locality)
-    void sort_children_by_prior() {
-        std::sort(children_.begin(), children_.end(),
-            [](const std::unique_ptr<Node>& a, const std::unique_ptr<Node>& b) {
-                return a->prior() > b->prior();
-            });
-    }
+    // Pool management
+    bool pool_managed() const { return pool_managed_; }
+    void set_pool_managed(bool v) { pool_managed_ = v; }
 
     // Float16 conversion helpers (public for testing)
     static uint16_t float_to_half(float value) {
@@ -96,6 +112,28 @@ public:
         float f; std::memcpy(&f, &bits, sizeof(f)); return f;
     }
 
+    // Reset node to initial state (for pool reuse)
+    void reset() {
+        move_ = Move::none();
+        prior_bits_ = 0;
+        visit_count_ = 0;
+        total_value_ = 0.0f;
+        sum_sq_value_ = 0.0f;
+        terminal_status_ = 0;
+        pending_evals_ = 0;
+        parent_ = nullptr;
+        if (edges_) {
+            delete[] edges_;
+            edges_ = nullptr;
+        }
+        if (child_nodes_) {
+            delete[] child_nodes_;
+            child_nodes_ = nullptr;
+        }
+        num_edges_ = 0;
+        pool_managed_ = false;
+    }
+
 private:
     Move move_;
     uint16_t prior_bits_ = 0;
@@ -108,7 +146,28 @@ private:
     int16_t pending_evals_ = 0;
 
     Node* parent_ = nullptr;
-    std::vector<std::unique_ptr<Node>> children_;
+
+    Edge* edges_ = nullptr;
+    Node** child_nodes_ = nullptr;
+    uint16_t num_edges_ = 0;
+    bool pool_managed_ = false;
+};
+
+// Edge inline methods that depend on Node
+inline float Edge::prior() const { return Node::half_to_float(prior_bits); }
+inline void Edge::set_prior(float p) { prior_bits = Node::float_to_half(p); }
+
+// Arena allocator for MCTS nodes
+class NodePool {
+public:
+    explicit NodePool(size_t initial_capacity = 65536);
+    Node* allocate();      // Returns zeroed Node
+    void reset();          // Reuse pool for next search
+    size_t used() const { return next_free_; }
+private:
+    std::deque<Node> nodes_;
+    size_t next_free_ = 0;
+    size_t capacity_ = 0;
 };
 
 } // namespace mcts

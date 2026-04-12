@@ -50,7 +50,7 @@ public:
 private:
     struct GameState {
         neural::PositionHistory history;
-        std::unique_ptr<Node> root;
+        Node* root = nullptr;  // Pool-managed
         int sims_done = 0;
         int target_sims = 400;
         bool search_complete = false;
@@ -70,6 +70,7 @@ private:
     neural::NeuralEvaluator& evaluator_;
     SearchParams params_;
     NNCache cache_;
+    NodePool pool_;
     std::vector<GameState> games_;
 
     // Pre-allocated buffers (reused across step() calls)

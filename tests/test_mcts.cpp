@@ -31,29 +31,36 @@ TEST_F(MCTSTest, NodeDefaultConstruction) {
 }
 
 TEST_F(MCTSTest, NodeConstructionWithPrior) {
+    // Nodes no longer take move/prior in constructor; test edge-based prior instead
+    mcts::Node node;
     Move m(E2, E4, FLAG_DOUBLE_PUSH);
-    mcts::Node node(m, 0.35f);
+    node.set_prior(0.35f);
     EXPECT_EQ(node.visit_count(), 0);
     EXPECT_NEAR(node.prior(), 0.35f, 0.002f);
-    EXPECT_EQ(node.move(), m);
     EXPECT_TRUE(node.is_leaf());
 }
 
 TEST_F(MCTSTest, AddChildren) {
     mcts::Node root;
-    root.add_child(Move(E2, E4, FLAG_DOUBLE_PUSH), 0.4f);
-    root.add_child(Move(D2, D4, FLAG_DOUBLE_PUSH), 0.3f);
-    root.add_child(Move(G1, F3, FLAG_QUIET), 0.2f);
+    Move moves[] = {Move(E2, E4, FLAG_DOUBLE_PUSH), Move(D2, D4, FLAG_DOUBLE_PUSH), Move(G1, F3, FLAG_QUIET)};
+    float priors[] = {0.4f, 0.3f, 0.2f};
+    root.create_edges(moves, priors, 3);
 
     EXPECT_FALSE(root.is_leaf());
     EXPECT_EQ(root.num_children(), 3);
-    EXPECT_EQ(root.child(0)->move(), Move(E2, E4, FLAG_DOUBLE_PUSH));
-    EXPECT_NEAR(root.child(0)->prior(), 0.4f, 0.002f);
-    EXPECT_EQ(root.child(0)->parent(), &root);
+    EXPECT_EQ(root.edge(0).move(), Move(E2, E4, FLAG_DOUBLE_PUSH));
+    EXPECT_NEAR(root.edge(0).prior(), 0.4f, 0.002f);
+
+    // ensure_child creates the child node lazily
+    mcts::Node* child0 = root.ensure_child(0);
+    EXPECT_EQ(child0->parent(), &root);
+    EXPECT_EQ(child0->move(), Move(E2, E4, FLAG_DOUBLE_PUSH));
+    EXPECT_NEAR(child0->prior(), 0.4f, 0.002f);
 }
 
 TEST_F(MCTSTest, UpdateVisitAndValue) {
-    mcts::Node node(Move(E2, E4, FLAG_DOUBLE_PUSH), 0.5f);
+    mcts::Node node;
+    node.set_prior(0.5f);
     node.update(0.6f);
     EXPECT_EQ(node.visit_count(), 1);
     EXPECT_FLOAT_EQ(node.total_value(), 0.6f);
@@ -69,12 +76,22 @@ TEST_F(MCTSTest, PUCTSelectsHighPriorUnvisited) {
     // With no visits, PUCT should prefer the child with highest prior
     mcts::Node root;
     root.update(0.0f); // root needs a visit for sqrt(N_parent) > 0
-    root.add_child(Move(E2, E4, FLAG_DOUBLE_PUSH), 0.1f);
-    root.add_child(Move(D2, D4, FLAG_DOUBLE_PUSH), 0.6f);
-    root.add_child(Move(G1, F3, FLAG_QUIET), 0.3f);
+    Move moves[] = {Move(E2, E4, FLAG_DOUBLE_PUSH), Move(D2, D4, FLAG_DOUBLE_PUSH), Move(G1, F3, FLAG_QUIET)};
+    float priors[] = {0.1f, 0.6f, 0.3f};
+    root.create_edges(moves, priors, 3);
 
+    // select_child now returns nullptr for unvisited edges (no Node allocated yet)
+    // Instead, verify via edge priors that D4 has highest prior
+    // The select_child method works on edges and returns child_node which may be null
     float c_puct = 2.5f;
-    float fpu = 0.0f; // FPU value for unvisited nodes
+    float fpu = 0.0f;
+    // We can test that best_move returns the edge move with most visits (all 0, so first)
+    // But let's test select_child which should pick edge index 1 (D4, prior 0.6)
+    // Since no children are allocated, select_child returns nullptr for the best edge
+    // Let's ensure children first to test the old behavior
+    root.ensure_child(0);
+    root.ensure_child(1);
+    root.ensure_child(2);
     mcts::Node* selected = root.select_child(c_puct, fpu);
     EXPECT_EQ(selected->move(), Move(D2, D4, FLAG_DOUBLE_PUSH));
 }
@@ -84,11 +101,16 @@ TEST_F(MCTSTest, PUCTBalancesExplorationExploitation) {
     root.update(0.0f);
     root.update(0.0f); // 2 root visits
 
-    root.add_child(Move(E2, E4, FLAG_DOUBLE_PUSH), 0.5f);
-    root.add_child(Move(D2, D4, FLAG_DOUBLE_PUSH), 0.5f);
+    Move moves[] = {Move(E2, E4, FLAG_DOUBLE_PUSH), Move(D2, D4, FLAG_DOUBLE_PUSH)};
+    float priors[] = {0.5f, 0.5f};
+    root.create_edges(moves, priors, 2);
+
+    // Ensure both children exist
+    mcts::Node* e4 = root.ensure_child(0);
+    root.ensure_child(1);
 
     // Give E4 a high Q from one visit
-    root.child(0)->update(0.8f);
+    e4->update(0.8f);
     // D4 is unvisited — FPU = 0, but exploration bonus is higher (denominator = 1 vs 2)
 
     float c_puct = 2.5f;
@@ -104,14 +126,18 @@ TEST_F(MCTSTest, PUCTBalancesExplorationExploitation) {
 
 TEST_F(MCTSTest, BestMoveReturnsMostVisited) {
     mcts::Node root;
-    root.add_child(Move(E2, E4, FLAG_DOUBLE_PUSH), 0.3f);
-    root.add_child(Move(D2, D4, FLAG_DOUBLE_PUSH), 0.5f);
-    root.add_child(Move(G1, F3, FLAG_QUIET), 0.2f);
+    Move moves[] = {Move(E2, E4, FLAG_DOUBLE_PUSH), Move(D2, D4, FLAG_DOUBLE_PUSH), Move(G1, F3, FLAG_QUIET)};
+    float priors[] = {0.3f, 0.5f, 0.2f};
+    root.create_edges(moves, priors, 3);
+
+    mcts::Node* e4 = root.ensure_child(0);
+    mcts::Node* d4 = root.ensure_child(1);
+    mcts::Node* nf3 = root.ensure_child(2);
 
     // E4: 10 visits, D4: 50 visits, Nf3: 5 visits
-    for (int i = 0; i < 10; i++) root.child(0)->update(0.5f);
-    for (int i = 0; i < 50; i++) root.child(1)->update(0.4f);
-    for (int i = 0; i < 5; i++) root.child(2)->update(0.6f);
+    for (int i = 0; i < 10; i++) e4->update(0.5f);
+    for (int i = 0; i < 50; i++) d4->update(0.4f);
+    for (int i = 0; i < 5; i++) nf3->update(0.6f);
 
     EXPECT_EQ(root.best_move(), Move(D2, D4, FLAG_DOUBLE_PUSH));
 }
@@ -393,15 +419,16 @@ TEST_F(MCTSTest, Float16RoundTrip) {
 
 TEST_F(MCTSTest, NodePriorFloat16) {
     // Prior stored as float16 should still be usable
-    Move m(E2, E4, FLAG_DOUBLE_PUSH);
-    mcts::Node node(m, 0.35f);
+    mcts::Node node;
+    node.set_prior(0.35f);
     EXPECT_NEAR(node.prior(), 0.35f, 0.002f);
     node.set_prior(0.75f);
     EXPECT_NEAR(node.prior(), 0.75f, 0.002f);
 }
 
 TEST_F(MCTSTest, VirtualLossApplyRevert) {
-    mcts::Node node(Move(E2, E4, FLAG_DOUBLE_PUSH), 0.5f);
+    mcts::Node node;
+    node.set_prior(0.5f);
     node.update(0.6f);
     EXPECT_EQ(node.visit_count(), 1);
     EXPECT_EQ(node.pending_evals(), 0);
@@ -416,7 +443,7 @@ TEST_F(MCTSTest, VirtualLossApplyRevert) {
 }
 
 TEST_F(MCTSTest, ValueVariance) {
-    mcts::Node node(Move(E2, E4, FLAG_DOUBLE_PUSH), 0.5f);
+    mcts::Node node;
     // < 2 visits -> 0 variance
     EXPECT_FLOAT_EQ(node.value_variance(), 0.0f);
     node.update(0.6f);
@@ -474,15 +501,16 @@ TEST_F(MCTSTest, TerminalStatus) {
     EXPECT_EQ(node.terminal_status(), 2);
 }
 
-TEST_F(MCTSTest, SortChildrenByPrior) {
+TEST_F(MCTSTest, SortEdgesByPrior) {
     mcts::Node root;
-    root.add_child(Move(E2, E4, FLAG_DOUBLE_PUSH), 0.2f);
-    root.add_child(Move(D2, D4, FLAG_DOUBLE_PUSH), 0.5f);
-    root.add_child(Move(G1, F3, FLAG_QUIET), 0.3f);
-    root.sort_children_by_prior();
-    EXPECT_NEAR(root.child(0)->prior(), 0.5f, 0.002f);
-    EXPECT_NEAR(root.child(1)->prior(), 0.3f, 0.002f);
-    EXPECT_NEAR(root.child(2)->prior(), 0.2f, 0.002f);
+    Move moves[] = {Move(E2, E4, FLAG_DOUBLE_PUSH), Move(D2, D4, FLAG_DOUBLE_PUSH), Move(G1, F3, FLAG_QUIET)};
+    float priors[] = {0.2f, 0.5f, 0.3f};
+    root.create_edges(moves, priors, 3);
+    root.sort_edges_by_prior();
+    EXPECT_NEAR(root.edge(0).prior(), 0.5f, 0.002f);
+    EXPECT_NEAR(root.edge(1).prior(), 0.3f, 0.002f);
+    EXPECT_NEAR(root.edge(2).prior(), 0.2f, 0.002f);
+    EXPECT_EQ(root.edge(0).move(), Move(D2, D4, FLAG_DOUBLE_PUSH));
 }
 
 TEST_F(MCTSTest, NNCacheStoreAndRetrieve) {

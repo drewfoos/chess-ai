@@ -8,6 +8,20 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 
 ## [Unreleased]
 
+### Changed — Node Arena Allocator + Edge/Node Separation
+- Replaced `std::vector<std::unique_ptr<Node>> children_` with parallel `Edge[]` + `Node*[]` arrays
+- Added `Edge` struct: stores move_bits (uint16_t) and prior_bits (FP16) for 4 bytes per edge
+- Added `NodePool` class: arena allocator using `std::deque<Node>` for pointer-stable contiguous allocation
+- `create_edges()` bulk-initializes edges from moves/priors arrays (replaces per-child `add_child()`)
+- `ensure_child(i, pool)` lazily allocates child Nodes on first visit (deferred allocation)
+- `sort_edges_by_prior()` sorts both edges and child_nodes arrays in parallel
+- `select_child_advanced()` now works with edge priors directly, avoids allocating unvisited nodes
+- Search::run() uses pool-allocated root; pool_.reset() between searches
+- GameManager uses shared NodePool for cross-game node allocation
+- All Dirichlet noise functions operate on edges instead of child Node priors
+- `propagate_terminal()` handles nullptr children (unvisited edges) correctly
+- Updated all 137 C++ tests to use new edge/node API
+
 ### Added — Play Against Engine
 - `/play` route serving interactive play page (`visualization/static/play.html`)
 - `/api/play/move` endpoint: sends position to UCI engine, returns bestmove + score + stats
