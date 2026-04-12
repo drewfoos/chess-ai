@@ -19,11 +19,29 @@ struct EvalResult {
     float value;                // Position evaluation from side-to-move perspective: [-1, +1]
 };
 
+// Request for batch evaluation
+struct BatchEvalRequest {
+    Position position;
+    Move legal_moves[MAX_MOVES];
+    int num_legal_moves;
+};
+
 // Abstract evaluator interface — neural network plugs in here later
 class Evaluator {
 public:
     virtual ~Evaluator() = default;
     virtual EvalResult evaluate(const Position& pos, const Move* moves, int num_moves) = 0;
+
+    // Batch evaluation — default falls back to individual calls.
+    // NeuralEvaluator overrides with single GPU forward pass.
+    virtual std::vector<EvalResult> evaluate_batch(const std::vector<BatchEvalRequest>& requests) {
+        std::vector<EvalResult> results;
+        results.reserve(requests.size());
+        for (const auto& req : requests) {
+            results.push_back(evaluate(req.position, req.legal_moves, req.num_legal_moves));
+        }
+        return results;
+    }
 };
 
 // Stub evaluator for testing MCTS without a neural network

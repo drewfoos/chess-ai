@@ -42,12 +42,13 @@ mcts::EvalResult NeuralEvaluator::evaluate(const Position& pos, const Move* move
     // Encode position
     encode_position(pos, encode_buffer_.data());
 
-    // Create input tensor (clone because from_blob doesn't own the memory)
+    // Create input tensor and transfer to device
+    // encode_buffer_ is a class member that outlives this call, so from_blob is safe
     auto input = torch::from_blob(
         encode_buffer_.data(),
         {1, INPUT_PLANES, BOARD_SIZE, BOARD_SIZE},
         torch::kFloat32
-    ).clone().to(device_);
+    ).to(device_);
 
     // Run inference
     torch::NoGradGuard no_grad;
@@ -89,7 +90,73 @@ mcts::EvalResult NeuralEvaluator::evaluate(const Position& pos, const Move* move
     return result;
 }
 
-std::vector<BatchResult> NeuralEvaluator::evaluate_batch(
+std::vector<mcts::EvalResult> NeuralEvaluator::evaluate_batch(
+    const std::vector<mcts::BatchEvalRequest>& requests) {
+
+    int batch_size = static_cast<int>(requests.size());
+    if (batch_size == 0) return {};
+    if (batch_size == 1) {
+        return {evaluate(requests[0].position, requests[0].legal_moves, requests[0].num_legal_moves)};
+    }
+
+    // Encode all positions into one contiguous buffer
+    batch_buffer_.resize(batch_size * TENSOR_SIZE);
+    for (int b = 0; b < batch_size; b++) {
+        encode_position(requests[b].position, batch_buffer_.data() + b * TENSOR_SIZE);
+    }
+
+    // Single GPU forward pass
+    auto input = torch::from_blob(
+        batch_buffer_.data(),
+        {batch_size, INPUT_PLANES, BOARD_SIZE, BOARD_SIZE},
+        torch::kFloat32
+    ).to(device_);
+
+    torch::NoGradGuard no_grad;
+    auto output = model_.forward({input}).toTuple();
+    auto policy_logits = output->elements()[0].toTensor().to(torch::kCPU);
+    auto wdl_probs = output->elements()[1].toTensor().to(torch::kCPU);
+
+    auto policy_acc = policy_logits.accessor<float, 2>();
+    auto wdl_acc = wdl_probs.accessor<float, 2>();
+
+    std::vector<mcts::EvalResult> results(batch_size);
+    for (int b = 0; b < batch_size; b++) {
+        results[b].value = wdl_acc[b][0] - wdl_acc[b][2];
+
+        int num_moves = requests[b].num_legal_moves;
+        if (num_moves == 0) {
+            if (requests[b].position.in_check()) results[b].value = -1.0f;
+            else results[b].value = 0.0f;
+            continue;
+        }
+
+        Color stm = requests[b].position.side_to_move();
+        std::vector<float> logits(num_moves);
+        for (int i = 0; i < num_moves; i++) {
+            int idx = move_to_policy_index(requests[b].legal_moves[i], stm);
+            logits[i] = (idx >= 0) ? policy_acc[b][idx] : -1000.0f;
+        }
+
+        if (policy_softmax_temp_ != 1.0f) {
+            for (int i = 0; i < num_moves; i++) logits[i] /= policy_softmax_temp_;
+        }
+
+        float max_logit = *std::max_element(logits.begin(), logits.end());
+        float sum = 0.0f;
+        results[b].policy.resize(num_moves);
+        for (int i = 0; i < num_moves; i++) {
+            results[b].policy[i] = std::exp(logits[i] - max_logit);
+            sum += results[b].policy[i];
+        }
+        if (sum > 0.0f) {
+            for (int i = 0; i < num_moves; i++) results[b].policy[i] /= sum;
+        }
+    }
+    return results;
+}
+
+std::vector<BatchResult> NeuralEvaluator::evaluate_batch_raw(
     const std::vector<BatchRequest>& requests) {
 
     int batch_size = static_cast<int>(requests.size());
@@ -107,12 +174,13 @@ std::vector<BatchResult> NeuralEvaluator::evaluate_batch(
         );
     }
 
-    // Create batch input tensor
+    // Create batch input tensor and transfer to device
+    // batch_buffer_ is a class member that outlives this call, so from_blob is safe
     auto input = torch::from_blob(
         batch_buffer_.data(),
         {batch_size, INPUT_PLANES, BOARD_SIZE, BOARD_SIZE},
         torch::kFloat32
-    ).clone().to(device_);
+    ).to(device_);
 
     // Run inference
     torch::NoGradGuard no_grad;

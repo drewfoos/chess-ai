@@ -364,7 +364,7 @@ TEST_F(NeuralTest, BatchEval_StructsCompile) {
 TEST_F(NeuralTest, BatchEval_EmptyBatch) {
     neural::NeuralEvaluator eval(TEST_MODEL, "cpu");
     std::vector<neural::BatchRequest> empty;
-    auto results = eval.evaluate_batch(empty);
+    auto results = eval.evaluate_batch_raw(empty);
     EXPECT_TRUE(results.empty());
 }
 
@@ -385,7 +385,7 @@ TEST_F(NeuralTest, BatchEval_SinglePosition) {
     req.legal_moves = moves;
     req.num_legal_moves = n;
 
-    auto results = eval.evaluate_batch({req});
+    auto results = eval.evaluate_batch_raw({req});
     ASSERT_EQ(results.size(), 1u);
     EXPECT_EQ(results[0].policy.size(), 20u);
     EXPECT_GE(results[0].value, -1.0f);
@@ -424,7 +424,7 @@ TEST_F(NeuralTest, BatchEval_MultiplePositions) {
     requests[0] = {enc1, moves1, n1};
     requests[1] = {enc2, moves2, n2};
 
-    auto results = eval.evaluate_batch(requests);
+    auto results = eval.evaluate_batch_raw(requests);
     ASSERT_EQ(results.size(), 2u);
 
     // Both should have valid policies
@@ -453,7 +453,7 @@ TEST_F(NeuralTest, BatchEval_MatchesSingleEval) {
     float encoded[neural::TENSOR_SIZE];
     neural::encode_position(pos, encoded);
     neural::BatchRequest req = {encoded, moves, n};
-    auto batch = eval.evaluate_batch({req});
+    auto batch = eval.evaluate_batch_raw({req});
 
     ASSERT_EQ(batch.size(), 1u);
     EXPECT_NEAR(batch[0].value, single.value, 1e-5f);

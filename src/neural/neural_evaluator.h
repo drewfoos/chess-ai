@@ -30,9 +30,12 @@ public:
                              float policy_softmax_temp = 2.2f);
     mcts::EvalResult evaluate(const Position& pos, const Move* moves, int num_moves) override;
 
-    // Batch evaluation: runs multiple positions through the network in a single forward pass.
+    // Batch evaluation via Evaluator interface — single GPU forward pass
+    std::vector<mcts::EvalResult> evaluate_batch(const std::vector<mcts::BatchEvalRequest>& requests) override;
+
+    // Batch evaluation with full policy output (for training data)
     // Callers must pre-encode positions into encoded_planes buffers.
-    std::vector<BatchResult> evaluate_batch(const std::vector<BatchRequest>& requests);
+    std::vector<BatchResult> evaluate_batch_raw(const std::vector<BatchRequest>& requests);
 
 private:
     torch::jit::script::Module model_;

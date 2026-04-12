@@ -561,17 +561,30 @@ SearchResult Search::run(const neural::PositionHistory& history) {
             gather_leaf(root.get(), history, batch);
         }
 
-        // Evaluate phase: evaluate each pending leaf through the Evaluator interface
-        for (auto& pe : batch) {
-            Move leaf_moves[MAX_MOVES];
-            int leaf_num_moves = generate_legal_moves(pe.position, leaf_moves);
+        // Evaluate phase: build batch requests and evaluate all at once
+        // Generate legal moves for each pending leaf
+        std::vector<int> leaf_num_moves(batch.size());
+        std::vector<BatchEvalRequest> eval_requests;
+        eval_requests.reserve(batch.size());
 
-            EvalResult eval_result = evaluator_.evaluate(pe.position, leaf_moves, leaf_num_moves);
+        for (size_t i = 0; i < batch.size(); i++) {
+            BatchEvalRequest req;
+            req.position = batch[i].position;
+            req.num_legal_moves = generate_legal_moves(batch[i].position, req.legal_moves);
+            leaf_num_moves[i] = req.num_legal_moves;
+            eval_requests.push_back(std::move(req));
+        }
 
-            // Expand the leaf node
+        // Single batched evaluation (one GPU forward pass for NeuralEvaluator)
+        auto eval_results = evaluator_.evaluate_batch(eval_requests);
+
+        // Scatter results: expand nodes, backpropagate
+        for (size_t i = 0; i < batch.size(); i++) {
+            auto& pe = batch[i];
+            auto& eval_result = eval_results[i];
+
             expand_node(pe.leaf, pe.position, eval_result);
 
-            // Check if terminal after expansion
             if (pe.leaf->is_leaf()) {
                 float value = 0.0f;
                 if (pe.leaf->terminal_status() == 1) value = 1.0f;
@@ -580,19 +593,16 @@ SearchResult Search::run(const neural::PositionHistory& history) {
                 backpropagate(pe.leaf, -value);
                 propagate_terminal(pe.leaf);
             } else {
-                // Revert all virtual losses and backprop
                 revert_virtual_loss_path(pe.path_nodes);
                 backpropagate(pe.leaf, -eval_result.value);
 
-                // Cache the evaluation
                 uint64_t pos_hash = neural::PositionHistory::compute_hash(pe.position);
                 CacheEntry entry;
                 entry.policy = eval_result.policy;
                 entry.value = eval_result.value;
-                entry.num_moves = leaf_num_moves;
+                entry.num_moves = leaf_num_moves[i];
                 cache_.put(pos_hash, std::move(entry));
 
-                // Propagate terminal status
                 propagate_terminal(pe.leaf);
             }
         }

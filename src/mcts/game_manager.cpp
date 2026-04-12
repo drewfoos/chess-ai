@@ -117,7 +117,7 @@ void GameManager::expand_root(GameState& game) {
     req.legal_moves = moves;
     req.num_legal_moves = num_moves;
 
-    auto results = evaluator_.evaluate_batch({req});
+    auto results = evaluator_.evaluate_batch_raw({req});
     const auto& br = results[0];
 
     game.raw_value = br.value;
@@ -625,7 +625,7 @@ int GameManager::step() {
         }
 
         // Run batch inference
-        auto results = evaluator_.evaluate_batch(requests);
+        auto results = evaluator_.evaluate_batch_raw(requests);
 
         // Scatter results back
         for (int b = 0; b < batch_size; b++) {

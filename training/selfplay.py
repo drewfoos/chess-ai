@@ -412,16 +412,21 @@ def generate_games(
     If C++ MCTS bindings are available and model_path is provided, uses the
     faster C++ search engine. Otherwise falls back to Python MCTS.
     """
-    if HAS_CPP_MCTS and model_path is not None:
-        mcts = CppMCTS(model_path, mcts_config, device)
-        print(f"  Using C++ MCTS engine ({device})")
+    use_cpp = HAS_CPP_MCTS and model_path is not None
+
+    if use_cpp:
+        # Use larger batch size for C++ MCTS to reduce GPU call overhead
+        cpp_config = MCTSConfig(
+            num_simulations=mcts_config.num_simulations,
+            batch_size=max(mcts_config.batch_size, 64),
+        )
+        print(f"  Using C++ MCTS engine ({device}, batch_size={cpp_config.batch_size})")
     else:
         if not HAS_CPP_MCTS:
             print("  Warning: C++ MCTS not available, using slower Python MCTS. "
                   "Build with -DBUILD_PYTHON=ON -DENABLE_NEURAL=ON for 50-100x speedup.")
         model = model.to(device)
         model.eval()
-        mcts = MCTS(model, mcts_config, device=device)
 
     all_planes = []
     all_policies = []
@@ -432,34 +437,84 @@ def generate_games(
 
     start = time.time()
 
-    for game_num in range(num_games):
-        game_start = time.time()
-        record = play_game(mcts, selfplay_config)
-        game_time = time.time() - game_start
+    if use_cpp:
+        # Parallel game generation: run multiple games concurrently using threads.
+        # Each thread gets its own CppMCTS instance; the GPU handles concurrent
+        # inference calls efficiently via CUDA stream scheduling.
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        import threading
 
-        if metrics_logger is not None:
-            from training.metrics import GameMetrics
-            metrics_logger.record_game(GameMetrics(
-                game_num=game_num + 1,
-                num_moves=record.num_moves,
-                result=record.result,
-                duration_s=game_time,
-                moves_uci=record.moves_uci,
-            ))
+        num_workers = min(4, num_games)  # 4 concurrent games
+        completed = 0
+        lock = threading.Lock()
 
-        all_planes.extend(record.planes)
-        all_policies.extend(record.policies)
-        all_values.extend(record.values)
-        all_moves_left.extend(record.moves_left)
-        all_surprise.extend(record.surprise)
-        all_use_policy.extend(record.use_policy)
+        def _play_one(game_idx):
+            engine = CppMCTS(model_path, cpp_config, device)
+            game_start = time.time()
+            record = play_game(engine, selfplay_config)
+            game_time = time.time() - game_start
+            return game_idx, record, game_time
 
-        total_positions = len(all_planes)
-        print(
-            f"  Game {game_num + 1}/{num_games}: "
-            f"{record.num_moves} moves, {record.result}, "
-            f"{game_time:.1f}s ({total_positions} positions total)"
-        )
+        with ThreadPoolExecutor(max_workers=num_workers) as pool:
+            futures = {pool.submit(_play_one, i): i for i in range(num_games)}
+            for future in as_completed(futures):
+                game_idx, record, game_time = future.result()
+                completed += 1
+
+                if metrics_logger is not None:
+                    from training.metrics import GameMetrics
+                    metrics_logger.record_game(GameMetrics(
+                        game_num=completed,
+                        num_moves=record.num_moves,
+                        result=record.result,
+                        duration_s=game_time,
+                        moves_uci=record.moves_uci,
+                    ))
+
+                with lock:
+                    all_planes.extend(record.planes)
+                    all_policies.extend(record.policies)
+                    all_values.extend(record.values)
+                    all_moves_left.extend(record.moves_left)
+                    all_surprise.extend(record.surprise)
+                    all_use_policy.extend(record.use_policy)
+
+                    total_positions = len(all_planes)
+                    print(
+                        f"  Game {completed}/{num_games}: "
+                        f"{record.num_moves} moves, {record.result}, "
+                        f"{game_time:.1f}s ({total_positions} positions total)"
+                    )
+    else:
+        mcts = MCTS(model, mcts_config, device=device)
+        for game_num in range(num_games):
+            game_start = time.time()
+            record = play_game(mcts, selfplay_config)
+            game_time = time.time() - game_start
+
+            if metrics_logger is not None:
+                from training.metrics import GameMetrics
+                metrics_logger.record_game(GameMetrics(
+                    game_num=game_num + 1,
+                    num_moves=record.num_moves,
+                    result=record.result,
+                    duration_s=game_time,
+                    moves_uci=record.moves_uci,
+                ))
+
+            all_planes.extend(record.planes)
+            all_policies.extend(record.policies)
+            all_values.extend(record.values)
+            all_moves_left.extend(record.moves_left)
+            all_surprise.extend(record.surprise)
+            all_use_policy.extend(record.use_policy)
+
+            total_positions = len(all_planes)
+            print(
+                f"  Game {game_num + 1}/{num_games}: "
+                f"{record.num_moves} moves, {record.result}, "
+                f"{game_time:.1f}s ({total_positions} positions total)"
+            )
 
     elapsed = time.time() - start
     total_positions = len(all_planes)
