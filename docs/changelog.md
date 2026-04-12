@@ -8,6 +8,11 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 
 ## [Unreleased]
 
+### Added — C++ Neural Inference
+- Batch neural evaluation: `NeuralEvaluator::evaluate_batch()` runs multiple positions through the network in a single GPU forward pass
+- `BatchRequest` / `BatchResult` structs for pre-encoded batch inference with full 1858-dim raw policy output
+- 5 new tests for batch evaluation (struct creation, empty batch, single position, multiple positions, consistency with single eval)
+
 ### Added — Performance
 - Batched MCTS inference: gather-batch-scatter loop collects N leaf positions per iteration for a single GPU forward pass (configurable `batch_size`, default 16)
 - Virtual loss: unscored virtual visits prevent traversal collisions within a batch (Lc0-style)

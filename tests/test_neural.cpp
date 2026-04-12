@@ -343,4 +343,125 @@ TEST_F(NeuralTest, Integration_MCTSWithNeural) {
     EXPECT_LE(result.root_value, 1.0f);
 }
 
+TEST_F(NeuralTest, BatchEval_StructsCompile) {
+    // Verify BatchRequest and BatchResult can be created and used
+    float buffer[neural::TENSOR_SIZE] = {0};
+    Move moves[] = {Move(E2, E4, FLAG_DOUBLE_PUSH)};
+    neural::BatchRequest req;
+    req.encoded_planes = buffer;
+    req.legal_moves = moves;
+    req.num_legal_moves = 1;
+    EXPECT_EQ(req.num_legal_moves, 1);
+
+    neural::BatchResult res;
+    res.value = 0.5f;
+    res.policy = {1.0f};
+    res.full_policy.resize(neural::POLICY_SIZE, 0.0f);
+    EXPECT_FLOAT_EQ(res.value, 0.5f);
+    EXPECT_EQ(res.full_policy.size(), static_cast<size_t>(neural::POLICY_SIZE));
+}
+
+TEST_F(NeuralTest, BatchEval_EmptyBatch) {
+    neural::NeuralEvaluator eval(TEST_MODEL, "cpu");
+    std::vector<neural::BatchRequest> empty;
+    auto results = eval.evaluate_batch(empty);
+    EXPECT_TRUE(results.empty());
+}
+
+TEST_F(NeuralTest, BatchEval_SinglePosition) {
+    neural::NeuralEvaluator eval(TEST_MODEL, "cpu");
+    Position pos;
+    pos.set_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+    Move moves[MAX_MOVES];
+    int n = generate_legal_moves(pos, moves);
+    ASSERT_EQ(n, 20);
+
+    // Encode position
+    float encoded[neural::TENSOR_SIZE];
+    neural::encode_position(pos, encoded);
+
+    neural::BatchRequest req;
+    req.encoded_planes = encoded;
+    req.legal_moves = moves;
+    req.num_legal_moves = n;
+
+    auto results = eval.evaluate_batch({req});
+    ASSERT_EQ(results.size(), 1u);
+    EXPECT_EQ(results[0].policy.size(), 20u);
+    EXPECT_GE(results[0].value, -1.0f);
+    EXPECT_LE(results[0].value, 1.0f);
+    EXPECT_EQ(results[0].full_policy.size(), static_cast<size_t>(neural::POLICY_SIZE));
+
+    // Policy should sum to ~1
+    float sum = 0;
+    for (float p : results[0].policy) {
+        EXPECT_GT(p, 0.0f);
+        sum += p;
+    }
+    EXPECT_NEAR(sum, 1.0f, 1e-5f);
+}
+
+TEST_F(NeuralTest, BatchEval_MultiplePositions) {
+    neural::NeuralEvaluator eval(TEST_MODEL, "cpu");
+
+    // Position 1: starting position
+    Position pos1;
+    pos1.set_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+    Move moves1[MAX_MOVES];
+    int n1 = generate_legal_moves(pos1, moves1);
+    float enc1[neural::TENSOR_SIZE];
+    neural::encode_position(pos1, enc1);
+
+    // Position 2: after 1.e4 Nc6
+    Position pos2;
+    pos2.set_fen("r1bqkbnr/pppppppp/2n5/8/4P3/8/PPPP1PPP/RNBQKBNR w KQkq - 1 2");
+    Move moves2[MAX_MOVES];
+    int n2 = generate_legal_moves(pos2, moves2);
+    float enc2[neural::TENSOR_SIZE];
+    neural::encode_position(pos2, enc2);
+
+    std::vector<neural::BatchRequest> requests(2);
+    requests[0] = {enc1, moves1, n1};
+    requests[1] = {enc2, moves2, n2};
+
+    auto results = eval.evaluate_batch(requests);
+    ASSERT_EQ(results.size(), 2u);
+
+    // Both should have valid policies
+    EXPECT_EQ(results[0].policy.size(), static_cast<size_t>(n1));
+    EXPECT_EQ(results[1].policy.size(), static_cast<size_t>(n2));
+
+    // Both should have full policy vectors
+    EXPECT_EQ(results[0].full_policy.size(), static_cast<size_t>(neural::POLICY_SIZE));
+    EXPECT_EQ(results[1].full_policy.size(), static_cast<size_t>(neural::POLICY_SIZE));
+
+    // Values should differ for different positions
+    EXPECT_NE(results[0].value, results[1].value);
+}
+
+TEST_F(NeuralTest, BatchEval_MatchesSingleEval) {
+    neural::NeuralEvaluator eval(TEST_MODEL, "cpu");
+    Position pos;
+    pos.set_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+    Move moves[MAX_MOVES];
+    int n = generate_legal_moves(pos, moves);
+
+    // Single evaluation
+    auto single = eval.evaluate(pos, moves, n);
+
+    // Batch evaluation with same position
+    float encoded[neural::TENSOR_SIZE];
+    neural::encode_position(pos, encoded);
+    neural::BatchRequest req = {encoded, moves, n};
+    auto batch = eval.evaluate_batch({req});
+
+    ASSERT_EQ(batch.size(), 1u);
+    EXPECT_NEAR(batch[0].value, single.value, 1e-5f);
+    ASSERT_EQ(batch[0].policy.size(), single.policy.size());
+    for (size_t i = 0; i < single.policy.size(); i++) {
+        EXPECT_NEAR(batch[0].policy[i], single.policy[i], 1e-5f)
+            << "Policy mismatch at index " << i;
+    }
+}
+
 #endif // HAS_LIBTORCH
