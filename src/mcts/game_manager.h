@@ -72,6 +72,11 @@ private:
     NNCache cache_;
     std::vector<GameState> games_;
 
+    // Pre-allocated buffers (reused across step() calls)
+    std::vector<float> flat_encode_buffer_;
+    std::vector<std::vector<Move>> legal_moves_vec_;
+    std::vector<int> num_legal_moves_vec_;
+
     // Gather a leaf from one game (returns true if a leaf was queued for eval)
     bool gather_leaf_from_game(int game_idx, std::vector<PendingLeaf>& batch);
 

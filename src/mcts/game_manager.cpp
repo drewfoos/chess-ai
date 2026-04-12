@@ -22,7 +22,12 @@ static void revert_virtual_loss_path(const std::vector<Node*>& path_nodes) {
 }
 
 GameManager::GameManager(neural::NeuralEvaluator& evaluator, const SearchParams& params)
-    : evaluator_(evaluator), params_(params), cache_(params.nn_cache_size) {}
+    : evaluator_(evaluator), params_(params), cache_(params.nn_cache_size) {
+    int max_batch = std::max(1, params.batch_size);
+    flat_encode_buffer_.resize(max_batch * neural::TENSOR_SIZE);
+    legal_moves_vec_.resize(max_batch);
+    num_legal_moves_vec_.resize(max_batch);
+}
 
 void GameManager::init_game(int idx, const neural::PositionHistory& history, int num_sims) {
     if (idx < 0 || idx >= static_cast<int>(games_.size())) {
@@ -603,26 +608,22 @@ int GameManager::step() {
     if (!batch.empty()) {
         int batch_size = static_cast<int>(batch.size());
 
-        // Encode all positions
-        std::vector<std::vector<float>> encode_buffers(batch_size, std::vector<float>(neural::TENSOR_SIZE));
-        std::vector<std::vector<Move>> legal_moves_vec(batch_size);
-        std::vector<int> num_legal_moves(batch_size);
-
+        // Encode all positions — use pre-allocated buffers (no per-step allocation)
         for (int b = 0; b < batch_size; b++) {
-            neural::encode_position(batch[b].position, encode_buffers[b].data());
-
+            neural::encode_position(batch[b].position,
+                flat_encode_buffer_.data() + b * neural::TENSOR_SIZE);
             Move moves[MAX_MOVES];
             int nm = generate_legal_moves(batch[b].position, moves);
-            legal_moves_vec[b].assign(moves, moves + nm);
-            num_legal_moves[b] = nm;
+            legal_moves_vec_[b].assign(moves, moves + nm);
+            num_legal_moves_vec_[b] = nm;
         }
 
         // Build batch requests
         std::vector<neural::BatchRequest> requests(batch_size);
         for (int b = 0; b < batch_size; b++) {
-            requests[b].encoded_planes = encode_buffers[b].data();
-            requests[b].legal_moves = legal_moves_vec[b].data();
-            requests[b].num_legal_moves = num_legal_moves[b];
+            requests[b].encoded_planes = flat_encode_buffer_.data() + b * neural::TENSOR_SIZE;
+            requests[b].legal_moves = legal_moves_vec_[b].data();
+            requests[b].num_legal_moves = num_legal_moves_vec_[b];
         }
 
         // Run batch inference
@@ -656,7 +657,7 @@ int GameManager::step() {
                 CacheEntry entry;
                 entry.policy = eval_result.policy;
                 entry.value = eval_result.value;
-                entry.num_moves = num_legal_moves[b];
+                entry.num_moves = num_legal_moves_vec_[b];
                 cache_.put(pos_hash, std::move(entry));
 
                 propagate_terminal(pl.leaf);
