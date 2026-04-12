@@ -1,0 +1,335 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Chess AI Training Dashboard</title>
+    <link rel="stylesheet"
+          href="https://unpkg.com/@chrisoakman/chessboardjs@1.0.0/dist/chessboard-1.0.0.min.css">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/chess.js/0.10.3/chess.min.js"></script>
+    <script src="https://unpkg.com/@chrisoakman/chessboardjs@1.0.0/dist/chessboard-1.0.0.min.js"></script>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #1a1a2e; color: #e0e0e0; padding: 20px;
+        }
+        h1 { text-align: center; margin-bottom: 20px; color: #00d4ff; }
+        .grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+        .card {
+            background: #16213e; border-radius: 12px; padding: 20px;
+            border: 1px solid #0f3460;
+        }
+        .card h2 { margin-bottom: 12px; color: #00d4ff; font-size: 1.1em; }
+        .stats-row {
+            display: flex; gap: 20px; flex-wrap: wrap;
+            grid-column: 1 / -1;
+        }
+        .stat-box {
+            background: #16213e; border-radius: 12px; padding: 16px 24px;
+            border: 1px solid #0f3460; flex: 1; min-width: 150px;
+            text-align: center;
+        }
+        .stat-box .label { font-size: 0.85em; color: #888; }
+        .stat-box .value { font-size: 1.8em; font-weight: bold; color: #00d4ff; }
+        .chart-container { position: relative; height: 300px; }
+        #board-container { display: flex; flex-direction: column; align-items: center; }
+        #board { width: 360px; }
+        .replay-controls {
+            margin-top: 12px; display: flex; gap: 8px; align-items: center;
+        }
+        .replay-controls button {
+            background: #0f3460; color: #e0e0e0; border: 1px solid #00d4ff;
+            border-radius: 6px; padding: 6px 14px; cursor: pointer; font-size: 0.9em;
+        }
+        .replay-controls button:hover { background: #00d4ff; color: #1a1a2e; }
+        .replay-controls select {
+            background: #0f3460; color: #e0e0e0; border: 1px solid #00d4ff;
+            border-radius: 6px; padding: 6px 10px; font-size: 0.9em;
+        }
+        .game-info { margin-top: 8px; font-size: 0.9em; color: #888; }
+        .status { text-align: center; grid-column: 1 / -1; font-size: 0.85em; color: #666; }
+    </style>
+</head>
+<body>
+    <h1>Chess AI Training Dashboard</h1>
+
+    <div class="grid">
+        <div class="stats-row">
+            <div class="stat-box">
+                <div class="label">Generations</div>
+                <div class="value" id="stat-generations">-</div>
+            </div>
+            <div class="stat-box">
+                <div class="label">Total Games</div>
+                <div class="value" id="stat-games">-</div>
+            </div>
+            <div class="stat-box">
+                <div class="label">Total Positions</div>
+                <div class="value" id="stat-positions">-</div>
+            </div>
+            <div class="stat-box">
+                <div class="label">Latest Loss</div>
+                <div class="value" id="stat-loss">-</div>
+            </div>
+            <div class="stat-box">
+                <div class="label">Speed</div>
+                <div class="value" id="stat-speed">-</div>
+                <div class="label">pos/min</div>
+            </div>
+        </div>
+
+        <div class="card">
+            <h2>Training Loss</h2>
+            <div class="chart-container">
+                <canvas id="lossChart"></canvas>
+            </div>
+        </div>
+
+        <div class="card">
+            <h2>Game Replay</h2>
+            <div id="board-container">
+                <div id="board"></div>
+                <div class="replay-controls">
+                    <select id="gen-select"><option>No data</option></select>
+                    <select id="game-select"><option>No data</option></select>
+                    <button id="btn-start">|&lt;</button>
+                    <button id="btn-prev">&lt;</button>
+                    <button id="btn-play">Play</button>
+                    <button id="btn-next">&gt;</button>
+                    <button id="btn-end">&gt;|</button>
+                </div>
+                <div class="game-info" id="game-info">No games loaded</div>
+            </div>
+        </div>
+
+        <div class="card" style="grid-column: 1 / -1;">
+            <h2>Game Results by Generation</h2>
+            <div class="chart-container">
+                <canvas id="resultsChart"></canvas>
+            </div>
+        </div>
+
+        <div class="status" id="status">Connecting...</div>
+    </div>
+
+<script>
+// --- Chart setup ---
+const lossCtx = document.getElementById('lossChart').getContext('2d');
+const lossChart = new Chart(lossCtx, {
+    type: 'line',
+    data: {
+        labels: [],
+        datasets: [
+            { label: 'Total Loss', data: [], borderColor: '#00d4ff', tension: 0.3, fill: false },
+            { label: 'Policy Loss', data: [], borderColor: '#ff6384', tension: 0.3, fill: false },
+            { label: 'Value Loss', data: [], borderColor: '#4bc0c0', tension: 0.3, fill: false },
+        ]
+    },
+    options: {
+        responsive: true, maintainAspectRatio: false,
+        scales: {
+            x: { title: { display: true, text: 'Generation', color: '#888' }, ticks: { color: '#888' }, grid: { color: '#333' } },
+            y: { title: { display: true, text: 'Loss', color: '#888' }, ticks: { color: '#888' }, grid: { color: '#333' } }
+        },
+        plugins: { legend: { labels: { color: '#e0e0e0' } } }
+    }
+});
+
+const resultsCtx = document.getElementById('resultsChart').getContext('2d');
+const resultsChart = new Chart(resultsCtx, {
+    type: 'bar',
+    data: {
+        labels: [],
+        datasets: [
+            { label: 'White wins', data: [], backgroundColor: '#4bc0c0' },
+            { label: 'Draws', data: [], backgroundColor: '#888' },
+            { label: 'Black wins', data: [], backgroundColor: '#ff6384' },
+        ]
+    },
+    options: {
+        responsive: true, maintainAspectRatio: false,
+        scales: {
+            x: { stacked: true, title: { display: true, text: 'Generation', color: '#888' }, ticks: { color: '#888' }, grid: { color: '#333' } },
+            y: { stacked: true, title: { display: true, text: 'Games', color: '#888' }, ticks: { color: '#888' }, grid: { color: '#333' } }
+        },
+        plugins: { legend: { labels: { color: '#e0e0e0' } } }
+    }
+});
+
+// --- Board setup ---
+let board = Chessboard('board', {
+    position: 'start',
+    pieceTheme: 'https://unpkg.com/@chrisoakman/chessboardjs@1.0.0/dist/img/chesspieces/wikipedia/{piece}.png'
+});
+let currentMoves = [];
+let currentMoveIdx = 0;
+let playInterval = null;
+let chess = new Chess();
+
+// --- Replay controls ---
+document.getElementById('btn-start').addEventListener('click', () => { goToMove(0); });
+document.getElementById('btn-prev').addEventListener('click', () => { goToMove(currentMoveIdx - 1); });
+document.getElementById('btn-next').addEventListener('click', () => { goToMove(currentMoveIdx + 1); });
+document.getElementById('btn-end').addEventListener('click', () => { goToMove(currentMoves.length); });
+document.getElementById('btn-play').addEventListener('click', togglePlay);
+
+function goToMove(idx) {
+    idx = Math.max(0, Math.min(idx, currentMoves.length));
+    currentMoveIdx = idx;
+    chess.reset();
+    for (let i = 0; i < idx; i++) {
+        chess.move(currentMoves[i], { sloppy: true });
+    }
+    board.position(chess.fen());
+    document.getElementById('game-info').textContent =
+        'Move ' + idx + '/' + currentMoves.length +
+        (idx > 0 ? ' \u2014 Last: ' + currentMoves[idx-1] : '');
+}
+
+function togglePlay() {
+    const btn = document.getElementById('btn-play');
+    if (playInterval) {
+        clearInterval(playInterval);
+        playInterval = null;
+        btn.textContent = 'Play';
+    } else {
+        btn.textContent = 'Pause';
+        playInterval = setInterval(() => {
+            if (currentMoveIdx >= currentMoves.length) {
+                clearInterval(playInterval);
+                playInterval = null;
+                btn.textContent = 'Play';
+                return;
+            }
+            goToMove(currentMoveIdx + 1);
+        }, 500);
+    }
+}
+
+// --- Game selection ---
+document.getElementById('gen-select').addEventListener('change', loadGeneration);
+document.getElementById('game-select').addEventListener('change', loadGame);
+
+let generationsData = {};
+
+async function loadGeneration() {
+    const gen = parseInt(document.getElementById('gen-select').value);
+    if (isNaN(gen)) return;
+
+    if (!generationsData[gen]) {
+        const resp = await fetch('/api/generation/' + gen);
+        if (!resp.ok) return;
+        generationsData[gen] = await resp.json();
+    }
+
+    const data = generationsData[gen];
+    const gameSelect = document.getElementById('game-select');
+    gameSelect.innerHTML = '';
+    data.games.forEach((g, i) => {
+        const opt = document.createElement('option');
+        opt.value = i;
+        opt.textContent = 'Game ' + g.game_num + ': ' + g.result + ' (' + g.num_moves + ' moves)';
+        gameSelect.appendChild(opt);
+    });
+    if (data.games.length > 0) loadGame();
+}
+
+function loadGame() {
+    const gen = parseInt(document.getElementById('gen-select').value);
+    const gameIdx = parseInt(document.getElementById('game-select').value);
+    if (isNaN(gen) || isNaN(gameIdx)) return;
+
+    const data = generationsData[gen];
+    if (!data || !data.games[gameIdx]) return;
+
+    const game = data.games[gameIdx];
+    currentMoves = game.moves_uci || [];
+    currentMoveIdx = 0;
+    chess.reset();
+    board.position('start');
+    document.getElementById('game-info').textContent =
+        game.result + ' \u2014 ' + game.num_moves + ' moves \u2014 ' + game.duration_s.toFixed(1) + 's';
+
+    if (playInterval) {
+        clearInterval(playInterval);
+        playInterval = null;
+        document.getElementById('btn-play').textContent = 'Play';
+    }
+}
+
+// --- Polling ---
+async function fetchSummary() {
+    try {
+        const resp = await fetch('/api/summary');
+        if (!resp.ok) throw new Error('Failed to fetch');
+        const data = await resp.json();
+        updateDashboard(data);
+        document.getElementById('status').textContent =
+            'Last updated: ' + new Date().toLocaleTimeString() + ' \u2014 Polling every 10s';
+    } catch (e) {
+        document.getElementById('status').textContent = 'Error: ' + e.message;
+    }
+}
+
+function updateDashboard(data) {
+    // Stats
+    document.getElementById('stat-generations').textContent = data.total_generations || 0;
+    document.getElementById('stat-games').textContent = data.total_games || 0;
+    document.getElementById('stat-positions').textContent =
+        (data.total_positions || 0).toLocaleString();
+
+    const gens = data.generations || [];
+    if (gens.length > 0) {
+        const latest = gens[gens.length - 1];
+        document.getElementById('stat-loss').textContent =
+            latest.training.total_loss.toFixed(3);
+
+        if (data.total_time_s > 0) {
+            const posPerMin = (data.total_positions / data.total_time_s * 60).toFixed(0);
+            document.getElementById('stat-speed').textContent = posPerMin;
+        }
+    }
+
+    // Loss chart
+    lossChart.data.labels = gens.map(g => g.generation);
+    lossChart.data.datasets[0].data = gens.map(g => g.training.total_loss);
+    lossChart.data.datasets[1].data = gens.map(g => g.training.policy_loss);
+    lossChart.data.datasets[2].data = gens.map(g => g.training.value_loss);
+    lossChart.update();
+
+    // Results chart
+    resultsChart.data.labels = gens.map(g => 'Gen ' + g.generation);
+    resultsChart.data.datasets[0].data = gens.map(g => (g.results || {})['1-0'] || 0);
+    resultsChart.data.datasets[1].data = gens.map(g => (g.results || {})['1/2-1/2'] || 0);
+    resultsChart.data.datasets[2].data = gens.map(g => (g.results || {})['0-1'] || 0);
+    resultsChart.update();
+
+    // Generation selector
+    const genSelect = document.getElementById('gen-select');
+    if (gens.length > 0 && genSelect.options.length !== gens.length) {
+        genSelect.innerHTML = '';
+        gens.forEach(g => {
+            const opt = document.createElement('option');
+            opt.value = g.generation;
+            opt.textContent = 'Generation ' + g.generation;
+            genSelect.appendChild(opt);
+        });
+        genSelect.value = gens[gens.length - 1].generation;
+        loadGeneration();
+    }
+}
+
+// Initial fetch + poll
+fetchSummary();
+setInterval(fetchSummary, 10000);
+</script>
+</body>
+</html>
