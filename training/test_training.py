@@ -900,3 +900,51 @@ def test_metrics_multiple_generations():
         assert len(summary['generations']) == 3
         losses = [g['training']['total_loss'] for g in summary['generations']]
         assert losses == [2.5, 2.0, 1.5]
+
+
+def test_game_record_has_moves_uci():
+    """GameRecord should include UCI move strings after play_game."""
+    from training.selfplay import play_game, SelfPlayConfig
+    from training.mcts import MCTS, MCTSConfig
+    from training.model import ChessNetwork
+    from training.config import NetworkConfig
+
+    config = NetworkConfig(num_blocks=1, num_filters=16)
+    model = ChessNetwork(config)
+    model.eval()
+    mcts = MCTS(model, MCTSConfig(num_simulations=2))
+    sp_config = SelfPlayConfig(max_moves=10)
+
+    record = play_game(mcts, sp_config)
+    assert hasattr(record, 'moves_uci')
+    assert isinstance(record.moves_uci, list)
+    assert len(record.moves_uci) == record.num_moves
+    for m in record.moves_uci:
+        assert isinstance(m, str)
+        assert len(m) >= 4
+
+
+def test_training_loop_writes_metrics():
+    """training_loop with metrics_dir should produce summary.json."""
+    import tempfile
+    from training.selfplay import training_loop
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        training_loop(
+            generations=1,
+            games_per_gen=2,
+            train_epochs=1,
+            batch_size=32,
+            num_simulations=2,
+            blocks=1,
+            filters=16,
+            output_dir=tmpdir,
+            max_moves=10,
+        )
+        metrics_dir = os.path.join(tmpdir, 'metrics')
+        assert os.path.isdir(metrics_dir)
+        summary_path = os.path.join(tmpdir, 'metrics', 'summary.json')
+        assert os.path.exists(summary_path)
+        with open(summary_path) as f:
+            summary = json.load(f)
+        assert summary['total_generations'] == 1
