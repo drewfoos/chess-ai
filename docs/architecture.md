@@ -233,10 +233,21 @@ Browser polls /api/summary every 10s → Chart.js + chessboard.js
 - Game results by generation (stacked bar chart)
 - Generation and game selectors for replay
 
+**Play Against Engine (`/play`):**
+- Interactive chessboard with drag-and-drop moves (chessboard.js + chess.js)
+- UCI engine subprocess managed by Flask (thread-safe, lazy-initialized)
+- Vertical evaluation bar with sigmoid-mapped score display
+- SAN move history with clickable position navigation
+- Engine info panel (score, nodes, NPS)
+- Controls: new game, flip board, undo, configurable think time, play as White/Black
+- Game state detection: check, checkmate, stalemate, draw variants
+
 **API endpoints:**
 - `GET /api/summary` — rolling summary of all generations
 - `GET /api/generation/<N>` — detailed data for generation N (including game moves)
 - `GET /api/status` — server health check
+- `POST /api/play/move` — send position to engine, get best move + evaluation
+- `POST /api/play/new` — reset engine for a new game
 
 **Implementation status:** Complete. Lightweight stack: Flask + CDN-hosted Chart.js/chessboard.js. No React, no npm, no WebSocket — just JSON files + polling.
 
@@ -325,9 +336,11 @@ chess-ai/
 │   ├── export.py
 │   ├── generate_data.py
 │   └── test_training.py
-├── visualization/              Dashboard (Plan 6)
-│   ├── server/
-│   └── client/
+├── visualization/              Dashboard + Play (Plan 6)
+│   ├── server.py               Flask REST API + engine subprocess
+│   └── static/
+│       ├── index.html          Training dashboard
+│       └── play.html           Play against engine page
 ├── tests/                      Google Test suite
 ├── data/                       Training data (.gz files)
 ├── checkpoints/                Network weights

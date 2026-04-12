@@ -8,6 +8,25 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 
 ## [Unreleased]
 
+### Added — Play Against Engine
+- `/play` route serving interactive play page (`visualization/static/play.html`)
+- `/api/play/move` endpoint: sends position to UCI engine, returns bestmove + score + stats
+- `/api/play/new` endpoint: resets engine for a new game
+- UCI engine subprocess management with threading lock in Flask server
+- Drag-and-drop chessboard (chessboard.js) with legal move validation (chess.js)
+- Vertical evaluation bar with sigmoid-mapped score display and smooth animation
+- SAN move history table with clickable navigation to past positions
+- Engine info panel: score (pawns/mate), nodes, NPS
+- Thinking indicator with animated dots while engine computes
+- Controls: New Game, Flip Board, Undo, think time selector (0.5s--10s), play as White/Black
+- Game state detection: check, checkmate, stalemate, draw (threefold, insufficient, 50-move)
+- Last-move highlighting on both source and target squares
+- Auto-promotion to queen on pawn promotion
+- If playing as Black, engine automatically moves first
+- Responsive layout: side-by-side on desktop, stacked on mobile
+- Dark theme matching existing dashboard (bg: #0f0f1a, accent: #6c63ff)
+- "Back to Dashboard" navigation link in header
+
 ### Added — UCI Protocol Handler
 - `UCIHandler` class (`src/uci/uci.h`, `src/uci/uci.cpp`): full UCI command parser and response handler
 - Supports commands: uci, isready, ucinewgame, position (startpos/fen + moves), go (wtime/btime/winc/binc/movestogo/depth/nodes/movetime/infinite), stop, setoption, quit
