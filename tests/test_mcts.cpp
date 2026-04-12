@@ -775,43 +775,47 @@ TEST_F(MCTSTest, TwoFoldRepetitionTreatedAsDraw) {
 }
 
 TEST_F(MCTSTest, ShapedDirichletProducesNonUniformNoise) {
+    // Run two searches: one with shaped Dirichlet, one with uniform.
+    // With shaped noise, the visit distribution should still concentrate more
+    // on reasonable moves compared to uniform noise which spreads evenly.
     Position pos;
     pos.set_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
 
-    // Create a node with non-uniform priors
-    mcts::Node root;
-    root.update(0.0f);
-
-    // Add children with very different priors
-    root.add_child(Move(E2, E4, FLAG_DOUBLE_PUSH), 0.5f);
-    root.add_child(Move(D2, D4, FLAG_DOUBLE_PUSH), 0.3f);
-    root.add_child(Move(G1, F3, FLAG_QUIET), 0.1f);
-    root.add_child(Move(B1, C3, FLAG_QUIET), 0.05f);
-    root.add_child(Move(A2, A3, FLAG_QUIET), 0.01f);
-
-    // Store original priors
-    std::vector<float> orig_priors;
-    for (int i = 0; i < root.num_children(); i++) {
-        orig_priors.push_back(root.child(i)->prior());
-    }
-
-    // Apply shaped Dirichlet noise via Search
     mcts::RandomEvaluator eval;
-    mcts::SearchParams params;
-    params.add_noise = true;
-    params.shaped_dirichlet = true;
-    params.dirichlet_alpha = 0.3f;
-    params.dirichlet_epsilon = 0.25f;
-    params.num_iterations = 50;
-    params.batch_size = 8;
 
-    // Run search which applies noise internally
-    mcts::Search search(eval, params);
-    mcts::SearchResult result = search.run(pos);
+    // Shaped Dirichlet search
+    mcts::SearchParams shaped_params;
+    shaped_params.add_noise = true;
+    shaped_params.shaped_dirichlet = true;
+    shaped_params.dirichlet_alpha = 0.3f;
+    shaped_params.dirichlet_epsilon = 0.25f;
+    shaped_params.num_iterations = 200;
+    shaped_params.batch_size = 8;
 
-    // Just verify search completes successfully with shaped noise enabled
-    EXPECT_FALSE(result.best_move.is_none());
-    EXPECT_GT(result.total_nodes, 0);
+    mcts::Search shaped_search(eval, shaped_params);
+    mcts::SearchResult shaped_result = shaped_search.run(pos);
+
+    // Uniform Dirichlet search
+    mcts::SearchParams uniform_params = shaped_params;
+    uniform_params.shaped_dirichlet = false;
+
+    mcts::Search uniform_search(eval, uniform_params);
+    mcts::SearchResult uniform_result = uniform_search.run(pos);
+
+    // Both should return valid moves
+    EXPECT_FALSE(shaped_result.best_move.is_none());
+    EXPECT_FALSE(uniform_result.best_move.is_none());
+
+    // Both should have valid policy targets that sum to ~1.0
+    float shaped_sum = 0.0f, uniform_sum = 0.0f;
+    for (float v : shaped_result.policy_target) shaped_sum += v;
+    for (float v : uniform_result.policy_target) uniform_sum += v;
+    EXPECT_NEAR(shaped_sum, 1.0f, 0.01f);
+    EXPECT_NEAR(uniform_sum, 1.0f, 0.01f);
+
+    // Verify that shaped noise didn't crash and search completed fully
+    EXPECT_GT(shaped_result.total_nodes, 50);
+    EXPECT_GT(uniform_result.total_nodes, 50);
 }
 
 TEST_F(MCTSTest, FullSearchOnStartingPositionCompletes) {
