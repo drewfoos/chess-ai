@@ -2153,27 +2153,28 @@ class TestAdaptiveConfig:
             sims, moves, games = get_gen_settings(gen, cfg)
             assert sims == cfg.early_sims == 100
             assert moves == cfg.early_max_moves == 150
-            assert games == cfg.early_games == 200
+            assert games == cfg.early_games == 300
 
     def test_mid_gen_returns_interpolated_settings(self):
         from training.selfplay import AdaptiveConfig, get_gen_settings
 
         cfg = AdaptiveConfig()
-        sims, moves, games = get_gen_settings(10, cfg)
-        # gen=10: t = (10-5)/(15-5) = 0.5
-        assert sims == int(100 + 0.5 * (200 - 100))  # 150
-        assert moves == int(150 + 0.5 * (300 - 150))  # 225
-        assert games == int(200 + 0.5 * (100 - 200))  # 150
+        # gen=12: t = (12-5)/(20-5) ≈ 0.467
+        sims, moves, games = get_gen_settings(12, cfg)
+        t = (12 - cfg.early_until) / (cfg.mid_until - cfg.early_until)
+        assert sims == int(cfg.early_sims + t * (cfg.mid_sims - cfg.early_sims))
+        assert moves == int(cfg.early_max_moves + t * (cfg.mid_max_moves - cfg.early_max_moves))
+        assert games == int(cfg.early_games + t * (cfg.mid_games - cfg.early_games))
 
     def test_full_gen_returns_full_settings(self):
         from training.selfplay import AdaptiveConfig, get_gen_settings
 
         cfg = AdaptiveConfig()
-        for gen in [16, 20, 100]:
+        for gen in [21, 30, 100]:
             sims, moves, games = get_gen_settings(gen, cfg)
             assert sims == cfg.full_sims == 400
             assert moves == cfg.full_max_moves == 512
-            assert games == cfg.full_games == 50
+            assert games == cfg.full_games == 150
 
     def test_disabled_returns_full_settings(self):
         from training.selfplay import AdaptiveConfig, get_gen_settings
@@ -2199,14 +2200,14 @@ class TestAdaptiveConfig:
         from training.selfplay import AdaptiveConfig, get_gen_settings
 
         cfg = AdaptiveConfig()
-        # gen=15 is last mid gen (t=1.0 → mid settings)
-        sims15, moves15, games15 = get_gen_settings(15, cfg)
-        assert sims15 == cfg.mid_sims
-        assert moves15 == cfg.mid_max_moves
-        assert games15 == cfg.mid_games
-        # gen=16 is full
-        sims16, _, _ = get_gen_settings(16, cfg)
-        assert sims16 == cfg.full_sims
+        # Last mid gen (t=1.0 → mid settings)
+        sims_mid, moves_mid, games_mid = get_gen_settings(cfg.mid_until, cfg)
+        assert sims_mid == cfg.mid_sims
+        assert moves_mid == cfg.mid_max_moves
+        assert games_mid == cfg.mid_games
+        # One past mid_until is full
+        sims_full, _, _ = get_gen_settings(cfg.mid_until + 1, cfg)
+        assert sims_full == cfg.full_sims
 
 
 class TestONNXExport:

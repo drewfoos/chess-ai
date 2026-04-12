@@ -8,6 +8,12 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 
 ## [Unreleased]
 
+### Changed — Adaptive Defaults Tuned for Consumer GPUs
+- `AdaptiveConfig` defaults rebalanced: `mid_until=20` (was 15), `early_games=300` (was 200), `mid_games=200` (was 100), `full_games=150` (was 50)
+- Motivation: on RTX 3080-class hardware with TRT + multivisit MCTS, self-play is ~90s / 120 games while training is ~2-3 min, so games/gen can be much higher without extending wall-clock per gen — the original 50/100/200 schedule was tuned for CPU-era throughput and starved the sliding window of fresh data
+- Sims and max-moves unchanged (quality ceilings, not throughput dials); only the games-per-gen curve moves
+- Slower hardware can still override via `--games-per-gen` or by passing an explicit `AdaptiveConfig`
+
 ### Changed — TensorRT Engine Refit
 - `training/build_trt_engine.py::build_engine()` now sets `BuilderFlag.REFIT` by default so engines can be refit with new weights without rebuilding the plan
 - New `refit_engine(onnx_path, engine_path)` uses `trt.Refitter` + `trt.OnnxParserRefitter.refit_from_file()` to swap weights into an existing engine (~5-10s vs 30-90s plan compile) and re-serializes it to disk so the C++ `TRTEvaluator` picks up the refit on its next reload

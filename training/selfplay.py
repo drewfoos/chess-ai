@@ -145,19 +145,27 @@ class SelfPlayConfig:
 
 @dataclass
 class AdaptiveConfig:
-    """Auto-tune sims/max_moves/games per generation for faster early training."""
+    """Auto-tune sims/max_moves/games per generation for faster early training.
+
+    Defaults are tuned for RTX 3080 (10GB) + 8-core/16-thread CPU + 32GB RAM,
+    where self-play is NN-bound and the GPU can sustain cross-game batching
+    at ~120+ games/gen. On slower hardware, drop `full_games` toward 50.
+    """
     enabled: bool = True
     early_until: int = 5       # Generations 1..early_until use early settings
-    mid_until: int = 15        # Generations (early_until+1)..mid_until interpolate
+    mid_until: int = 20        # Generations (early_until+1)..mid_until interpolate
     early_sims: int = 100
     mid_sims: int = 200
     full_sims: int = 400
     early_max_moves: int = 150
     mid_max_moves: int = 300
     full_max_moves: int = 512
-    early_games: int = 200
-    mid_games: int = 100
-    full_games: int = 50
+    # Games/gen stays high at full strength: training (~2-3 min/gen) is the
+    # bottleneck, not self-play (~90s for 120 games on RTX 3080), so extra
+    # games are nearly free and keep the sliding window full of fresh data.
+    early_games: int = 300
+    mid_games: int = 200
+    full_games: int = 150
 
 
 def get_gen_settings(gen: int, adaptive: AdaptiveConfig) -> tuple[int, int, int]:
@@ -1427,7 +1435,7 @@ def main():
                 enabled=True,
                 early_sims=getattr(args, 'early_sims', 100),
                 early_max_moves=getattr(args, 'early_max_moves', 150),
-                early_games=getattr(args, 'early_games', 200),
+                early_games=getattr(args, 'early_games', 300),
                 full_sims=args.simulations,
                 full_max_moves=args.max_moves,
                 full_games=args.games_per_gen,
