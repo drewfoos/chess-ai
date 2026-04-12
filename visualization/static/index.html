@@ -428,7 +428,7 @@ const resultsChart = new Chart(resultsCtx, {
 // --- Board setup ---
 let board = Chessboard('board', {
     position: 'start',
-    pieceTheme: 'https://unpkg.com/@chrisoakman/chessboardjs@1.0.0/dist/img/chesspieces/wikipedia/{piece}.png'
+    pieceTheme: '/static/img/pieces/{piece}.webp'
 });
 let currentMoves = [];
 let currentMoveIdx = 0;
