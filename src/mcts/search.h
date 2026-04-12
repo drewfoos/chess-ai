@@ -2,7 +2,11 @@
 #include "core/types.h"
 #include "core/position.h"
 #include "mcts/node.h"
+#include "mcts/nn_cache.h"
+#include "neural/position_history.h"
+#include "neural/policy_map.h"
 #include <vector>
+#include <array>
 #include <memory>
 
 namespace mcts {
@@ -41,6 +45,18 @@ struct SearchParams {
     float dirichlet_epsilon = 0.25f;
     bool add_noise = true;    // Add Dirichlet noise at root (for self-play)
     float policy_softmax_temp = 2.2f;  // Temperature applied to NN policy logits
+
+    // Batched search config
+    int batch_size = 16;
+    bool smart_pruning = true;
+    float smart_pruning_factor = 1.33f;
+    bool two_fold_draw = true;
+    bool shaped_dirichlet = true;
+    float uncertainty_weight = 0.15f;
+    bool variance_scaling = true;
+    float contempt = 0.0f;
+    bool sibling_blending = true;
+    int nn_cache_size = 20000;
 };
 
 // Search result
@@ -50,13 +66,22 @@ struct SearchResult {
     std::vector<int> visit_counts;     // Visit count per move
     float root_value;                  // Value estimate at root
     int total_nodes;                   // Total nodes in tree
+
+    // New fields for training data
+    std::array<float, neural::POLICY_SIZE> policy_target = {};   // Normalized visit distribution mapped to 1858 policy indices
+    std::array<float, neural::POLICY_SIZE> raw_policy = {};      // NN policy before MCTS
+    float raw_value = 0.0f;                                       // NN value before MCTS
 };
 
 class Search {
 public:
     Search(Evaluator& evaluator, const SearchParams& params = SearchParams{});
 
+    // Backward-compatible: wraps pos in a 1-entry PositionHistory
     SearchResult run(const Position& pos);
+
+    // Full history for repetition detection
+    SearchResult run(const neural::PositionHistory& history);
 
     // Temperature-based move selection for self-play
     // temperature = 1.0: proportional to visit counts
@@ -66,17 +91,49 @@ public:
 private:
     Evaluator& evaluator_;
     SearchParams params_;
+    NNCache cache_;
 
-    Node* select(Node* root);
-    void expand(Node* node, const Position& pos);
-    float evaluate(Node* node, const Position& pos);
+    // Batched search internals
+    struct PendingEval {
+        Node* leaf;
+        Position position;
+        std::vector<Move> path_moves;      // Moves from root to leaf for position tracking
+        std::vector<uint64_t> path_hashes; // Hashes along selection path
+        std::vector<Node*> path_nodes;     // Nodes with virtual loss applied (for reverting)
+    };
+
+    // Selection with all features: solver, variance scaling, uncertainty, sibling blending
+    Node* select_child_advanced(Node* node, bool is_root);
+
+    // Gather phase: select leaves with virtual loss
+    void gather_leaf(Node* root, const neural::PositionHistory& history,
+                     std::vector<PendingEval>& batch);
+
+    // Expand a node with evaluation results
+    void expand_node(Node* node, const Position& pos, const EvalResult& eval_result);
+
+    // Backpropagate value up the tree
     void backpropagate(Node* node, float value);
+
+    // Propagate terminal status up the tree
+    void propagate_terminal(Node* node);
+
+    // Dirichlet noise (shaped or uniform)
     void add_dirichlet_noise(Node* root);
+    void add_shaped_dirichlet_noise(Node* root);
 
     float dynamic_cpuct(int parent_visits) const;
 
-    // Position tracking during selection
-    void apply_moves_to_root(const Position& root_pos, Node* node, Position& out_pos);
+    // Build position by replaying moves from root
+    void replay_moves(const Position& root_pos, const std::vector<Move>& moves, Position& out_pos);
+
+    // Check for two-fold repetition during selection
+    bool is_two_fold_repetition(uint64_t hash, const std::vector<uint64_t>& path_hashes,
+                                 const neural::PositionHistory& history) const;
+
+    // Build the final result with contempt
+    SearchResult build_result(Node* root, const Position& root_pos,
+                              float raw_value, const std::array<float, neural::POLICY_SIZE>& raw_policy);
 };
 
 } // namespace mcts

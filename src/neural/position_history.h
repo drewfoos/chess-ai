@@ -25,12 +25,15 @@ public:
     // Check if current position has been seen 'count' times in the history
     bool is_repetition(int count = 2) const;
 
+    // Compute a hash from position state (piece placement + castling + EP + STM)
+    static uint64_t compute_hash(const Position& pos);
+
+    // Access to hash history for repetition detection during search
+    const std::vector<uint64_t>& hashes() const { return hashes_; }
+
 private:
     std::vector<Position> positions_;
     std::vector<uint64_t> hashes_;
-
-    // Compute a hash from position state (piece placement + castling + EP + STM)
-    static uint64_t compute_hash(const Position& pos);
 };
 
 } // namespace neural

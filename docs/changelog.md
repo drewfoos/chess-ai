@@ -8,6 +8,22 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 
 ## [Unreleased]
 
+### Added — C++ Core Search Rewrite
+- Batched gather/evaluate/scatter MCTS loop in C++ `Search::run()` with virtual loss
+- `SearchResult` now includes `policy_target` (1858-dim visit distribution), `raw_policy`, and `raw_value` for training data
+- `Search::run(const PositionHistory&)` overload for full history + repetition detection
+- MCTS-solver terminal propagation: proven wins/losses/draws propagate up the tree
+- Two-fold repetition detection during selection (checks both search path and game history)
+- Shaped Dirichlet noise (KataGo-style): concentrates noise on plausible moves in C++
+- Variance-scaled cPUCT: dynamic exploration coefficient scales with position complexity in C++
+- Sibling blending (Ceres): visited sibling values as FPU for unvisited children in C++
+- Uncertainty boosting: exploration bonus proportional to child value variance in C++
+- Smart pruning: stops MCTS early when best move has insurmountable visit lead in C++
+- NN evaluation cache integration during search (avoids redundant evaluations)
+- Contempt support: configurable draw aversion shifts root value away from 0
+- `PositionHistory::compute_hash` made public for search-level repetition detection
+- 8 new C++ tests for batched search, MCTS-solver, smart pruning, two-fold repetition, shaped Dirichlet, contempt, backward compatibility
+
 ### Added — C++ Neural Inference
 - Batch neural evaluation: `NeuralEvaluator::evaluate_batch()` runs multiple positions through the network in a single GPU forward pass
 - `BatchRequest` / `BatchResult` structs for pre-encoded batch inference with full 1858-dim raw policy output
