@@ -67,7 +67,7 @@ struct SearchParams {
     float policy_softmax_temp = 2.2f;  // Temperature applied to NN policy logits
 
     // Batched search config
-    int batch_size = 16;
+    int batch_size = 128;
     bool smart_pruning = true;
     float smart_pruning_factor = 1.33f;
     bool two_fold_draw = true;
@@ -76,7 +76,7 @@ struct SearchParams {
     bool variance_scaling = true;
     float contempt = 0.0f;
     bool sibling_blending = true;
-    int nn_cache_size = 20000;
+    int nn_cache_size = 200000;
 };
 
 // Search result

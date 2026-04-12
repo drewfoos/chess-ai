@@ -13,7 +13,7 @@ struct CacheEntry {
 
 class NNCache {
 public:
-    explicit NNCache(int max_size = 20000) : max_size_(max_size) {}
+    explicit NNCache(int max_size = 200000) : max_size_(max_size) {}
 
     // Returns pointer to cached entry, or nullptr if not found
     const CacheEntry* get(uint64_t hash) const {
