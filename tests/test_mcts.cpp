@@ -1,9 +1,12 @@
 #include <gtest/gtest.h>
 #include "mcts/node.h"
 #include "mcts/search.h"
+#include "mcts/nn_cache.h"
 #include "core/attacks.h"
 #include "core/position.h"
 #include "core/movegen.h"
+#include "neural/position_history.h"
+#include "neural/encoder.h"
 
 class MCTSTest : public ::testing::Test {
 protected:
@@ -435,4 +438,194 @@ TEST_F(MCTSTest, SortChildrenByPrior) {
     EXPECT_NEAR(root.child(0)->prior(), 0.5f, 0.002f);
     EXPECT_NEAR(root.child(1)->prior(), 0.3f, 0.002f);
     EXPECT_NEAR(root.child(2)->prior(), 0.2f, 0.002f);
+}
+
+TEST_F(MCTSTest, NNCacheStoreAndRetrieve) {
+    mcts::NNCache cache(100);
+    mcts::CacheEntry entry;
+    entry.policy = {0.5f, 0.3f, 0.2f};
+    entry.value = 0.42f;
+    entry.num_moves = 3;
+
+    cache.put(12345, entry);
+    EXPECT_EQ(cache.size(), 1);
+
+    const mcts::CacheEntry* found = cache.get(12345);
+    ASSERT_NE(found, nullptr);
+    EXPECT_FLOAT_EQ(found->value, 0.42f);
+    EXPECT_EQ(found->num_moves, 3);
+    EXPECT_EQ(found->policy.size(), 3u);
+    EXPECT_FLOAT_EQ(found->policy[0], 0.5f);
+}
+
+TEST_F(MCTSTest, NNCacheMiss) {
+    mcts::NNCache cache(100);
+    EXPECT_EQ(cache.get(99999), nullptr);
+}
+
+TEST_F(MCTSTest, NNCacheEviction) {
+    mcts::NNCache cache(10);
+    for (int i = 0; i < 15; i++) {
+        mcts::CacheEntry entry;
+        entry.policy = {1.0f};
+        entry.value = static_cast<float>(i) / 15.0f;
+        entry.num_moves = 1;
+        cache.put(static_cast<uint64_t>(i), entry);
+    }
+    // After adding 15 entries to a cache of size 10, size should be <= 10
+    EXPECT_LE(cache.size(), 10);
+}
+
+TEST_F(MCTSTest, NNCacheClear) {
+    mcts::NNCache cache(100);
+    mcts::CacheEntry entry;
+    entry.policy = {1.0f};
+    entry.value = 0.5f;
+    entry.num_moves = 1;
+    cache.put(1, entry);
+    cache.put(2, entry);
+    EXPECT_EQ(cache.size(), 2);
+    cache.clear();
+    EXPECT_EQ(cache.size(), 0);
+    EXPECT_EQ(cache.get(1), nullptr);
+}
+
+TEST_F(MCTSTest, NNCacheOverwrite) {
+    mcts::NNCache cache(100);
+    mcts::CacheEntry e1;
+    e1.policy = {0.5f, 0.5f};
+    e1.value = 0.3f;
+    e1.num_moves = 2;
+    cache.put(42, e1);
+
+    mcts::CacheEntry e2;
+    e2.policy = {0.7f, 0.3f};
+    e2.value = 0.8f;
+    e2.num_moves = 2;
+    cache.put(42, e2);
+
+    EXPECT_EQ(cache.size(), 1);
+    const mcts::CacheEntry* found = cache.get(42);
+    ASSERT_NE(found, nullptr);
+    EXPECT_FLOAT_EQ(found->value, 0.8f);
+}
+
+TEST_F(MCTSTest, PositionHistoryBasic) {
+    Position pos;
+    pos.set_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+    neural::PositionHistory hist;
+    hist.reset(pos);
+    EXPECT_EQ(hist.length(), 1);
+    EXPECT_EQ(hist.current().side_to_move(), WHITE);
+}
+
+TEST_F(MCTSTest, PositionHistoryPush) {
+    Position pos;
+    pos.set_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+    neural::PositionHistory hist;
+    hist.reset(pos);
+
+    // Make a move and push
+    UndoInfo undo;
+    Move moves[MAX_MOVES];
+    int n = generate_legal_moves(pos, moves);
+    ASSERT_GT(n, 0);
+    pos.make_move(moves[0], undo);
+    hist.push(pos);
+
+    EXPECT_EQ(hist.length(), 2);
+    EXPECT_EQ(hist.at(0).side_to_move(), BLACK);  // current (after move)
+    EXPECT_EQ(hist.at(1).side_to_move(), WHITE);  // one step back
+}
+
+TEST_F(MCTSTest, PositionHistoryRepetition) {
+    Position pos;
+    pos.set_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+    neural::PositionHistory hist;
+    hist.reset(pos);
+
+    // Play Nf3 Nf6 Ng1 Ng8 - back to start
+    UndoInfo undo;
+    const char* uci_moves[] = {"g1f3", "g8f6", "f3g1", "f6g8"};
+    for (const char* uci : uci_moves) {
+        int from = (uci[0]-'a') + (uci[1]-'1') * 8;
+        int to = (uci[2]-'a') + (uci[3]-'1') * 8;
+        Move m(Square(from), Square(to), FLAG_QUIET);
+        pos.make_move(m, undo);
+        hist.push(pos);
+    }
+    // After 4 moves, should have 2-fold repetition of starting position
+    EXPECT_TRUE(hist.is_repetition(2));
+}
+
+TEST_F(MCTSTest, PositionHistoryAtClamps) {
+    Position pos;
+    pos.set_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+    neural::PositionHistory hist;
+    hist.reset(pos);
+    // at(10) should clamp to the first position, not crash
+    auto& old = hist.at(10);
+    EXPECT_EQ(old.side_to_move(), WHITE);  // same as the only position
+}
+
+TEST_F(MCTSTest, EncodeWithHistoryShape) {
+    Position pos;
+    pos.set_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+    neural::PositionHistory hist;
+    hist.reset(pos);
+
+    float buffer[neural::TENSOR_SIZE] = {0};
+    neural::encode_position(hist, buffer);
+
+    // Bias plane (111) should be all 1.0
+    for (int i = 0; i < 64; i++) {
+        EXPECT_FLOAT_EQ(buffer[111 * 64 + i], 1.0f);
+    }
+}
+
+TEST_F(MCTSTest, EncodeWithHistoryMatchesSinglePosition) {
+    // Encoding a single-position history should produce the same result
+    // as encoding the position directly (backward compatibility)
+    Position pos;
+    pos.set_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+
+    float buf_single[neural::TENSOR_SIZE] = {0};
+    neural::encode_position(pos, buf_single);
+
+    neural::PositionHistory hist;
+    hist.reset(pos);
+    float buf_hist[neural::TENSOR_SIZE] = {0};
+    neural::encode_position(hist, buf_hist);
+
+    for (int i = 0; i < neural::TENSOR_SIZE; i++) {
+        EXPECT_FLOAT_EQ(buf_single[i], buf_hist[i])
+            << "Mismatch at index " << i;
+    }
+}
+
+TEST_F(MCTSTest, EncodeWithHistoryDifferentTimeSteps) {
+    // After making a move, time step 0 and time step 1 should differ
+    Position pos;
+    pos.set_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+    neural::PositionHistory hist;
+    hist.reset(pos);
+
+    UndoInfo undo;
+    Move m(E2, E4, FLAG_DOUBLE_PUSH);
+    pos.make_move(m, undo);
+    hist.push(pos);
+
+    float buffer[neural::TENSOR_SIZE] = {0};
+    neural::encode_position(hist, buffer);
+
+    // Time step 0 (current position after e4) and time step 1 (starting position)
+    // should differ because a pawn moved
+    bool any_diff = false;
+    for (int i = 0; i < 13 * 64; i++) {
+        if (buffer[i] != buffer[13 * 64 + i]) {
+            any_diff = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(any_diff);
 }
