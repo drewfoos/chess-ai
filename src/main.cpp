@@ -4,6 +4,7 @@
 #include "core/position.h"
 #include "core/movegen.h"
 #include "mcts/search.h"
+#include "uci/uci.h"
 #ifdef HAS_LIBTORCH
 #include "neural/neural_evaluator.h"
 #endif
@@ -97,13 +98,13 @@ int main(int argc, char* argv[]) {
     attacks::init();
 
     if (argc < 2) {
-        std::cout << "Usage:\n";
-        std::cout << "  chess_engine perft <depth> [fen]\n";
-        std::cout << "  chess_engine search [fen] [iterations]\n";
-#ifdef HAS_LIBTORCH
-        std::cout << "  chess_engine search_nn <model_path> [fen] [iterations] [device]\n";
-#endif
-        return 1;
+        // Default: UCI mode with random evaluator
+        mcts::RandomEvaluator eval;
+        mcts::SearchParams params;
+        params.add_noise = false;
+        uci::UCIHandler handler(eval, params);
+        handler.loop();
+        return 0;
     }
 
     std::string command = argv[1];
@@ -150,8 +151,40 @@ int main(int argc, char* argv[]) {
         std::cout << "Model: " << model_path << " (device: " << device << ")\n";
         display_search_result(pos, result, iterations);
 #endif
+    } else if (command == "uci") {
+#ifdef HAS_LIBTORCH
+        std::string model_path = (argc >= 3) ? argv[2] : "";
+        std::string device = (argc >= 4) ? argv[3] : "cuda";
+        if (!model_path.empty()) {
+            neural::NeuralEvaluator eval(model_path, device);
+            mcts::SearchParams params;
+            params.add_noise = false;
+            uci::UCIHandler handler(eval, params);
+            handler.loop();
+        } else {
+            mcts::RandomEvaluator eval;
+            mcts::SearchParams params;
+            params.add_noise = false;
+            uci::UCIHandler handler(eval, params);
+            handler.loop();
+        }
+#else
+        mcts::RandomEvaluator eval;
+        mcts::SearchParams params;
+        params.add_noise = false;
+        uci::UCIHandler handler(eval, params);
+        handler.loop();
+#endif
     } else {
         std::cerr << "Unknown command: " << command << "\n";
+        std::cerr << "Usage:\n";
+        std::cerr << "  chess_engine                     — UCI mode (random evaluator)\n";
+        std::cerr << "  chess_engine uci [model] [dev]   — UCI mode (neural network)\n";
+        std::cerr << "  chess_engine perft <depth> [fen]\n";
+        std::cerr << "  chess_engine search [fen] [iterations]\n";
+#ifdef HAS_LIBTORCH
+        std::cerr << "  chess_engine search_nn <model_path> [fen] [iterations] [device]\n";
+#endif
         return 1;
     }
 
