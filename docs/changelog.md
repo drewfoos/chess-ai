@@ -8,6 +8,13 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 
 ## [Unreleased]
 
+### Added — C++ MCTS Performance Optimizations
+- FP16 inference via `model_.to(torch::kHalf)` for ~2x GPU throughput on RTX 3080 Tensor Cores
+- Pinned (page-locked) memory for async CPU→GPU DMA transfers with non-blocking `.to(device_)`
+- Pre-allocated encode buffers in GameManager (eliminates 3.6MB/step allocation churn)
+- Default batch size increased from 16 to 128 (better GPU kernel amortization)
+- Default NN cache size increased from 20K to 200K entries (~40MB RAM, matches Lc0 scale)
+
 ### Changed — Node Arena Allocator + Edge/Node Separation
 - Replaced `std::vector<std::unique_ptr<Node>> children_` with parallel `Edge[]` + `Node*[]` arrays
 - Added `Edge` struct: stores move_bits (uint16_t) and prior_bits (FP16) for 4 bytes per edge
