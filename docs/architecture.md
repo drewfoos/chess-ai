@@ -204,22 +204,6 @@ Value output[3] → WDL → v = P(win) - P(loss) ∈ [-1, +1]
 
 **CLI:** `chess_engine search_nn <model_path> [fen] [iterations] [device]`
 
-### Neural Inference (Plan 5)
-
-**Files:** `src/neural/encoder.h/.cpp`, `src/neural/policy_map.h/.cpp`, `src/neural/neural_evaluator.h/.cpp`
-
-Three components bridge the Python training pipeline and C++ MCTS:
-
-1. **Position Encoder** (`encoder.h`): Converts a `Position` to a 112×8×8 float32 tensor matching the Python encoder. 8 time steps (duplicated current position — no history in C++ MCTS), 13 planes per step (6 own + 6 opponent + repetition), 8 constant planes (color, move count, castling, halfmove, bias). Board flipped for Black to move.
-
-2. **Policy Map** (`policy_map.h`): Maps chess moves to indices in the 1858-dim policy vector. Replicates the Leela Chess Zero encoding: 56 queen-like + 8 knight + 9 underpromotion per source square. Handles Black mirroring and promotion flag extraction.
-
-3. **NeuralEvaluator** (`neural_evaluator.h`): Implements the `Evaluator` interface from `mcts/search.h`. Loads TorchScript models via LibTorch, runs single-position inference, extracts WDL value (win - loss → [-1, +1]), applies softmax over legal move logits for policy output. Supports CPU and CUDA devices.
-
-**Build:** Optional via `-DENABLE_NEURAL=ON -DCMAKE_PREFIX_PATH=<torch_cmake_path>`. Requires LibTorch (included in PyTorch installation).
-
-**CLI:** `chess_engine search_nn <model_path> [fen] [iterations] [device]`
-
 ### 6. Visualization Dashboard — Plan 6
 
 Real-time monitoring of training progress and game playback.

@@ -43,18 +43,7 @@ static void divide(Position& pos, int depth) {
     std::cout << "\nTotal: " << total << "\n";
 }
 
-static void search_position(const std::string& fen, int iterations) {
-    Position pos;
-    pos.set_fen(fen);
-
-    mcts::RandomEvaluator eval;
-    mcts::SearchParams params;
-    params.num_iterations = iterations;
-    params.add_noise = false;
-
-    mcts::Search search(eval, params);
-    mcts::SearchResult result = search.run(pos);
-
+static void display_search_result(const Position& pos, const mcts::SearchResult& result, int iterations) {
     if (result.best_move.is_none()) {
         std::cout << "No legal moves (";
         if (pos.in_check()) std::cout << "checkmate";
@@ -88,6 +77,20 @@ static void search_position(const std::string& fen, int iterations) {
                   << "  (" << std::fixed << std::setprecision(1) << pct << "%)\n";
         shown++;
     }
+}
+
+static void search_position(const std::string& fen, int iterations) {
+    Position pos;
+    pos.set_fen(fen);
+
+    mcts::RandomEvaluator eval;
+    mcts::SearchParams params;
+    params.num_iterations = iterations;
+    params.add_noise = false;
+
+    mcts::Search search(eval, params);
+    mcts::SearchResult result = search.run(pos);
+    display_search_result(pos, result, iterations);
 }
 
 int main(int argc, char* argv[]) {
@@ -144,40 +147,8 @@ int main(int argc, char* argv[]) {
         mcts::Search search(eval, params);
         mcts::SearchResult result = search.run(pos);
 
-        if (result.best_move.is_none()) {
-            std::cout << "No legal moves (";
-            if (pos.in_check()) std::cout << "checkmate";
-            else std::cout << "stalemate";
-            std::cout << ")\n";
-            return 0;
-        }
-
-        std::cout << "Position: " << pos.to_fen() << "\n";
         std::cout << "Model: " << model_path << " (device: " << device << ")\n";
-        std::cout << "Iterations: " << iterations << "\n";
-        std::cout << "Root value: " << std::fixed << std::setprecision(3) << result.root_value << "\n";
-        std::cout << "Best move: " << result.best_move.to_uci() << "\n\n";
-
-        // Sort by visit count descending for display
-        std::vector<std::pair<int, int>> indexed(result.moves.size());
-        for (int i = 0; i < static_cast<int>(result.moves.size()); i++) {
-            indexed[i] = {result.visit_counts[i], i};
-        }
-        std::sort(indexed.begin(), indexed.end(), std::greater<>());
-
-        int total_visits = 0;
-        for (int v : result.visit_counts) total_visits += v;
-
-        std::cout << "Move distribution (top 10):\n";
-        int shown = 0;
-        for (auto& [visits, idx] : indexed) {
-            if (shown >= 10) break;
-            float pct = 100.0f * visits / total_visits;
-            std::cout << "  " << std::setw(5) << result.moves[idx].to_uci()
-                      << "  " << std::setw(6) << visits << " visits"
-                      << "  (" << std::fixed << std::setprecision(1) << pct << "%)\n";
-            shown++;
-        }
+        display_search_result(pos, result, iterations);
 #endif
     } else {
         std::cerr << "Unknown command: " << command << "\n";
