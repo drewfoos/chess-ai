@@ -37,12 +37,17 @@ venv/
 *.onnx
 *.pth
 
-# Training data
+# Training data & output
 *.gz
 *.npz
 data/
 checkpoints/
 runs/
+selfplay_output/
+
+# Playwright / screenshots
+.playwright-mcp/
+dashboard-*.png
 
 # OS
 Thumbs.db

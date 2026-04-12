@@ -28,10 +28,16 @@ class TrainingMetrics:
 
 
 class MetricsLogger:
-    """Writes per-generation JSON metrics for the visualization dashboard."""
+    """Writes per-generation JSON metrics for the visualization dashboard.
 
-    def __init__(self, metrics_dir: str):
+    Per-generation files (gen_NNN.json) are always written in full.
+    summary.json keeps only the most recent `max_summary_generations`
+    entries to avoid unbounded growth during long training runs.
+    """
+
+    def __init__(self, metrics_dir: str, max_summary_generations: int = 500):
         self.metrics_dir = metrics_dir
+        self.max_summary_generations = max_summary_generations
         os.makedirs(metrics_dir, exist_ok=True)
         self.current_games: list[GameMetrics] = []
 
@@ -89,7 +95,12 @@ class MetricsLogger:
         }
 
         summary['generations'].append(gen_summary)
-        summary['total_generations'] = len(summary['generations'])
+
+        # Trim old entries to keep summary.json bounded
+        if len(summary['generations']) > self.max_summary_generations:
+            summary['generations'] = summary['generations'][-self.max_summary_generations:]
+
+        summary['total_generations'] = gen_data['generation']  # actual generation count, not len
 
         total_positions = sum(g['num_positions'] for g in summary['generations'])
         total_time = sum(g['duration_s'] for g in summary['generations'])
