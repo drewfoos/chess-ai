@@ -240,6 +240,33 @@ Browser polls /api/summary every 10s → Chart.js + chessboard.js
 
 **Implementation status:** Complete. Lightweight stack: Flask + CDN-hosted Chart.js/chessboard.js. No React, no npm, no WebSocket — just JSON files + polling.
 
+### 7. UCI Protocol — Plan 7
+
+Universal Chess Interface support for GUI integration and tournament play.
+
+```
+src/uci/
+├── time_manager.h      Time allocation from clock/movetime/nodes/infinite
+└── uci.h/cpp           Command parser, position management, threaded search
+```
+
+**Data flow:**
+```
+GUI → stdin → UCIHandler::loop() → parse command
+  "position startpos moves e2e4 e7e5" → update Position + PositionHistory
+  "go wtime 60000 btime 60000" → allocate_time() → start_search() on background thread
+  Search thread → info callback → "info nodes N nps X score cp Y pv MOVE" → stdout
+  Search complete → "bestmove e2e4" → stdout
+  "stop" → set stop_flag_ → join search thread
+```
+
+**Key design decisions:**
+- Search runs on a dedicated background thread for responsive stop handling
+- PositionHistory captured by value in search thread (main thread may update position)
+- Thread-safe output via mutex-protected `send()` method
+- NPS estimate updated after each search for better time allocation
+- Info output rate-limited to every 500ms or 100 iterations
+
 ## The Training Loop (End-to-End)
 
 ```
@@ -287,6 +314,7 @@ chess-ai/
 │   ├── mcts/                   MCTS search (Plan 2)
 │   ├── neural/                 C++ inference (Plan 5)
 │   ├── selfplay/               Game generation (Plan 4)
+│   ├── uci/                    UCI protocol (Plan 7)
 │   └── main.cpp                CLI entry point
 ├── training/                   Python/PyTorch (Plan 3)
 │   ├── config.py

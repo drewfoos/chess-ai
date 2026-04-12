@@ -15,6 +15,7 @@ add_library(chess_core
     src/neural/policy_map.cpp
     src/neural/encoder.cpp
     src/neural/position_history.cpp
+    src/uci/uci.cpp
 )
 target_include_directories(chess_core PUBLIC src)
 
@@ -41,6 +42,7 @@ if(BUILD_TESTS)
         tests/test_perft.cpp
         tests/test_mcts.cpp
         tests/test_neural.cpp
+        tests/test_uci.cpp
     )
     target_link_libraries(chess_tests PRIVATE chess_core GTest::gtest_main)
     include(GoogleTest)

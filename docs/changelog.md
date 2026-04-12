@@ -8,6 +8,17 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 
 ## [Unreleased]
 
+### Added — UCI Protocol Handler
+- `UCIHandler` class (`src/uci/uci.h`, `src/uci/uci.cpp`): full UCI command parser and response handler
+- Supports commands: uci, isready, ucinewgame, position (startpos/fen + moves), go (wtime/btime/winc/binc/movestogo/depth/nodes/movetime/infinite), stop, setoption, quit
+- Background search thread with atomic stop flag for responsive `stop` handling
+- Thread-safe output via mutex-protected `send()` method
+- Info callback with rate limiting (500ms / 100 iterations) emitting `info nodes/nps/score/pv`
+- PositionHistory captured by value in search thread for safe concurrent access
+- NPS estimate updated after each search for adaptive time allocation
+- `Iterations` UCI option for configuring base search parameters
+- 6 new C++ tests: uci/isready commands, position startpos/fen/moves, go nodes, go infinite+stop
+
 ### Added — Multi-Game Parallelism (GameManager)
 - `GameManager` C++ class: runs N concurrent MCTS games with cross-game NN batching
 - Single GPU forward pass collects leaves from all active games (e.g., 4 per game × 16 games = 64 batch)
