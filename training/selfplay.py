@@ -35,6 +35,7 @@ class GameRecord:
     values: list[np.ndarray] = field(default_factory=list)
     result: str = '*'
     num_moves: int = 0
+    moves_uci: list[str] = field(default_factory=list)
 
 
 def play_game(mcts: MCTS, config: SelfPlayConfig) -> GameRecord:
@@ -74,6 +75,7 @@ def play_game(mcts: MCTS, config: SelfPlayConfig) -> GameRecord:
         else:
             resign_count = 0
 
+        record.moves_uci.append(result.best_move.uci())
         board.push(result.best_move)
 
     # Determine game result if not resigned
@@ -118,6 +120,7 @@ def generate_games(
     mcts_config: MCTSConfig = MCTSConfig(),
     selfplay_config: SelfPlayConfig = SelfPlayConfig(),
     device: str = 'cpu',
+    metrics_logger=None,
 ) -> int:
     """Generate self-play games and save as .npz file."""
     model = model.to(device)
@@ -134,6 +137,16 @@ def generate_games(
         game_start = time.time()
         record = play_game(mcts, selfplay_config)
         game_time = time.time() - game_start
+
+        if metrics_logger is not None:
+            from training.metrics import GameMetrics
+            metrics_logger.record_game(GameMetrics(
+                game_num=game_num + 1,
+                num_moves=record.num_moves,
+                result=record.result,
+                duration_s=game_time,
+                moves_uci=record.moves_uci,
+            ))
 
         all_planes.extend(record.planes)
         all_policies.extend(record.policies)
@@ -202,6 +215,10 @@ def training_loop(
     os.makedirs(data_dir, exist_ok=True)
     os.makedirs(checkpoint_dir, exist_ok=True)
 
+    from training.metrics import MetricsLogger, TrainingMetrics
+    metrics_dir = os.path.join(output_dir, 'metrics')
+    metrics_logger = MetricsLogger(metrics_dir)
+
     config = NetworkConfig(num_blocks=blocks, num_filters=filters)
     model = ChessNetwork(config).to(device)
     optimizer = create_optimizer(model, lr=lr, weight_decay=weight_decay)
@@ -226,6 +243,7 @@ def training_loop(
             mcts_config=mcts_config,
             selfplay_config=selfplay_config,
             device=device,
+            metrics_logger=metrics_logger,
         )
 
         # 2. Load sliding window of recent generations
@@ -281,6 +299,19 @@ def training_loop(
               f"{len(dataset)} training samples (window {window_start}-{gen})")
         print(f"  Loss: total={avg_total:.4f}, policy={avg_policy:.4f}, value={avg_value:.4f}")
         print(f"  Time: {gen_time:.1f}s, Checkpoint: {checkpoint_path}")
+        training_metrics = TrainingMetrics(
+            total_loss=avg_total,
+            policy_loss=avg_policy,
+            value_loss=avg_value,
+            num_batches=num_batches,
+            learning_rate=optimizer.param_groups[0]['lr'],
+        )
+        metrics_logger.save_generation(
+            generation=gen,
+            num_positions=num_positions,
+            training=training_metrics,
+            duration_s=gen_time,
+        )
 
     # Export final TorchScript model
     final_path = os.path.join(output_dir, 'model_final.pt')

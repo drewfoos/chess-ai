@@ -12,6 +12,28 @@ Nothing yet.
 
 ---
 
+## [0.6.0] - 2026-04-11
+
+**Visualization Dashboard — Plan 6 complete.**
+
+### Added
+- MetricsLogger: writes per-generation JSON metrics for training monitoring (`training/metrics.py`)
+- Flask visualization server: REST API serving training metrics (`visualization/server.py`)
+- Single-page training dashboard: loss curves (Chart.js), game replay (chessboard.js), speed metrics (`visualization/static/index.html`)
+- Self-play loop instrumented with metrics logging (games, training loss, timing)
+- UCI move recording in GameRecord for game replay
+- End-to-end integration test (self-play -> metrics -> Flask API)
+
+### Changed
+- `GameRecord` now includes `moves_uci` field
+- `generate_games()` accepts optional `metrics_logger` parameter
+- `training_loop()` automatically writes metrics to `<output_dir>/metrics/`
+
+### Dependencies
+- Added: `flask` for visualization server
+
+---
+
 ## [0.5.0] - 2026-04-11
 
 ### Added

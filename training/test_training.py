@@ -803,3 +803,292 @@ def test_selfplay_gpu():
             device='cuda',
         )
         assert num_positions > 0
+
+
+# ── Metrics Tests ────────────────────────────────────────────────────────────
+
+import json
+from training.metrics import MetricsLogger, GameMetrics, TrainingMetrics
+
+
+def test_metrics_logger_creates_directory():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        metrics_dir = os.path.join(tmpdir, 'metrics')
+        logger = MetricsLogger(metrics_dir)
+        assert os.path.isdir(metrics_dir)
+
+
+def test_metrics_game_recorded():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        logger = MetricsLogger(tmpdir)
+        game = GameMetrics(
+            game_num=1,
+            num_moves=45,
+            result='1-0',
+            duration_s=12.5,
+            moves_uci=['e2e4', 'd7d5', 'e4d5'],
+        )
+        logger.record_game(game)
+        assert len(logger.current_games) == 1
+
+
+def test_metrics_generation_saved():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        logger = MetricsLogger(tmpdir)
+        game = GameMetrics(
+            game_num=1, num_moves=30, result='1/2-1/2',
+            duration_s=10.0, moves_uci=['e2e4', 'e7e5'],
+        )
+        logger.record_game(game)
+        training = TrainingMetrics(
+            total_loss=2.5, policy_loss=1.8, value_loss=0.7,
+            num_batches=10, learning_rate=0.001,
+        )
+        logger.save_generation(
+            generation=1, num_positions=150,
+            training=training, duration_s=25.0,
+        )
+        gen_path = os.path.join(tmpdir, 'gen_001.json')
+        assert os.path.exists(gen_path)
+        with open(gen_path) as f:
+            data = json.load(f)
+        assert data['generation'] == 1
+        assert data['num_positions'] == 150
+        assert len(data['games']) == 1
+        assert data['training']['total_loss'] == 2.5
+
+
+def test_metrics_summary_updated():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        logger = MetricsLogger(tmpdir)
+        game = GameMetrics(
+            game_num=1, num_moves=20, result='0-1',
+            duration_s=8.0, moves_uci=['d2d4'],
+        )
+        logger.record_game(game)
+        training = TrainingMetrics(
+            total_loss=3.0, policy_loss=2.0, value_loss=1.0,
+            num_batches=5, learning_rate=0.001,
+        )
+        logger.save_generation(1, 100, training, 20.0)
+        summary_path = os.path.join(tmpdir, 'summary.json')
+        assert os.path.exists(summary_path)
+        with open(summary_path) as f:
+            summary = json.load(f)
+        assert summary['total_generations'] == 1
+        assert len(summary['generations']) == 1
+
+
+def test_metrics_multiple_generations():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        logger = MetricsLogger(tmpdir)
+        for gen in range(1, 4):
+            game = GameMetrics(
+                game_num=1, num_moves=20, result='1/2-1/2',
+                duration_s=5.0, moves_uci=['e2e4'],
+            )
+            logger.record_game(game)
+            training = TrainingMetrics(
+                total_loss=3.0 - gen * 0.5, policy_loss=2.0, value_loss=1.0,
+                num_batches=5, learning_rate=0.001,
+            )
+            logger.save_generation(gen, 100, training, 15.0)
+        summary_path = os.path.join(tmpdir, 'summary.json')
+        with open(summary_path) as f:
+            summary = json.load(f)
+        assert summary['total_generations'] == 3
+        assert len(summary['generations']) == 3
+        losses = [g['training']['total_loss'] for g in summary['generations']]
+        assert losses == [2.5, 2.0, 1.5]
+
+
+def test_game_record_has_moves_uci():
+    """GameRecord should include UCI move strings after play_game."""
+    from training.selfplay import play_game, SelfPlayConfig
+    from training.mcts import MCTS, MCTSConfig
+    from training.model import ChessNetwork
+    from training.config import NetworkConfig
+
+    config = NetworkConfig(num_blocks=1, num_filters=16)
+    model = ChessNetwork(config)
+    model.eval()
+    mcts = MCTS(model, MCTSConfig(num_simulations=2))
+    sp_config = SelfPlayConfig(max_moves=10)
+
+    record = play_game(mcts, sp_config)
+    assert hasattr(record, 'moves_uci')
+    assert isinstance(record.moves_uci, list)
+    assert len(record.moves_uci) == record.num_moves
+    for m in record.moves_uci:
+        assert isinstance(m, str)
+        assert len(m) >= 4
+
+
+def test_training_loop_writes_metrics():
+    """training_loop with metrics_dir should produce summary.json."""
+    import tempfile
+    from training.selfplay import training_loop
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        training_loop(
+            generations=1,
+            games_per_gen=2,
+            train_epochs=1,
+            batch_size=32,
+            num_simulations=2,
+            blocks=1,
+            filters=16,
+            output_dir=tmpdir,
+            max_moves=10,
+        )
+        metrics_dir = os.path.join(tmpdir, 'metrics')
+        assert os.path.isdir(metrics_dir)
+        summary_path = os.path.join(tmpdir, 'metrics', 'summary.json')
+        assert os.path.exists(summary_path)
+        with open(summary_path) as f:
+            summary = json.load(f)
+        assert summary['total_generations'] == 1
+
+
+def test_server_summary_endpoint():
+    """Flask /api/summary should return summary.json contents."""
+    import tempfile
+    from visualization.server import create_app
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        summary = {
+            'total_generations': 1,
+            'total_games': 5,
+            'total_positions': 200,
+            'total_time_s': 30.0,
+            'generations': [{
+                'generation': 1,
+                'num_positions': 200,
+                'num_games': 5,
+                'training': {'total_loss': 2.5, 'policy_loss': 1.8, 'value_loss': 0.7,
+                             'num_batches': 10, 'learning_rate': 0.001},
+                'duration_s': 30.0,
+                'avg_game_length': 40.0,
+                'results': {'1-0': 2, '0-1': 2, '1/2-1/2': 1},
+            }],
+        }
+        with open(os.path.join(tmpdir, 'summary.json'), 'w') as f:
+            json.dump(summary, f)
+
+        app = create_app(tmpdir)
+        client = app.test_client()
+        resp = client.get('/api/summary')
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data['total_generations'] == 1
+
+
+def test_server_generation_endpoint():
+    """Flask /api/generation/1 should return gen_001.json contents."""
+    import tempfile
+    from visualization.server import create_app
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        gen_data = {
+            'generation': 1,
+            'num_positions': 100,
+            'num_games': 3,
+            'games': [
+                {'game_num': 1, 'num_moves': 30, 'result': '1-0',
+                 'duration_s': 10.0, 'moves_uci': ['e2e4', 'e7e5']},
+            ],
+            'training': {'total_loss': 2.0, 'policy_loss': 1.5, 'value_loss': 0.5,
+                         'num_batches': 5, 'learning_rate': 0.001},
+            'duration_s': 20.0,
+        }
+        with open(os.path.join(tmpdir, 'gen_001.json'), 'w') as f:
+            json.dump(gen_data, f)
+
+        app = create_app(tmpdir)
+        client = app.test_client()
+        resp = client.get('/api/generation/1')
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data['generation'] == 1
+        assert len(data['games']) == 1
+
+
+def test_server_generation_not_found():
+    """Flask /api/generation/99 should return 404."""
+    import tempfile
+    from visualization.server import create_app
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        app = create_app(tmpdir)
+        client = app.test_client()
+        resp = client.get('/api/generation/99')
+        assert resp.status_code == 404
+
+
+def test_server_status_endpoint():
+    """Flask /api/status should always return ok."""
+    import tempfile
+    from visualization.server import create_app
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        app = create_app(tmpdir)
+        client = app.test_client()
+        resp = client.get('/api/status')
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data['status'] == 'ok'
+
+
+def test_server_empty_summary():
+    """Flask /api/summary should return empty data when no summary.json exists."""
+    import tempfile
+    from visualization.server import create_app
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        app = create_app(tmpdir)
+        client = app.test_client()
+        resp = client.get('/api/summary')
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data['total_generations'] == 0
+        assert data['generations'] == []
+
+
+def test_integration_selfplay_to_dashboard():
+    """Full pipeline: self-play -> metrics -> Flask API -> verify data."""
+    import tempfile
+    from training.selfplay import training_loop
+    from visualization.server import create_app
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        training_loop(
+            generations=2,
+            games_per_gen=2,
+            train_epochs=1,
+            batch_size=32,
+            num_simulations=2,
+            blocks=1,
+            filters=16,
+            output_dir=tmpdir,
+            max_moves=10,
+        )
+
+        metrics_dir = os.path.join(tmpdir, 'metrics')
+        assert os.path.exists(os.path.join(metrics_dir, 'gen_001.json'))
+        assert os.path.exists(os.path.join(metrics_dir, 'gen_002.json'))
+        assert os.path.exists(os.path.join(metrics_dir, 'summary.json'))
+
+        app = create_app(metrics_dir)
+        client = app.test_client()
+
+        resp = client.get('/api/summary')
+        assert resp.status_code == 200
+        summary = resp.get_json()
+        assert summary['total_generations'] == 2
+        assert summary['total_games'] == 4
+
+        resp = client.get('/api/generation/1')
+        assert resp.status_code == 200
+        gen = resp.get_json()
+        assert len(gen['games']) == 2
+        assert len(gen['games'][0]['moves_uci']) > 0
