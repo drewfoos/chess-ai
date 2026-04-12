@@ -49,6 +49,9 @@ selfplay_output/
 .playwright-mcp/
 dashboard-*.png
 
+# Environment / secrets
+.env
+
 # OS
 Thumbs.db
 Desktop.ini
