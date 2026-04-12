@@ -210,21 +210,35 @@ Real-time monitoring of training progress and game playback.
 
 ```
 visualization/
-├── server/          Python Flask + WebSocket server
-└── client/          React + chessboard.jsx + Recharts
+├── server.py           Flask REST API (serves metrics + static files)
+└── static/
+    └── index.html      Single-page dashboard (Chart.js + chessboard.js)
+training/
+└── metrics.py          MetricsLogger (writes per-generation JSON)
 ```
 
 **Data flow:**
 ```
-Self-play engine ──→ WebSocket ──→ Flask server ──→ WebSocket ──→ React client
-Training pipeline ──→ Metrics file ──→ Flask server ──→ WebSocket ──→ React client
+Self-play loop → MetricsLogger → JSON files (gen_NNN.json + summary.json)
+  ↓
+Flask server reads JSON files → REST API endpoints
+  ↓
+Browser polls /api/summary every 10s → Chart.js + chessboard.js
 ```
 
-**Dashboard features (MVP):**
-- Live game board (current self-play position)
-- Training loss curves (policy + value)
-- Games counter / positions generated
-- Speed metrics (games/hour, positions/second)
+**Dashboard features:**
+- Training loss curves (total, policy, value) via Chart.js
+- Game replay board with play/pause/step controls via chessboard.js
+- Summary stats: generations, total games, positions, speed (pos/min)
+- Game results by generation (stacked bar chart)
+- Generation and game selectors for replay
+
+**API endpoints:**
+- `GET /api/summary` — rolling summary of all generations
+- `GET /api/generation/<N>` — detailed data for generation N (including game moves)
+- `GET /api/status` — server health check
+
+**Implementation status:** Complete. Lightweight stack: Flask + CDN-hosted Chart.js/chessboard.js. No React, no npm, no WebSocket — just JSON files + polling.
 
 ## The Training Loop (End-to-End)
 
