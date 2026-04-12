@@ -948,3 +948,107 @@ def test_training_loop_writes_metrics():
         with open(summary_path) as f:
             summary = json.load(f)
         assert summary['total_generations'] == 1
+
+
+def test_server_summary_endpoint():
+    """Flask /api/summary should return summary.json contents."""
+    import tempfile
+    from visualization.server import create_app
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        summary = {
+            'total_generations': 1,
+            'total_games': 5,
+            'total_positions': 200,
+            'total_time_s': 30.0,
+            'generations': [{
+                'generation': 1,
+                'num_positions': 200,
+                'num_games': 5,
+                'training': {'total_loss': 2.5, 'policy_loss': 1.8, 'value_loss': 0.7,
+                             'num_batches': 10, 'learning_rate': 0.001},
+                'duration_s': 30.0,
+                'avg_game_length': 40.0,
+                'results': {'1-0': 2, '0-1': 2, '1/2-1/2': 1},
+            }],
+        }
+        with open(os.path.join(tmpdir, 'summary.json'), 'w') as f:
+            json.dump(summary, f)
+
+        app = create_app(tmpdir)
+        client = app.test_client()
+        resp = client.get('/api/summary')
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data['total_generations'] == 1
+
+
+def test_server_generation_endpoint():
+    """Flask /api/generation/1 should return gen_001.json contents."""
+    import tempfile
+    from visualization.server import create_app
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        gen_data = {
+            'generation': 1,
+            'num_positions': 100,
+            'num_games': 3,
+            'games': [
+                {'game_num': 1, 'num_moves': 30, 'result': '1-0',
+                 'duration_s': 10.0, 'moves_uci': ['e2e4', 'e7e5']},
+            ],
+            'training': {'total_loss': 2.0, 'policy_loss': 1.5, 'value_loss': 0.5,
+                         'num_batches': 5, 'learning_rate': 0.001},
+            'duration_s': 20.0,
+        }
+        with open(os.path.join(tmpdir, 'gen_001.json'), 'w') as f:
+            json.dump(gen_data, f)
+
+        app = create_app(tmpdir)
+        client = app.test_client()
+        resp = client.get('/api/generation/1')
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data['generation'] == 1
+        assert len(data['games']) == 1
+
+
+def test_server_generation_not_found():
+    """Flask /api/generation/99 should return 404."""
+    import tempfile
+    from visualization.server import create_app
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        app = create_app(tmpdir)
+        client = app.test_client()
+        resp = client.get('/api/generation/99')
+        assert resp.status_code == 404
+
+
+def test_server_status_endpoint():
+    """Flask /api/status should always return ok."""
+    import tempfile
+    from visualization.server import create_app
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        app = create_app(tmpdir)
+        client = app.test_client()
+        resp = client.get('/api/status')
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data['status'] == 'ok'
+
+
+def test_server_empty_summary():
+    """Flask /api/summary should return empty data when no summary.json exists."""
+    import tempfile
+    from visualization.server import create_app
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        app = create_app(tmpdir)
+        client = app.test_client()
+        resp = client.get('/api/summary')
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data['total_generations'] == 0
+        assert data['generations'] == []
