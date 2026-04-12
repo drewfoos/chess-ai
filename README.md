@@ -19,24 +19,58 @@ A ground-up AlphaZero-style chess engine — every component written from scratc
 ## Architecture
 
 ```
-                          Self-Play Loop (C++ GameManager, 128 games in parallel)
-                  +-----------------------------------------------------------+
-                  |                                                           |
-                  v                                                           |
-   +----------------------+    +---------------------+    +-------------------+
-   |   Neural Network     |    |   MCTS Search       |    |   Game Generator   |
-   |   SE-ResNet 10x128   |--->|   PUCT + Solver     |--->|   400 games/gen    |
-   |   ~13M params        |    |   Multivisit, KLD   |    |   UCI move records |
-   |   FP16 via TRT/LTorch|    |   Cross-game batch  |    |                    |
-   +----------------------+    +---------------------+    +-------------------+
-           ^                                                        |
-           |            +-------------------+                       |
-           +------------| Training Pipeline |<----------------------+
-                        |  AdamW + SWA      |
-                        |  AMP mixed-prec.  |
-                        |  Sliding window   |
-                        +-------------------+
+  ======================  PYTHON  =========================================
+
+  +----------------------+         +----------------------+
+  |  Training Pipeline   |         |   Self-Play driver   |
+  |  PyTorch + AMP FP16  |         |  (play_games_        |
+  |  AdamW + SWA         |         |   batched, Python)   |
+  |  Sliding window +    |         |                      |
+  |  mirror augmentation |         +----------+-----------+
+  +----------+-----------+                    |
+             ^                                |  pybind11
+             |                                |  (chess_mcts._core)
+  +----------+-----------+                    v
+  |  Training data       |         ======================  C++ / CUDA  ===
+  |  packed .npz         |
+  |  (104 x uint64       |         +---------------------------------+
+  |   bitboards)         |         |           GameManager           |
+  +----------+-----------+         |  128 parallel games, shared     |
+             ^                     |  NodePool arena, cross-game     |
+             |                     |  NN batching                    |
+             |                     +----------------+----------------+
+  +----------+-----------+                          |
+  |  PyTorch .pt  (SWA)  |                          v
+  |  export.py           |         +----------------------------------+
+  +----------+-----------+         |           MCTS Search            |
+             |                     |  PUCT + Solver + Multivisit      |
+             |  ONNX opset-18      |  KLD-adaptive, smart pruning,    |
+             |  (dynamic batch)    |  shaped Dirichlet, variance-cPUCT|
+             v                     +---+---------------------------+--+
+  +----------------------+             |                           |
+  |  build_trt_engine.py |             |  encode + policy_map      |
+  |  FP16, batch profile |             v                           v
+  |  (min=1, opt=128,    |     +----------------+       +---------------------+
+  |   max=256)           |     |  TRTEvaluator  |       |   NeuralEvaluator   |
+  +----------+-----------+     |  enqueueV3     |<----->|   LibTorch FP16     |
+             |                 |  pinned host + |       |   (fallback)        |
+             v                 |  device bufs   |       |                     |
+  +----------------------+     +--------+-------+       +----------+----------+
+  |  TensorRT engine     |              |                          |
+  |  (.plan)             |--------------+   RawBatchEvaluator      |
+  +----------------------+                  (shared interface) <---+
+                                                    |
+                                                    v
+                                   +-----------------------------------+
+                                   |  Self-play games → training data  |
+                                   |  fed back into the sliding window |
+                                   +-----------------------------------+
 ```
+
+Python owns training, ONNX + TRT engine export, and orchestration.
+C++ owns hot-path inference (TRT by default, LibTorch fallback), MCTS search,
+and the parallel self-play loop. The two sides talk over pybind11 via the
+`chess_mcts._core` module.
 
 **Hardware target:** RTX 3080 (10 GB VRAM) + Ryzen 7 5800X (8 cores / 16 threads), Windows 11.
 Smaller / larger GPUs work — just reduce/raise `--parallel-games` and the network tier.
