@@ -11,7 +11,7 @@
 namespace neural {
 
 NeuralEvaluator::NeuralEvaluator(const std::string& model_path, const std::string& device,
-                                 float policy_softmax_temp)
+                                 float policy_softmax_temp, bool use_fp16)
     : device_(device == "cuda" && torch::cuda::is_available() ? torch::kCUDA : torch::kCPU)
     , policy_softmax_temp_(policy_softmax_temp)
     , encode_buffer_(TENSOR_SIZE)
@@ -24,6 +24,12 @@ NeuralEvaluator::NeuralEvaluator(const std::string& model_path, const std::strin
     }
     model_.to(device_);
     model_.eval();
+    use_fp16_ = use_fp16;
+    if (use_fp16_ && device_ == torch::kCUDA) {
+        model_.to(torch::kHalf);
+    } else {
+        use_fp16_ = false;  // FP16 only on CUDA
+    }
 }
 
 mcts::EvalResult NeuralEvaluator::evaluate(const Position& pos, const Move* moves, int num_moves) {
@@ -48,13 +54,14 @@ mcts::EvalResult NeuralEvaluator::evaluate(const Position& pos, const Move* move
         encode_buffer_.data(),
         {1, INPUT_PLANES, BOARD_SIZE, BOARD_SIZE},
         torch::kFloat32
-    ).to(device_);
+    );
+    input = use_fp16_ ? input.to(device_, torch::kHalf) : input.to(device_);
 
     // Run inference
     torch::NoGradGuard no_grad;
     auto output = model_.forward({input}).toTuple();
-    auto policy_logits = output->elements()[0].toTensor().to(torch::kCPU);  // (1, 1858)
-    auto wdl_probs = output->elements()[1].toTensor().to(torch::kCPU);      // (1, 3)
+    auto policy_logits = output->elements()[0].toTensor().to(torch::kCPU).to(torch::kFloat32);  // (1, 1858)
+    auto wdl_probs = output->elements()[1].toTensor().to(torch::kCPU).to(torch::kFloat32);      // (1, 3)
 
     // Value: win - loss
     auto wdl_acc = wdl_probs.accessor<float, 2>();
@@ -110,12 +117,13 @@ std::vector<mcts::EvalResult> NeuralEvaluator::evaluate_batch(
         batch_buffer_.data(),
         {batch_size, INPUT_PLANES, BOARD_SIZE, BOARD_SIZE},
         torch::kFloat32
-    ).to(device_);
+    );
+    input = use_fp16_ ? input.to(device_, torch::kHalf) : input.to(device_);
 
     torch::NoGradGuard no_grad;
     auto output = model_.forward({input}).toTuple();
-    auto policy_logits = output->elements()[0].toTensor().to(torch::kCPU);
-    auto wdl_probs = output->elements()[1].toTensor().to(torch::kCPU);
+    auto policy_logits = output->elements()[0].toTensor().to(torch::kCPU).to(torch::kFloat32);
+    auto wdl_probs = output->elements()[1].toTensor().to(torch::kCPU).to(torch::kFloat32);
 
     auto policy_acc = policy_logits.accessor<float, 2>();
     auto wdl_acc = wdl_probs.accessor<float, 2>();
@@ -180,13 +188,14 @@ std::vector<BatchResult> NeuralEvaluator::evaluate_batch_raw(
         batch_buffer_.data(),
         {batch_size, INPUT_PLANES, BOARD_SIZE, BOARD_SIZE},
         torch::kFloat32
-    ).to(device_);
+    );
+    input = use_fp16_ ? input.to(device_, torch::kHalf) : input.to(device_);
 
     // Run inference
     torch::NoGradGuard no_grad;
     auto output = model_.forward({input}).toTuple();
-    auto policy_logits = output->elements()[0].toTensor().to(torch::kCPU);  // (B, 1858)
-    auto wdl_probs = output->elements()[1].toTensor().to(torch::kCPU);      // (B, 3)
+    auto policy_logits = output->elements()[0].toTensor().to(torch::kCPU).to(torch::kFloat32);  // (B, 1858)
+    auto wdl_probs = output->elements()[1].toTensor().to(torch::kCPU).to(torch::kFloat32);      // (B, 3)
 
     auto policy_acc = policy_logits.accessor<float, 2>();
     auto wdl_acc = wdl_probs.accessor<float, 2>();

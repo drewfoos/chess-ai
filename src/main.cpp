@@ -140,7 +140,7 @@ int main(int argc, char* argv[]) {
         Position pos;
         pos.set_fen(fen);
 
-        neural::NeuralEvaluator eval(model_path, device);
+        neural::NeuralEvaluator eval(model_path, device, 2.2f, device == "cuda");
         mcts::SearchParams params;
         params.num_iterations = iterations;
         params.add_noise = false;
@@ -156,7 +156,7 @@ int main(int argc, char* argv[]) {
         std::string model_path = (argc >= 3) ? argv[2] : "";
         std::string device = (argc >= 4) ? argv[3] : "cuda";
         if (!model_path.empty()) {
-            neural::NeuralEvaluator eval(model_path, device);
+            neural::NeuralEvaluator eval(model_path, device, 2.2f, device == "cuda");
             mcts::SearchParams params;
             params.add_noise = false;
             uci::UCIHandler handler(eval, params);

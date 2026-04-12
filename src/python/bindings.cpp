@@ -79,12 +79,12 @@ void apply_config(mcts::SearchParams& params, const py::dict& config) {
 class SearchEngine {
 public:
     SearchEngine(const std::string& model_path, const std::string& device,
-                 py::dict config = py::dict()) {
+                 py::dict config = py::dict(), bool use_fp16 = false) {
         params_ = mcts::SearchParams{};
         apply_config(params_, config);
 
         evaluator_ = std::make_unique<neural::NeuralEvaluator>(
-            model_path, device, params_.policy_softmax_temp);
+            model_path, device, params_.policy_softmax_temp, use_fp16);
         search_ = std::make_unique<mcts::Search>(*evaluator_, params_);
     }
 
@@ -141,12 +141,12 @@ private:
 class PyGameManager {
 public:
     PyGameManager(const std::string& model_path, const std::string& device,
-                  py::dict config = py::dict()) {
+                  py::dict config = py::dict(), bool use_fp16 = false) {
         params_ = mcts::SearchParams{};
         apply_config(params_, config);
 
         evaluator_ = std::make_unique<neural::NeuralEvaluator>(
-            model_path, device, params_.policy_softmax_temp);
+            model_path, device, params_.policy_softmax_temp, use_fp16);
         manager_ = std::make_unique<mcts::GameManager>(*evaluator_, params_);
     }
 
@@ -220,10 +220,11 @@ PYBIND11_MODULE(chess_mcts, m) {
 
     // Expose SearchEngine
     py::class_<SearchEngine>(m, "SearchEngine")
-        .def(py::init<const std::string&, const std::string&, py::dict>(),
+        .def(py::init<const std::string&, const std::string&, py::dict, bool>(),
              py::arg("model_path"),
              py::arg("device") = "cpu",
-             py::arg("config") = py::dict())
+             py::arg("config") = py::dict(),
+             py::arg("use_fp16") = false)
         .def("search", &SearchEngine::search,
              py::arg("fen"),
              py::arg("moves") = std::vector<std::string>{},
@@ -234,10 +235,11 @@ PYBIND11_MODULE(chess_mcts, m) {
 
     // Expose GameManager for cross-game batched search
     py::class_<PyGameManager>(m, "GameManager")
-        .def(py::init<const std::string&, const std::string&, py::dict>(),
+        .def(py::init<const std::string&, const std::string&, py::dict, bool>(),
              py::arg("model_path"),
              py::arg("device") = "cpu",
-             py::arg("config") = py::dict())
+             py::arg("config") = py::dict(),
+             py::arg("use_fp16") = false)
         .def("init_games", &PyGameManager::init_games,
              py::arg("num_games"),
              py::arg("num_sims"),

@@ -464,4 +464,16 @@ TEST_F(NeuralTest, BatchEval_MatchesSingleEval) {
     }
 }
 
+TEST_F(NeuralTest, FP16FlagDisabledOnCPU) {
+    neural::NeuralEvaluator eval(TEST_MODEL, "cpu", 2.2f, true);
+    // FP16 auto-disabled on CPU — verify no crash
+    Position pos;
+    pos.set_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+    Move moves[MAX_MOVES];
+    int n = generate_legal_moves(pos, moves);
+    auto result = eval.evaluate(pos, moves, n);
+    EXPECT_GE(result.value, -1.0f);
+    EXPECT_LE(result.value, 1.0f);
+}
+
 #endif // HAS_LIBTORCH

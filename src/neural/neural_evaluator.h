@@ -27,7 +27,7 @@ struct BatchResult {
 class NeuralEvaluator : public mcts::Evaluator {
 public:
     explicit NeuralEvaluator(const std::string& model_path, const std::string& device = "cpu",
-                             float policy_softmax_temp = 2.2f);
+                             float policy_softmax_temp = 2.2f, bool use_fp16 = false);
     mcts::EvalResult evaluate(const Position& pos, const Move* moves, int num_moves) override;
 
     // Batch evaluation via Evaluator interface — single GPU forward pass
@@ -41,6 +41,7 @@ private:
     torch::jit::script::Module model_;
     torch::Device device_;
     float policy_softmax_temp_;
+    bool use_fp16_ = false;
     std::vector<float> encode_buffer_;
     std::vector<float> batch_buffer_;  // Resizable buffer for batch encoding
 };
