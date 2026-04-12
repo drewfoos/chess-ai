@@ -76,17 +76,30 @@ class CppMCTS:
         )
 
     def search(self, board: chess.Board) -> SearchResult:
-        # Push current config (temperature → not used by C++, but sims may have changed)
-        self._engine.set_config({'num_iterations': self.config.num_simulations})
+        # Only push config if sims changed (avoid unnecessary Python→C++ call)
+        if not hasattr(self, '_last_sims') or self._last_sims != self.config.num_simulations:
+            self._engine.set_config({'num_iterations': self.config.num_simulations})
+            self._last_sims = self.config.num_simulations
 
-        # Build UCI move history from board
-        history = [m.uci() for m in board.move_stack]
-
-        # Get the starting FEN (before any moves)
-        root_board = board.copy()
-        while root_board.move_stack:
-            root_board.pop()
-        fen = root_board.fen()
+        # Pass current FEN directly — no need to replay entire game history.
+        # For repetition detection, pass last 8 positions as history.
+        fen = board.fen()
+        history = []
+        if len(board.move_stack) > 0:
+            # Build short history for repetition detection (last 8 moves)
+            temp = board.copy()
+            recent_fens = []
+            for _ in range(min(8, len(temp.move_stack))):
+                temp.pop()
+                recent_fens.append(temp.fen())
+            # Start from oldest, replay forward
+            if recent_fens:
+                oldest_fen = recent_fens[-1]
+                # Replay moves from oldest to current
+                temp2 = chess.Board(oldest_fen)
+                moves_to_replay = list(board.move_stack)[-len(recent_fens):]
+                fen = oldest_fen
+                history = [m.uci() for m in moves_to_replay]
 
         cpp_result = self._engine.search(fen, history)
 
@@ -444,7 +457,7 @@ def generate_games(
         from concurrent.futures import ThreadPoolExecutor, as_completed
         import threading
 
-        num_workers = min(4, num_games)  # 4 concurrent games
+        num_workers = 1  # Single worker: multiple models thrash GPU memory
         completed = 0
         lock = threading.Lock()
 

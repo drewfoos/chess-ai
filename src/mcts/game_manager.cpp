@@ -352,7 +352,9 @@ bool GameManager::gather_leaf_from_game(int game_idx, std::vector<PendingLeaf>& 
     std::vector<uint64_t> path_hashes;
     std::vector<Node*> path_nodes;
 
-    path_hashes.push_back(neural::PositionHistory::compute_hash(game.history.current()));
+    // Maintain running position instead of replaying from root each level
+    Position current_pos = game.history.current();
+    path_hashes.push_back(neural::PositionHistory::compute_hash(current_pos));
 
     while (!node->is_leaf()) {
         bool is_root = (node->parent() == nullptr);
@@ -362,11 +364,12 @@ bool GameManager::gather_leaf_from_game(int game_idx, std::vector<PendingLeaf>& 
         child->apply_virtual_loss();
         path_nodes.push_back(child);
 
-        // Two-fold repetition check
+        // Advance position incrementally
+        UndoInfo undo;
+        current_pos.make_move(child->move(), undo);
+
         if (params_.two_fold_draw) {
-            Position child_pos;
-            replay_moves(game.history.current(), path_moves, child_pos);
-            uint64_t child_hash = neural::PositionHistory::compute_hash(child_pos);
+            uint64_t child_hash = neural::PositionHistory::compute_hash(current_pos);
 
             if (is_two_fold_repetition(child_hash, path_hashes, game.history)) {
                 revert_virtual_loss_path(path_nodes);
@@ -382,9 +385,7 @@ bool GameManager::gather_leaf_from_game(int game_idx, std::vector<PendingLeaf>& 
         node = child;
     }
 
-    // node is a leaf
-    Position leaf_pos;
-    replay_moves(game.history.current(), path_moves, leaf_pos);
+    // current_pos is already the leaf position
 
     // Already-visited terminal
     if (node->visit_count() > 0 && node->terminal_status() != 0) {
@@ -397,14 +398,14 @@ bool GameManager::gather_leaf_from_game(int game_idx, std::vector<PendingLeaf>& 
     }
 
     // NN cache check
-    uint64_t pos_hash = neural::PositionHistory::compute_hash(leaf_pos);
+    uint64_t pos_hash = neural::PositionHistory::compute_hash(current_pos);
     const CacheEntry* cached = cache_.get(pos_hash);
     if (cached) {
         EvalResult eval_result;
         eval_result.policy = cached->policy;
         eval_result.value = cached->value;
 
-        expand_node(node, leaf_pos, eval_result);
+        expand_node(node, current_pos, eval_result);
 
         if (node->is_leaf()) {
             float value = 0.0f;
@@ -425,7 +426,7 @@ bool GameManager::gather_leaf_from_game(int game_idx, std::vector<PendingLeaf>& 
     PendingLeaf pl;
     pl.game_idx = game_idx;
     pl.leaf = node;
-    pl.position = leaf_pos;
+    pl.position = current_pos;
     pl.path_nodes = std::move(path_nodes);
     batch.push_back(std::move(pl));
     return true;
