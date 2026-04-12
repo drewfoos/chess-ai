@@ -52,8 +52,13 @@ class MetricsLogger:
         training: TrainingMetrics,
         duration_s: float,
         network: dict | None = None,
+        resumed: bool = False,
     ):
-        """Save generation metrics to JSON and update summary."""
+        """Save generation metrics to JSON and update summary.
+
+        `resumed` marks the first generation after a training restart so the
+        dashboard can annotate the loss chart with a vertical line.
+        """
         gen_data = {
             'generation': generation,
             'num_positions': num_positions,
@@ -64,6 +69,8 @@ class MetricsLogger:
         }
         if network is not None:
             gen_data['network'] = network
+        if resumed:
+            gen_data['resumed'] = True
 
         gen_path = os.path.join(self.metrics_dir, f'gen_{generation:03d}.json')
         with open(gen_path, 'w') as f:
@@ -88,6 +95,7 @@ class MetricsLogger:
             'training': gen_data['training'],
             'duration_s': gen_data['duration_s'],
             'network': gen_data.get('network'),
+            'resumed': gen_data.get('resumed', False),
             'avg_game_length': (
                 sum(g['num_moves'] for g in gen_data['games']) / max(len(gen_data['games']), 1)
             ),

@@ -1147,6 +1147,9 @@ def training_loop(
           f"{', adaptive' if adaptive.enabled else ''}"
           f"{f', tiered schedule={network_schedule}' if network_schedule else ''}")
 
+    # Used to mark the first gen after a resume on the dashboard's loss chart.
+    first_gen_after_resume = start_gen if resume_from else None
+
     for gen in range(start_gen, end_gen + 1):
         gen_start = time.time()
 
@@ -1294,6 +1297,7 @@ def training_loop(
             training=training_metrics,
             duration_s=gen_time,
             network={'blocks': config.num_blocks, 'filters': config.num_filters},
+            resumed=(gen == first_gen_after_resume),
         )
 
     # Export final TorchScript model

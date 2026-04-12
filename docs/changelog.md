@@ -12,6 +12,11 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 - `training_loop()` now persists `network_schedule` in each checkpoint dict; on resume (including auto-resume) the schedule is restored from the checkpoint if the caller didn't pass one — prevents silently dropping the scale-up plan on restart
 - New `--network-schedule "1:6:64,20:10:128"` CLI flag for `python -m training loop` (parses comma-separated `gen_start:blocks:filters` tiers)
 
+### Added — Loss Chart Event Markers
+- Dashboard loss chart now draws dashed vertical lines at tier transitions (architecture size change between consecutive gens) and at the first generation after a resume
+- `MetricsLogger.save_generation(resumed=True)` tags a gen as post-resume; `training_loop()` passes `resumed=(gen == first_gen_after_resume)` so the first gen after `--resume-from` gets marked once
+- Implemented via a small Chart.js plugin (`eventMarkersPlugin`) that reads `chart.$eventMarkers`, computed from the gens array during the dashboard's refresh tick
+
 ### Fixed — Resume Preserves Run Configuration
 - Tier transitions now run a warm-up training pass on the existing sliding window before self-play, so the freshly-built (randomly-initialized) larger net isn't used to generate a generation's worth of noise games
 - Checkpoints now persist a `run_params` dict (games/gen, batch size, LR, window size, sims, max moves, parallel games, train epochs, syzygy/opening book paths, adaptive config, use_trt, etc.)

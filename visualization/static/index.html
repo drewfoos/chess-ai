@@ -361,9 +361,39 @@
 Chart.defaults.color = '#8888a0';
 Chart.defaults.borderColor = '#2a2a4a';
 
+// Plugin: draws vertical lines at tier transitions / resume points.
+// Reads marker list from chart.$eventMarkers (set by refresh()).
+const eventMarkersPlugin = {
+    id: 'eventMarkers',
+    afterDatasetsDraw(chart) {
+        const markers = chart.$eventMarkers || [];
+        if (!markers.length) return;
+        const {ctx, chartArea: {top, bottom}, scales: {x}} = chart;
+        ctx.save();
+        ctx.setLineDash([4, 4]);
+        ctx.lineWidth = 1.5;
+        markers.forEach(function(m) {
+            const px = x.getPixelForValue(m.index);
+            ctx.strokeStyle = m.color;
+            ctx.beginPath();
+            ctx.moveTo(px, top);
+            ctx.lineTo(px, bottom);
+            ctx.stroke();
+            ctx.setLineDash([]);
+            ctx.fillStyle = m.color;
+            ctx.font = '10px system-ui, sans-serif';
+            ctx.textAlign = 'center';
+            ctx.fillText(m.label, px, top + 12);
+            ctx.setLineDash([4, 4]);
+        });
+        ctx.restore();
+    }
+};
+
 const lossCtx = document.getElementById('lossChart').getContext('2d');
 const lossChart = new Chart(lossCtx, {
     type: 'line',
+    plugins: [eventMarkersPlugin],
     data: {
         labels: [],
         datasets: [
@@ -619,6 +649,28 @@ function updateDashboard(data) {
     lossChart.data.datasets[0].data = gens.map(function(g) { return g.training.total_loss; });
     lossChart.data.datasets[1].data = gens.map(function(g) { return g.training.policy_loss; });
     lossChart.data.datasets[2].data = gens.map(function(g) { return g.training.value_loss; });
+
+    // Event markers: tier transitions (network size changed from prior gen)
+    // and resumes (first gen after a --resume-from). Drawn as dashed vertical
+    // lines on the loss chart by the eventMarkersPlugin.
+    var markers = [];
+    gens.forEach(function(g, i) {
+        var prev = i > 0 ? gens[i - 1] : null;
+        if (prev && prev.network && g.network &&
+            (prev.network.blocks !== g.network.blocks ||
+             prev.network.filters !== g.network.filters)) {
+            markers.push({
+                index: i,
+                color: '#f4c430',
+                label: prev.network.blocks + 'b' + prev.network.filters +
+                       ' \u2192 ' + g.network.blocks + 'b' + g.network.filters
+            });
+        }
+        if (g.resumed) {
+            markers.push({index: i, color: '#b084ff', label: 'Resume'});
+        }
+    });
+    lossChart.$eventMarkers = markers;
     lossChart.update();
 
     // Results chart
