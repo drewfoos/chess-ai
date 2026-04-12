@@ -43,7 +43,7 @@ if(BUILD_TESTS)
     )
     target_link_libraries(chess_tests PRIVATE chess_core GTest::gtest_main)
     include(GoogleTest)
-    gtest_discover_tests(chess_tests)
+    gtest_discover_tests(chess_tests WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 endif()
 
 # Neural network support (optional — requires LibTorch)

@@ -251,3 +251,77 @@ TEST_F(NeuralTest, Encoder_RepetitionPlaneZero) {
     for (int i = 0; i < 64; i++)
         EXPECT_FLOAT_EQ(buf[12 * 64 + i], 0.0f);
 }
+
+#ifdef HAS_LIBTORCH
+#include "neural/neural_evaluator.h"
+
+// Test model path — generate with:
+// python -c "from training.export import export_torchscript; from training.model import ChessNetwork; from training.config import NetworkConfig; import os; os.makedirs('tests/fixtures', exist_ok=True); c=NetworkConfig(num_blocks=1, num_filters=16); m=ChessNetwork(c); export_torchscript(m, 'tests/fixtures/test_model.pt')"
+static const char* TEST_MODEL = "tests/fixtures/test_model.pt";
+
+TEST_F(NeuralTest, NeuralEval_LoadModel) {
+    ASSERT_NO_THROW(neural::NeuralEvaluator eval(TEST_MODEL, "cpu"));
+}
+
+TEST_F(NeuralTest, NeuralEval_StartingPosition) {
+    neural::NeuralEvaluator eval(TEST_MODEL, "cpu");
+    Position pos;
+    pos.set_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+    Move moves[MAX_MOVES];
+    int n = generate_legal_moves(pos, moves);
+    ASSERT_EQ(n, 20);
+
+    auto result = eval.evaluate(pos, moves, n);
+    EXPECT_EQ(result.policy.size(), 20u);
+    EXPECT_GE(result.value, -1.0f);
+    EXPECT_LE(result.value, 1.0f);
+}
+
+TEST_F(NeuralTest, NeuralEval_PolicySumsToOne) {
+    neural::NeuralEvaluator eval(TEST_MODEL, "cpu");
+    Position pos;
+    pos.set_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+    Move moves[MAX_MOVES];
+    int n = generate_legal_moves(pos, moves);
+    auto result = eval.evaluate(pos, moves, n);
+
+    float sum = 0;
+    for (float p : result.policy) {
+        EXPECT_GT(p, 0.0f);
+        sum += p;
+    }
+    EXPECT_NEAR(sum, 1.0f, 1e-5f);
+}
+
+TEST_F(NeuralTest, NeuralEval_Checkmate) {
+    neural::NeuralEvaluator eval(TEST_MODEL, "cpu");
+    Position pos;
+    pos.set_fen("rnb1kbnr/pppp1ppp/8/4p3/6Pq/5P2/PPPPP2P/RNBQKBNR w KQkq - 1 3");
+    Move moves[MAX_MOVES];
+    int n = generate_legal_moves(pos, moves);
+    ASSERT_EQ(n, 0);
+
+    auto result = eval.evaluate(pos, moves, n);
+    EXPECT_TRUE(result.policy.empty());
+    EXPECT_FLOAT_EQ(result.value, -1.0f);
+}
+
+TEST_F(NeuralTest, NeuralEval_DifferentPositions) {
+    neural::NeuralEvaluator eval(TEST_MODEL, "cpu");
+
+    Position pos1;
+    pos1.set_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+    Move moves1[MAX_MOVES];
+    int n1 = generate_legal_moves(pos1, moves1);
+    auto r1 = eval.evaluate(pos1, moves1, n1);
+
+    Position pos2;
+    pos2.set_fen("r1bqkbnr/pppppppp/2n5/8/4P3/8/PPPP1PPP/RNBQKBNR w KQkq - 1 2");
+    Move moves2[MAX_MOVES];
+    int n2 = generate_legal_moves(pos2, moves2);
+    auto r2 = eval.evaluate(pos2, moves2, n2);
+
+    EXPECT_NE(r1.value, r2.value);
+}
+
+#endif // HAS_LIBTORCH
