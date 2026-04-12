@@ -27,7 +27,8 @@ struct BatchResult {
 class NeuralEvaluator : public mcts::Evaluator {
 public:
     explicit NeuralEvaluator(const std::string& model_path, const std::string& device = "cpu",
-                             float policy_softmax_temp = 2.2f, bool use_fp16 = false);
+                             float policy_softmax_temp = 2.2f, bool use_fp16 = false,
+                             int max_batch_size = 256);
     mcts::EvalResult evaluate(const Position& pos, const Move* moves, int num_moves) override;
 
     // Batch evaluation via Evaluator interface — single GPU forward pass
@@ -42,6 +43,8 @@ private:
     torch::Device device_;
     float policy_softmax_temp_;
     bool use_fp16_ = false;
+    int max_batch_size_ = 256;
+    torch::Tensor input_pinned_;  // Pinned memory buffer (only on CUDA)
     std::vector<float> encode_buffer_;
     std::vector<float> batch_buffer_;  // Resizable buffer for batch encoding
 };

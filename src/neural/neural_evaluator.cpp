@@ -11,7 +11,7 @@
 namespace neural {
 
 NeuralEvaluator::NeuralEvaluator(const std::string& model_path, const std::string& device,
-                                 float policy_softmax_temp, bool use_fp16)
+                                 float policy_softmax_temp, bool use_fp16, int max_batch_size)
     : device_(device == "cuda" && torch::cuda::is_available() ? torch::kCUDA : torch::kCPU)
     , policy_softmax_temp_(policy_softmax_temp)
     , encode_buffer_(TENSOR_SIZE)
@@ -29,6 +29,11 @@ NeuralEvaluator::NeuralEvaluator(const std::string& model_path, const std::strin
         model_.to(torch::kHalf);
     } else {
         use_fp16_ = false;  // FP16 only on CUDA
+    }
+    max_batch_size_ = max_batch_size;
+    if (device_ == torch::kCUDA) {
+        auto opts = torch::TensorOptions().dtype(torch::kFloat32).pinned_memory(true);
+        input_pinned_ = torch::empty({max_batch_size_, INPUT_PLANES, BOARD_SIZE, BOARD_SIZE}, opts);
     }
 }
 
@@ -113,12 +118,23 @@ std::vector<mcts::EvalResult> NeuralEvaluator::evaluate_batch(
     }
 
     // Single GPU forward pass
-    auto input = torch::from_blob(
-        batch_buffer_.data(),
-        {batch_size, INPUT_PLANES, BOARD_SIZE, BOARD_SIZE},
-        torch::kFloat32
-    );
-    input = use_fp16_ ? input.to(device_, torch::kHalf) : input.to(device_);
+    torch::Tensor input;
+    if (input_pinned_.defined() && batch_size <= max_batch_size_) {
+        auto pinned_slice = input_pinned_.slice(0, 0, batch_size);
+        std::memcpy(pinned_slice.data_ptr<float>(), batch_buffer_.data(),
+                    batch_size * TENSOR_SIZE * sizeof(float));
+        input = use_fp16_
+            ? pinned_slice.to(device_, torch::kHalf, /*non_blocking=*/true)
+            : pinned_slice.to(device_, /*non_blocking=*/true);
+    } else {
+        // Fallback for CPU or oversized batches
+        auto raw = torch::from_blob(
+            batch_buffer_.data(),
+            {batch_size, INPUT_PLANES, BOARD_SIZE, BOARD_SIZE},
+            torch::kFloat32
+        );
+        input = use_fp16_ ? raw.to(device_, torch::kHalf) : raw.to(device_);
+    }
 
     torch::NoGradGuard no_grad;
     auto output = model_.forward({input}).toTuple();
@@ -183,13 +199,23 @@ std::vector<BatchResult> NeuralEvaluator::evaluate_batch_raw(
     }
 
     // Create batch input tensor and transfer to device
-    // batch_buffer_ is a class member that outlives this call, so from_blob is safe
-    auto input = torch::from_blob(
-        batch_buffer_.data(),
-        {batch_size, INPUT_PLANES, BOARD_SIZE, BOARD_SIZE},
-        torch::kFloat32
-    );
-    input = use_fp16_ ? input.to(device_, torch::kHalf) : input.to(device_);
+    torch::Tensor input;
+    if (input_pinned_.defined() && batch_size <= max_batch_size_) {
+        auto pinned_slice = input_pinned_.slice(0, 0, batch_size);
+        std::memcpy(pinned_slice.data_ptr<float>(), batch_buffer_.data(),
+                    batch_size * TENSOR_SIZE * sizeof(float));
+        input = use_fp16_
+            ? pinned_slice.to(device_, torch::kHalf, /*non_blocking=*/true)
+            : pinned_slice.to(device_, /*non_blocking=*/true);
+    } else {
+        // Fallback for CPU or oversized batches
+        auto raw = torch::from_blob(
+            batch_buffer_.data(),
+            {batch_size, INPUT_PLANES, BOARD_SIZE, BOARD_SIZE},
+            torch::kFloat32
+        );
+        input = use_fp16_ ? raw.to(device_, torch::kHalf) : raw.to(device_);
+    }
 
     // Run inference
     torch::NoGradGuard no_grad;
