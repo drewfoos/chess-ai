@@ -123,6 +123,39 @@ class SelfPlayConfig:
 
 
 @dataclass
+class AdaptiveConfig:
+    """Auto-tune sims/max_moves/games per generation for faster early training."""
+    enabled: bool = True
+    early_until: int = 5       # Generations 1..early_until use early settings
+    mid_until: int = 15        # Generations (early_until+1)..mid_until interpolate
+    early_sims: int = 100
+    mid_sims: int = 200
+    full_sims: int = 400
+    early_max_moves: int = 150
+    mid_max_moves: int = 300
+    full_max_moves: int = 512
+    early_games: int = 200
+    mid_games: int = 100
+    full_games: int = 50
+
+
+def get_gen_settings(gen: int, adaptive: AdaptiveConfig) -> tuple[int, int, int]:
+    """Returns (simulations, max_moves, games_per_gen) for this generation."""
+    if not adaptive.enabled:
+        return adaptive.full_sims, adaptive.full_max_moves, adaptive.full_games
+    if gen <= adaptive.early_until:
+        return adaptive.early_sims, adaptive.early_max_moves, adaptive.early_games
+    elif gen <= adaptive.mid_until:
+        t = (gen - adaptive.early_until) / (adaptive.mid_until - adaptive.early_until)
+        sims = int(adaptive.early_sims + t * (adaptive.mid_sims - adaptive.early_sims))
+        moves = int(adaptive.early_max_moves + t * (adaptive.mid_max_moves - adaptive.early_max_moves))
+        games = int(adaptive.early_games + t * (adaptive.mid_games - adaptive.early_games))
+        return sims, moves, games
+    else:
+        return adaptive.full_sims, adaptive.full_max_moves, adaptive.full_games
+
+
+@dataclass
 class GameRecord:
     planes: list[np.ndarray] = field(default_factory=list)
     policies: list[np.ndarray] = field(default_factory=list)
@@ -461,6 +494,7 @@ def training_loop(
     resign_threshold: float = -0.95,
     use_swa: bool = True,
     syzygy_path: str | None = None,
+    adaptive: AdaptiveConfig | None = None,
 ):
     """Full reinforcement learning training loop.
 
@@ -503,14 +537,27 @@ def training_loop(
     mcts_config = MCTSConfig(num_simulations=num_simulations)
     selfplay_config = SelfPlayConfig(max_moves=max_moves, resign_threshold=resign_threshold, syzygy_path=syzygy_path)
 
+    # Default adaptive config if not provided
+    if adaptive is None:
+        adaptive = AdaptiveConfig(enabled=False, full_sims=num_simulations,
+                                   full_max_moves=max_moves, full_games=games_per_gen)
+
     print(f"Starting training loop: {generations} generations, {games_per_gen} games/gen")
     print(f"Device: {device}, Model: {blocks} blocks, {filters} filters"
-          f"{', SWA enabled' if use_swa else ''}")
+          f"{', SWA enabled' if use_swa else ''}"
+          f"{', adaptive' if adaptive.enabled else ''}")
 
     for gen in range(1, generations + 1):
         gen_start = time.time()
+
+        # Adaptive settings: adjust sims/max_moves/games per generation
+        gen_sims, gen_max_moves, gen_games = get_gen_settings(gen, adaptive)
+        mcts_config.num_simulations = gen_sims
+        selfplay_config.max_moves = gen_max_moves
+
         print(f"\n{'='*60}")
-        print(f"Generation {gen}/{generations}")
+        print(f"Generation {gen}/{generations}"
+              f" (sims={gen_sims}, max_moves={gen_max_moves}, games={gen_games})")
         print(f"{'='*60}")
 
         # 1. Generate self-play games (use SWA model if available)
@@ -536,7 +583,7 @@ def training_loop(
                 export_torchscript(model, cpp_model_path, device=device)
 
         num_positions = generate_games(
-            play_model, games_per_gen, data_path,
+            play_model, gen_games, data_path,
             mcts_config=mcts_config,
             selfplay_config=selfplay_config,
             device=device,
@@ -672,6 +719,11 @@ def main():
     loop_parser.add_argument('--device', type=str, default='auto')
     loop_parser.add_argument('--max-moves', type=int, default=512)
     loop_parser.add_argument('--syzygy', type=str, default=None, help='Path to Syzygy tablebase files')
+    loop_parser.add_argument('--adaptive', action='store_true', default=False, help='Enable adaptive settings per generation')
+    loop_parser.add_argument('--no-adaptive', dest='adaptive', action='store_false')
+    loop_parser.add_argument('--early-sims', type=int, default=100, help='Simulations for early generations')
+    loop_parser.add_argument('--early-max-moves', type=int, default=150, help='Max moves for early generations')
+    loop_parser.add_argument('--early-games', type=int, default=200, help='Games per early generation')
 
     args = parser.parse_args()
 
@@ -701,6 +753,17 @@ def main():
         )
 
     elif args.command == 'loop':
+        adaptive_config = None
+        if getattr(args, 'adaptive', False):
+            adaptive_config = AdaptiveConfig(
+                enabled=True,
+                early_sims=getattr(args, 'early_sims', 100),
+                early_max_moves=getattr(args, 'early_max_moves', 150),
+                early_games=getattr(args, 'early_games', 200),
+                full_sims=args.simulations,
+                full_max_moves=args.max_moves,
+                full_games=args.games_per_gen,
+            )
         training_loop(
             generations=args.generations,
             games_per_gen=args.games_per_gen,
@@ -715,6 +778,7 @@ def main():
             device=args.device,
             max_moves=args.max_moves,
             syzygy_path=getattr(args, 'syzygy', None),
+            adaptive=adaptive_config,
         )
 
 

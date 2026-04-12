@@ -2003,3 +2003,72 @@ class TestCppMCTS:
             result = manager.get_result(i)
             assert result.best_move
             assert result.total_nodes > 0
+
+
+# ── Adaptive Early-Gen Settings ────────────────────────────────────────────
+
+class TestAdaptiveConfig:
+    """Tests for AdaptiveConfig and get_gen_settings."""
+
+    def test_early_gen_returns_early_settings(self):
+        from training.selfplay import AdaptiveConfig, get_gen_settings
+
+        cfg = AdaptiveConfig()
+        for gen in [1, 3, 5]:
+            sims, moves, games = get_gen_settings(gen, cfg)
+            assert sims == cfg.early_sims == 100
+            assert moves == cfg.early_max_moves == 150
+            assert games == cfg.early_games == 200
+
+    def test_mid_gen_returns_interpolated_settings(self):
+        from training.selfplay import AdaptiveConfig, get_gen_settings
+
+        cfg = AdaptiveConfig()
+        sims, moves, games = get_gen_settings(10, cfg)
+        # gen=10: t = (10-5)/(15-5) = 0.5
+        assert sims == int(100 + 0.5 * (200 - 100))  # 150
+        assert moves == int(150 + 0.5 * (300 - 150))  # 225
+        assert games == int(200 + 0.5 * (100 - 200))  # 150
+
+    def test_full_gen_returns_full_settings(self):
+        from training.selfplay import AdaptiveConfig, get_gen_settings
+
+        cfg = AdaptiveConfig()
+        for gen in [16, 20, 100]:
+            sims, moves, games = get_gen_settings(gen, cfg)
+            assert sims == cfg.full_sims == 400
+            assert moves == cfg.full_max_moves == 512
+            assert games == cfg.full_games == 50
+
+    def test_disabled_returns_full_settings(self):
+        from training.selfplay import AdaptiveConfig, get_gen_settings
+
+        cfg = AdaptiveConfig(enabled=False)
+        sims, moves, games = get_gen_settings(1, cfg)
+        assert sims == cfg.full_sims
+        assert moves == cfg.full_max_moves
+        assert games == cfg.full_games
+
+    def test_boundary_gen_early_until(self):
+        from training.selfplay import AdaptiveConfig, get_gen_settings
+
+        cfg = AdaptiveConfig()
+        # gen=5 is last early gen
+        sims5, _, _ = get_gen_settings(5, cfg)
+        assert sims5 == cfg.early_sims
+        # gen=6 starts interpolation
+        sims6, _, _ = get_gen_settings(6, cfg)
+        assert sims6 > cfg.early_sims
+
+    def test_boundary_gen_mid_until(self):
+        from training.selfplay import AdaptiveConfig, get_gen_settings
+
+        cfg = AdaptiveConfig()
+        # gen=15 is last mid gen (t=1.0 → mid settings)
+        sims15, moves15, games15 = get_gen_settings(15, cfg)
+        assert sims15 == cfg.mid_sims
+        assert moves15 == cfg.mid_max_moves
+        assert games15 == cfg.mid_games
+        # gen=16 is full
+        sims16, _, _ = get_gen_settings(16, cfg)
+        assert sims16 == cfg.full_sims

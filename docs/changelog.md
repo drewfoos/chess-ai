@@ -8,6 +8,30 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 
 ## [Unreleased]
 
+### Added — Multi-Game Parallelism (GameManager)
+- `GameManager` C++ class: runs N concurrent MCTS games with cross-game NN batching
+- Single GPU forward pass collects leaves from all active games (e.g., 4 per game × 16 games = 64 batch)
+- `init_games()` / `init_games_from_fen()` for starting from default or custom positions
+- `step()` method: one round of gather/evaluate/scatter across all active games
+- Exposed via pybind11 as `chess_mcts.GameManager` with Python-friendly API
+- 4 new C++ MCTS integration tests for GameManager
+
+### Added — Adaptive Early-Gen Settings
+- `AdaptiveConfig` dataclass: per-generation auto-tuning of sims/max_moves/games
+- 3-phase schedule: early (gen≤5, 100 sims), mid (gen 6-15, interpolated), full (gen>15, 400 sims)
+- `get_gen_settings()` function returns settings for any generation number
+- CLI flags: `--adaptive`/`--no-adaptive`, `--early-sims`, `--early-max-moves`, `--early-games`
+- Integrated into training loop: each generation uses phase-appropriate settings
+- 6 new Python tests for adaptive config (early, mid interpolation, full, disabled, boundaries)
+
+### Added — C++ MCTS Python Integration
+- `CppMCTS` wrapper class in selfplay.py matching Python MCTS API for transparent fallback
+- `_CppMCTSConfig` proxy for mutable temperature/num_simulations
+- `HAS_CPP_MCTS` flag: auto-detects C++ module, falls back to Python MCTS
+- Training loop exports TorchScript model for C++ engine when available
+- SWA model export fix: copies SWA parameters into base model for TorchScript export
+- 4 new integration tests (C++ search, play game, parallel games, FEN init)
+
 ### Added — Python Bindings (pybind11)
 - `chess_mcts` Python module exposing C++ MCTS search engine via pybind11
 - `SearchEngine` class: loads TorchScript model, runs MCTS search from FEN + move history
