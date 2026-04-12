@@ -4,142 +4,385 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Chess AI Training Dashboard</title>
+    <script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
     <link rel="stylesheet"
           href="https://unpkg.com/@chrisoakman/chessboardjs@1.0.0/dist/chessboard-1.0.0.min.css">
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/chess.js/0.10.3/chess.min.js"></script>
     <script src="https://unpkg.com/@chrisoakman/chessboardjs@1.0.0/dist/chessboard-1.0.0.min.js"></script>
     <style>
-        * { box-sizing: border-box; margin: 0; padding: 0; }
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            background: #1a1a2e; color: #e0e0e0; padding: 20px;
+        :root {
+            --bg-primary: #0f0f1a;
+            --bg-card: #161627;
+            --bg-card-hover: #1a1a30;
+            --border: #2a2a4a;
+            --border-accent: #3a3a6a;
+            --accent: #6c63ff;
+            --accent-light: #8b83ff;
+            --accent-glow: rgba(108, 99, 255, 0.15);
+            --text: #e8e8f0;
+            --text-muted: #8888a0;
+            --text-dim: #555570;
+            --success: #4ecdc4;
+            --danger: #ff6b6b;
+            --warning: #ffd93d;
         }
-        h1 { text-align: center; margin-bottom: 20px; color: #00d4ff; }
+
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+
+        body {
+            font-family: 'Segoe UI', -apple-system, BlinkMacSystemFont, Roboto, sans-serif;
+            background: var(--bg-primary); color: var(--text);
+            min-height: 100vh;
+        }
+
+        /* Header */
+        .header {
+            text-align: center;
+            padding: 32px 20px 24px;
+            background: linear-gradient(180deg, rgba(108, 99, 255, 0.08) 0%, transparent 100%);
+            border-bottom: 1px solid var(--border);
+            margin-bottom: 24px;
+        }
+        .header h1 {
+            font-size: 1.75em;
+            font-weight: 700;
+            color: var(--text);
+            letter-spacing: -0.02em;
+        }
+        .header h1 span { color: var(--accent); }
+        .header .subtitle {
+            font-size: 0.85em;
+            color: var(--text-muted);
+            margin-top: 6px;
+        }
+
+        /* Layout */
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 0 24px 40px;
+        }
         .grid {
             display: grid;
             grid-template-columns: 1fr 1fr;
             gap: 20px;
-            max-width: 1400px;
-            margin: 0 auto;
+            overflow: hidden;
         }
-        .card {
-            background: #16213e; border-radius: 12px; padding: 20px;
-            border: 1px solid #0f3460;
-        }
-        .card h2 { margin-bottom: 12px; color: #00d4ff; font-size: 1.1em; }
+        .full-width { grid-column: 1 / -1; }
+
+        /* Stats Row */
         .stats-row {
-            display: flex; gap: 20px; flex-wrap: wrap;
+            display: grid;
+            grid-template-columns: repeat(5, 1fr);
+            gap: 16px;
             grid-column: 1 / -1;
+            margin-bottom: 4px;
         }
         .stat-box {
-            background: #16213e; border-radius: 12px; padding: 16px 24px;
-            border: 1px solid #0f3460; flex: 1; min-width: 150px;
+            background: var(--bg-card);
+            border-radius: 12px;
+            padding: 20px;
+            border: 1px solid var(--border);
+            text-align: center;
+            position: relative;
+            overflow: hidden;
+            transition: border-color 0.2s, transform 0.2s;
+        }
+        .stat-box:hover {
+            border-color: var(--border-accent);
+            transform: translateY(-1px);
+        }
+        .stat-box::before {
+            content: '';
+            position: absolute;
+            top: 0; left: 0; right: 0;
+            height: 3px;
+            background: var(--accent);
+            opacity: 0.6;
+        }
+        .stat-box .label {
+            font-size: 0.75em;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            color: var(--text-muted);
+            margin-bottom: 8px;
+        }
+        .stat-box .value {
+            font-size: 1.8em;
+            font-weight: 700;
+            color: var(--text);
+            line-height: 1.1;
+        }
+        .stat-box .unit {
+            font-size: 0.7em;
+            color: var(--text-dim);
+            margin-top: 4px;
+        }
+
+        /* Cards */
+        .card {
+            background: var(--bg-card);
+            border-radius: 12px;
+            padding: 24px;
+            border: 1px solid var(--border);
+            transition: border-color 0.2s;
+        }
+        .card:hover { border-color: var(--border-accent); }
+        .card h2 {
+            font-size: 0.85em;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            color: var(--text-muted);
+            margin-bottom: 16px;
+            padding-bottom: 12px;
+            border-bottom: 1px solid var(--border);
+        }
+
+        /* Charts */
+        .chart-container { position: relative; height: 280px; }
+
+        /* Board */
+        #board-container {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 16px;
+            overflow: hidden;
+        }
+        #board { width: min(340px, 100%); }
+
+        .replay-controls {
+            display: flex;
+            gap: 6px;
+            align-items: center;
+            flex-wrap: wrap;
+            justify-content: center;
+        }
+        .replay-controls select {
+            background: var(--bg-primary);
+            color: var(--text);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 8px 12px;
+            font-size: 0.8em;
+            cursor: pointer;
+            max-width: 180px;
+            transition: border-color 0.2s;
+        }
+        .replay-controls select:hover { border-color: var(--accent); }
+        .replay-controls select:focus { outline: none; border-color: var(--accent); }
+
+        .btn-group {
+            display: flex;
+            gap: 2px;
+            background: var(--bg-primary);
+            border-radius: 8px;
+            padding: 2px;
+            border: 1px solid var(--border);
+        }
+        .btn-group button {
+            background: transparent;
+            color: var(--text-muted);
+            border: none;
+            border-radius: 6px;
+            padding: 6px 12px;
+            cursor: pointer;
+            font-size: 0.85em;
+            font-weight: 500;
+            transition: all 0.15s;
+        }
+        .btn-group button:hover {
+            background: var(--accent-glow);
+            color: var(--accent-light);
+        }
+        .btn-group button:active,
+        .btn-group button.active {
+            background: var(--accent);
+            color: white;
+        }
+
+        .game-info {
+            font-size: 0.8em;
+            color: var(--text-muted);
+            text-align: center;
+            padding: 8px 16px;
+            background: var(--bg-primary);
+            border-radius: 8px;
+            border: 1px solid var(--border);
+            min-width: 200px;
+        }
+
+        /* Move counter */
+        .move-counter {
+            font-size: 0.75em;
+            color: var(--text-dim);
             text-align: center;
         }
-        .stat-box .label { font-size: 0.85em; color: #888; }
-        .stat-box .value { font-size: 1.8em; font-weight: bold; color: #00d4ff; }
-        .chart-container { position: relative; height: 300px; }
-        #board-container { display: flex; flex-direction: column; align-items: center; }
-        #board { width: 360px; }
-        .replay-controls {
-            margin-top: 12px; display: flex; gap: 8px; align-items: center;
+
+        /* Footer status */
+        .status-bar {
+            text-align: center;
+            grid-column: 1 / -1;
+            font-size: 0.75em;
+            color: var(--text-dim);
+            padding-top: 8px;
         }
-        .replay-controls button {
-            background: #0f3460; color: #e0e0e0; border: 1px solid #00d4ff;
-            border-radius: 6px; padding: 6px 14px; cursor: pointer; font-size: 0.9em;
+        .status-bar .dot {
+            display: inline-block;
+            width: 6px; height: 6px;
+            border-radius: 50%;
+            background: var(--success);
+            margin-right: 6px;
+            vertical-align: middle;
+            animation: pulse 2s infinite;
         }
-        .replay-controls button:hover { background: #00d4ff; color: #1a1a2e; }
-        .replay-controls select {
-            background: #0f3460; color: #e0e0e0; border: 1px solid #00d4ff;
-            border-radius: 6px; padding: 6px 10px; font-size: 0.9em;
+        .status-bar .dot.error { background: var(--danger); animation: none; }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.4; }
         }
-        .game-info { margin-top: 8px; font-size: 0.9em; color: #888; }
-        .status { text-align: center; grid-column: 1 / -1; font-size: 0.85em; color: #666; }
+
+        /* Responsive */
+        @media (max-width: 900px) {
+            .grid { grid-template-columns: 1fr; }
+            .stats-row { grid-template-columns: repeat(3, 1fr); }
+            #board { width: 300px; }
+        }
+        @media (max-width: 600px) {
+            .stats-row { grid-template-columns: repeat(2, 1fr); }
+            .header h1 { font-size: 1.3em; }
+        }
     </style>
 </head>
 <body>
-    <h1>Chess AI Training Dashboard</h1>
+    <div class="header">
+        <h1><span>Chess AI</span> Training Dashboard</h1>
+        <div class="subtitle">AlphaZero-style self-play reinforcement learning</div>
+    </div>
 
-    <div class="grid">
-        <div class="stats-row">
-            <div class="stat-box">
-                <div class="label">Generations</div>
-                <div class="value" id="stat-generations">-</div>
-            </div>
-            <div class="stat-box">
-                <div class="label">Total Games</div>
-                <div class="value" id="stat-games">-</div>
-            </div>
-            <div class="stat-box">
-                <div class="label">Total Positions</div>
-                <div class="value" id="stat-positions">-</div>
-            </div>
-            <div class="stat-box">
-                <div class="label">Latest Loss</div>
-                <div class="value" id="stat-loss">-</div>
-            </div>
-            <div class="stat-box">
-                <div class="label">Speed</div>
-                <div class="value" id="stat-speed">-</div>
-                <div class="label">pos/min</div>
-            </div>
-        </div>
-
-        <div class="card">
-            <h2>Training Loss</h2>
-            <div class="chart-container">
-                <canvas id="lossChart"></canvas>
-            </div>
-        </div>
-
-        <div class="card">
-            <h2>Game Replay</h2>
-            <div id="board-container">
-                <div id="board"></div>
-                <div class="replay-controls">
-                    <select id="gen-select"><option>No data</option></select>
-                    <select id="game-select"><option>No data</option></select>
-                    <button id="btn-start">|&lt;</button>
-                    <button id="btn-prev">&lt;</button>
-                    <button id="btn-play">Play</button>
-                    <button id="btn-next">&gt;</button>
-                    <button id="btn-end">&gt;|</button>
+    <div class="container">
+        <div class="grid">
+            <div class="stats-row">
+                <div class="stat-box">
+                    <div class="label">Generations</div>
+                    <div class="value" id="stat-generations">-</div>
                 </div>
-                <div class="game-info" id="game-info">No games loaded</div>
+                <div class="stat-box">
+                    <div class="label">Total Games</div>
+                    <div class="value" id="stat-games">-</div>
+                </div>
+                <div class="stat-box">
+                    <div class="label">Positions</div>
+                    <div class="value" id="stat-positions">-</div>
+                </div>
+                <div class="stat-box">
+                    <div class="label">Latest Loss</div>
+                    <div class="value" id="stat-loss">-</div>
+                </div>
+                <div class="stat-box">
+                    <div class="label">Speed</div>
+                    <div class="value" id="stat-speed">-</div>
+                    <div class="unit">pos/min</div>
+                </div>
             </div>
-        </div>
 
-        <div class="card" style="grid-column: 1 / -1;">
-            <h2>Game Results by Generation</h2>
-            <div class="chart-container">
-                <canvas id="resultsChart"></canvas>
+            <div class="card">
+                <h2>Training Loss</h2>
+                <div class="chart-container">
+                    <canvas id="lossChart"></canvas>
+                </div>
             </div>
-        </div>
 
-        <div class="status" id="status">Connecting...</div>
+            <div class="card">
+                <h2>Game Replay</h2>
+                <div id="board-container">
+                    <div id="board"></div>
+                    <div class="replay-controls">
+                        <select id="gen-select"><option>No data</option></select>
+                        <select id="game-select"><option>No data</option></select>
+                    </div>
+                    <div class="replay-controls">
+                        <div class="btn-group">
+                            <button id="btn-start" title="Start">&#x23EE;</button>
+                            <button id="btn-prev" title="Previous">&lsaquo;</button>
+                            <button id="btn-play" title="Play">&#9654;</button>
+                            <button id="btn-next" title="Next">&rsaquo;</button>
+                            <button id="btn-end" title="End">&#x23ED;</button>
+                        </div>
+                    </div>
+                    <div class="game-info" id="game-info">No games loaded</div>
+                </div>
+            </div>
+
+            <div class="card full-width">
+                <h2>Game Results by Generation</h2>
+                <div class="chart-container">
+                    <canvas id="resultsChart"></canvas>
+                </div>
+            </div>
+
+            <div class="status-bar" id="status"><span class="dot"></span>Connecting...</div>
+        </div>
     </div>
 
 <script>
-// --- Chart setup ---
+// --- Chart.js global defaults for dark theme ---
+Chart.defaults.color = '#8888a0';
+Chart.defaults.borderColor = '#2a2a4a';
+
 const lossCtx = document.getElementById('lossChart').getContext('2d');
 const lossChart = new Chart(lossCtx, {
     type: 'line',
     data: {
         labels: [],
         datasets: [
-            { label: 'Total Loss', data: [], borderColor: '#00d4ff', tension: 0.3, fill: false },
-            { label: 'Policy Loss', data: [], borderColor: '#ff6384', tension: 0.3, fill: false },
-            { label: 'Value Loss', data: [], borderColor: '#4bc0c0', tension: 0.3, fill: false },
+            {
+                label: 'Total Loss', data: [],
+                borderColor: '#6c63ff', backgroundColor: 'rgba(108, 99, 255, 0.1)',
+                borderWidth: 2.5, pointRadius: 4, pointHoverRadius: 6,
+                pointBackgroundColor: '#6c63ff', tension: 0.3, fill: true
+            },
+            {
+                label: 'Policy Loss', data: [],
+                borderColor: '#ff6b6b', backgroundColor: 'rgba(255, 107, 107, 0.05)',
+                borderWidth: 2, pointRadius: 3, pointHoverRadius: 5,
+                pointBackgroundColor: '#ff6b6b', tension: 0.3, fill: false
+            },
+            {
+                label: 'Value Loss', data: [],
+                borderColor: '#4ecdc4', backgroundColor: 'rgba(78, 205, 196, 0.05)',
+                borderWidth: 2, pointRadius: 3, pointHoverRadius: 5,
+                pointBackgroundColor: '#4ecdc4', tension: 0.3, fill: false
+            },
         ]
     },
     options: {
         responsive: true, maintainAspectRatio: false,
+        interaction: { mode: 'index', intersect: false },
         scales: {
-            x: { title: { display: true, text: 'Generation', color: '#888' }, ticks: { color: '#888' }, grid: { color: '#333' } },
-            y: { title: { display: true, text: 'Loss', color: '#888' }, ticks: { color: '#888' }, grid: { color: '#333' } }
+            x: {
+                title: { display: true, text: 'Generation', font: { size: 11 } },
+                grid: { color: 'rgba(255,255,255,0.04)' }
+            },
+            y: {
+                title: { display: true, text: 'Loss', font: { size: 11 } },
+                grid: { color: 'rgba(255,255,255,0.04)' },
+                beginAtZero: true
+            }
         },
-        plugins: { legend: { labels: { color: '#e0e0e0' } } }
+        plugins: {
+            legend: {
+                labels: { usePointStyle: true, pointStyle: 'circle', padding: 16, font: { size: 11 } }
+            },
+            tooltip: {
+                backgroundColor: '#1a1a30', titleColor: '#e8e8f0', bodyColor: '#8888a0',
+                borderColor: '#2a2a4a', borderWidth: 1, cornerRadius: 8, padding: 12
+            }
+        }
     }
 });
 
@@ -149,18 +392,36 @@ const resultsChart = new Chart(resultsCtx, {
     data: {
         labels: [],
         datasets: [
-            { label: 'White wins', data: [], backgroundColor: '#4bc0c0' },
-            { label: 'Draws', data: [], backgroundColor: '#888' },
-            { label: 'Black wins', data: [], backgroundColor: '#ff6384' },
+            { label: 'White wins', data: [], backgroundColor: 'rgba(78, 205, 196, 0.8)', borderRadius: 4 },
+            { label: 'Draws', data: [], backgroundColor: 'rgba(136, 136, 160, 0.6)', borderRadius: 4 },
+            { label: 'Black wins', data: [], backgroundColor: 'rgba(255, 107, 107, 0.8)', borderRadius: 4 },
         ]
     },
     options: {
         responsive: true, maintainAspectRatio: false,
         scales: {
-            x: { stacked: true, title: { display: true, text: 'Generation', color: '#888' }, ticks: { color: '#888' }, grid: { color: '#333' } },
-            y: { stacked: true, title: { display: true, text: 'Games', color: '#888' }, ticks: { color: '#888' }, grid: { color: '#333' } }
+            x: {
+                stacked: true,
+                title: { display: true, text: 'Generation', font: { size: 11 } },
+                grid: { display: false }
+            },
+            y: {
+                stacked: true,
+                title: { display: true, text: 'Games', font: { size: 11 } },
+                grid: { color: 'rgba(255,255,255,0.04)' },
+                beginAtZero: true,
+                ticks: { stepSize: 1 }
+            }
         },
-        plugins: { legend: { labels: { color: '#e0e0e0' } } }
+        plugins: {
+            legend: {
+                labels: { usePointStyle: true, pointStyle: 'rect', padding: 16, font: { size: 11 } }
+            },
+            tooltip: {
+                backgroundColor: '#1a1a30', titleColor: '#e8e8f0', bodyColor: '#8888a0',
+                borderColor: '#2a2a4a', borderWidth: 1, cornerRadius: 8, padding: 12
+            }
+        }
     }
 });
 
@@ -175,42 +436,55 @@ let playInterval = null;
 let chess = new Chess();
 
 // --- Replay controls ---
-document.getElementById('btn-start').addEventListener('click', () => { goToMove(0); });
-document.getElementById('btn-prev').addEventListener('click', () => { goToMove(currentMoveIdx - 1); });
-document.getElementById('btn-next').addEventListener('click', () => { goToMove(currentMoveIdx + 1); });
-document.getElementById('btn-end').addEventListener('click', () => { goToMove(currentMoves.length); });
+document.getElementById('btn-start').addEventListener('click', function() { goToMove(0); });
+document.getElementById('btn-prev').addEventListener('click', function() { goToMove(currentMoveIdx - 1); });
+document.getElementById('btn-next').addEventListener('click', function() { goToMove(currentMoveIdx + 1); });
+document.getElementById('btn-end').addEventListener('click', function() { goToMove(currentMoves.length); });
 document.getElementById('btn-play').addEventListener('click', togglePlay);
 
 function goToMove(idx) {
     idx = Math.max(0, Math.min(idx, currentMoves.length));
     currentMoveIdx = idx;
     chess.reset();
-    for (let i = 0; i < idx; i++) {
+    for (var i = 0; i < idx; i++) {
         chess.move(currentMoves[i], { sloppy: true });
     }
     board.position(chess.fen());
-    document.getElementById('game-info').textContent =
-        'Move ' + idx + '/' + currentMoves.length +
-        (idx > 0 ? ' \u2014 Last: ' + currentMoves[idx-1] : '');
+    var info = 'Move ' + idx + ' / ' + currentMoves.length;
+    if (idx > 0) info += '  \u2014  ' + currentMoves[idx - 1];
+    document.getElementById('game-info').textContent = info;
+
+    // Update play button state
+    var btn = document.getElementById('btn-play');
+    if (idx >= currentMoves.length && playInterval) {
+        clearInterval(playInterval);
+        playInterval = null;
+        btn.innerHTML = '&#9654;';
+        btn.classList.remove('active');
+    }
 }
 
 function togglePlay() {
-    const btn = document.getElementById('btn-play');
+    var btn = document.getElementById('btn-play');
     if (playInterval) {
         clearInterval(playInterval);
         playInterval = null;
-        btn.textContent = 'Play';
+        btn.innerHTML = '&#9654;';
+        btn.classList.remove('active');
     } else {
-        btn.textContent = 'Pause';
-        playInterval = setInterval(() => {
+        if (currentMoveIdx >= currentMoves.length) goToMove(0);
+        btn.innerHTML = '&#9646;&#9646;';
+        btn.classList.add('active');
+        playInterval = setInterval(function() {
             if (currentMoveIdx >= currentMoves.length) {
                 clearInterval(playInterval);
                 playInterval = null;
-                btn.textContent = 'Play';
+                btn.innerHTML = '&#9654;';
+                btn.classList.remove('active');
                 return;
             }
             goToMove(currentMoveIdx + 1);
-        }, 500);
+        }, 600);
     }
 }
 
@@ -218,23 +492,23 @@ function togglePlay() {
 document.getElementById('gen-select').addEventListener('change', loadGeneration);
 document.getElementById('game-select').addEventListener('change', loadGame);
 
-let generationsData = {};
+var generationsData = {};
 
 async function loadGeneration() {
-    const gen = parseInt(document.getElementById('gen-select').value);
+    var gen = parseInt(document.getElementById('gen-select').value);
     if (isNaN(gen)) return;
 
     if (!generationsData[gen]) {
-        const resp = await fetch('/api/generation/' + gen);
+        var resp = await fetch('/api/generation/' + gen);
         if (!resp.ok) return;
         generationsData[gen] = await resp.json();
     }
 
-    const data = generationsData[gen];
-    const gameSelect = document.getElementById('game-select');
+    var data = generationsData[gen];
+    var gameSelect = document.getElementById('game-select');
     gameSelect.innerHTML = '';
-    data.games.forEach((g, i) => {
-        const opt = document.createElement('option');
+    data.games.forEach(function(g, i) {
+        var opt = document.createElement('option');
         opt.value = i;
         opt.textContent = 'Game ' + g.game_num + ': ' + g.result + ' (' + g.num_moves + ' moves)';
         gameSelect.appendChild(opt);
@@ -243,81 +517,87 @@ async function loadGeneration() {
 }
 
 function loadGame() {
-    const gen = parseInt(document.getElementById('gen-select').value);
-    const gameIdx = parseInt(document.getElementById('game-select').value);
+    var gen = parseInt(document.getElementById('gen-select').value);
+    var gameIdx = parseInt(document.getElementById('game-select').value);
     if (isNaN(gen) || isNaN(gameIdx)) return;
 
-    const data = generationsData[gen];
+    var data = generationsData[gen];
     if (!data || !data.games[gameIdx]) return;
 
-    const game = data.games[gameIdx];
+    var game = data.games[gameIdx];
     currentMoves = game.moves_uci || [];
     currentMoveIdx = 0;
     chess.reset();
     board.position('start');
     document.getElementById('game-info').textContent =
-        game.result + ' \u2014 ' + game.num_moves + ' moves \u2014 ' + game.duration_s.toFixed(1) + 's';
+        game.result + '  \u2014  ' + game.num_moves + ' moves  \u2014  ' + game.duration_s.toFixed(1) + 's';
 
     if (playInterval) {
         clearInterval(playInterval);
         playInterval = null;
-        document.getElementById('btn-play').textContent = 'Play';
+        document.getElementById('btn-play').innerHTML = '&#9654;';
+        document.getElementById('btn-play').classList.remove('active');
     }
 }
 
 // --- Polling ---
+var isConnected = false;
+
 async function fetchSummary() {
     try {
-        const resp = await fetch('/api/summary');
-        if (!resp.ok) throw new Error('Failed to fetch');
-        const data = await resp.json();
+        var resp = await fetch('/api/summary');
+        if (!resp.ok) throw new Error('HTTP ' + resp.status);
+        var data = await resp.json();
         updateDashboard(data);
-        document.getElementById('status').textContent =
-            'Last updated: ' + new Date().toLocaleTimeString() + ' \u2014 Polling every 10s';
+        isConnected = true;
+        var statusEl = document.getElementById('status');
+        statusEl.innerHTML = '<span class="dot"></span>Live \u2014 ' +
+            new Date().toLocaleTimeString();
     } catch (e) {
-        document.getElementById('status').textContent = 'Error: ' + e.message;
+        isConnected = false;
+        var statusEl = document.getElementById('status');
+        statusEl.innerHTML = '<span class="dot error"></span>Disconnected \u2014 ' + e.message;
     }
 }
 
 function updateDashboard(data) {
-    // Stats
     document.getElementById('stat-generations').textContent = data.total_generations || 0;
     document.getElementById('stat-games').textContent = data.total_games || 0;
     document.getElementById('stat-positions').textContent =
         (data.total_positions || 0).toLocaleString();
 
-    const gens = data.generations || [];
+    var gens = data.generations || [];
     if (gens.length > 0) {
-        const latest = gens[gens.length - 1];
+        var latest = gens[gens.length - 1];
         document.getElementById('stat-loss').textContent =
             latest.training.total_loss.toFixed(3);
 
         if (data.total_time_s > 0) {
-            const posPerMin = (data.total_positions / data.total_time_s * 60).toFixed(0);
+            var posPerMin = (data.total_positions / data.total_time_s * 60).toFixed(0);
             document.getElementById('stat-speed').textContent = posPerMin;
         }
     }
 
     // Loss chart
-    lossChart.data.labels = gens.map(g => g.generation);
-    lossChart.data.datasets[0].data = gens.map(g => g.training.total_loss);
-    lossChart.data.datasets[1].data = gens.map(g => g.training.policy_loss);
-    lossChart.data.datasets[2].data = gens.map(g => g.training.value_loss);
+    lossChart.data.labels = gens.map(function(g) { return 'Gen ' + g.generation; });
+    lossChart.data.datasets[0].data = gens.map(function(g) { return g.training.total_loss; });
+    lossChart.data.datasets[1].data = gens.map(function(g) { return g.training.policy_loss; });
+    lossChart.data.datasets[2].data = gens.map(function(g) { return g.training.value_loss; });
     lossChart.update();
 
     // Results chart
-    resultsChart.data.labels = gens.map(g => 'Gen ' + g.generation);
-    resultsChart.data.datasets[0].data = gens.map(g => (g.results || {})['1-0'] || 0);
-    resultsChart.data.datasets[1].data = gens.map(g => (g.results || {})['1/2-1/2'] || 0);
-    resultsChart.data.datasets[2].data = gens.map(g => (g.results || {})['0-1'] || 0);
+    resultsChart.data.labels = gens.map(function(g) { return 'Gen ' + g.generation; });
+    resultsChart.data.datasets[0].data = gens.map(function(g) { return (g.results || {})['1-0'] || 0; });
+    resultsChart.data.datasets[1].data = gens.map(function(g) { return (g.results || {})['1/2-1/2'] || 0; });
+    resultsChart.data.datasets[2].data = gens.map(function(g) { return (g.results || {})['0-1'] || 0; });
     resultsChart.update();
 
     // Generation selector
-    const genSelect = document.getElementById('gen-select');
+    var genSelect = document.getElementById('gen-select');
     if (gens.length > 0 && genSelect.options.length !== gens.length) {
         genSelect.innerHTML = '';
-        gens.forEach(g => {
-            const opt = document.createElement('option');
+        gens.forEach(function(g) {
+            var opt = document.createElement('option');
             opt.value = g.generation;
             opt.textContent = 'Generation ' + g.generation;
             genSelect.appendChild(opt);
