@@ -55,6 +55,7 @@ if(ENABLE_NEURAL)
 
     add_library(chess_neural
         src/neural/neural_evaluator.cpp
+        src/mcts/game_manager.cpp
     )
     target_include_directories(chess_neural PUBLIC src)
     target_link_libraries(chess_neural PUBLIC chess_core ${TORCH_LIBRARIES})

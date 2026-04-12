@@ -7,6 +7,7 @@
 #include "core/movegen.h"
 #include "core/attacks.h"
 #include "mcts/search.h"
+#include "mcts/game_manager.h"
 #include "neural/neural_evaluator.h"
 #include "neural/position_history.h"
 #include "neural/policy_map.h"
@@ -169,6 +170,69 @@ private:
     std::unique_ptr<mcts::Search> search_;
 };
 
+// The GameManager wrapper exposed to Python — runs N games with cross-game batching
+class PyGameManager {
+public:
+    PyGameManager(const std::string& model_path, const std::string& device,
+                  py::dict config = py::dict()) {
+        params_ = mcts::SearchParams{};
+        apply_config(params_, config);
+
+        evaluator_ = std::make_unique<neural::NeuralEvaluator>(
+            model_path, device, params_.policy_softmax_temp);
+        manager_ = std::make_unique<mcts::GameManager>(*evaluator_, params_);
+    }
+
+    void init_games(int num_games, int num_sims) {
+        manager_->init_games(num_games, num_sims);
+    }
+
+    void init_games_from_fen(const std::vector<std::string>& fens,
+                             const std::vector<std::vector<std::string>>& move_histories,
+                             int num_sims) {
+        manager_->init_games_from_fen(fens, move_histories, num_sims);
+    }
+
+    int step() {
+        return manager_->step();
+    }
+
+    bool all_complete() const {
+        return manager_->all_complete();
+    }
+
+    bool is_complete(int idx) const {
+        return manager_->is_complete(idx);
+    }
+
+    PySearchResult get_result(int idx) {
+        mcts::SearchResult result = manager_->get_result(idx);
+
+        PySearchResult py_result;
+        py_result.best_move = result.best_move.to_uci();
+        py_result.root_value = result.root_value;
+        py_result.raw_value = result.raw_value;
+        py_result.total_nodes = result.total_nodes;
+        py_result.policy_target = make_numpy_array(result.policy_target);
+        py_result.raw_policy = make_numpy_array(result.raw_policy);
+
+        for (size_t i = 0; i < result.moves.size(); i++) {
+            py_result.visit_counts[result.moves[i].to_uci()] = result.visit_counts[i];
+        }
+
+        return py_result;
+    }
+
+    int num_games() const {
+        return manager_->num_games();
+    }
+
+private:
+    mcts::SearchParams params_;
+    std::unique_ptr<neural::NeuralEvaluator> evaluator_;
+    std::unique_ptr<mcts::GameManager> manager_;
+};
+
 } // anonymous namespace
 
 PYBIND11_MODULE(chess_mcts, m) {
@@ -200,4 +264,32 @@ PYBIND11_MODULE(chess_mcts, m) {
         .def("set_config", &SearchEngine::set_config,
              py::arg("config"),
              "Update search configuration parameters");
+
+    // Expose GameManager for cross-game batched search
+    py::class_<PyGameManager>(m, "GameManager")
+        .def(py::init<const std::string&, const std::string&, py::dict>(),
+             py::arg("model_path"),
+             py::arg("device") = "cpu",
+             py::arg("config") = py::dict())
+        .def("init_games", &PyGameManager::init_games,
+             py::arg("num_games"),
+             py::arg("num_sims"),
+             "Initialize N games from the starting position")
+        .def("init_games_from_fen", &PyGameManager::init_games_from_fen,
+             py::arg("fens"),
+             py::arg("move_histories"),
+             py::arg("num_sims"),
+             "Initialize games from FEN strings and UCI move histories")
+        .def("step", &PyGameManager::step,
+             "Run one step of cross-game batched search. Returns number of newly completed games.")
+        .def("all_complete", &PyGameManager::all_complete,
+             "Check if all games have completed their search")
+        .def("is_complete", &PyGameManager::is_complete,
+             py::arg("idx"),
+             "Check if a specific game has completed its search")
+        .def("get_result", &PyGameManager::get_result,
+             py::arg("idx"),
+             "Get the search result for a completed game")
+        .def("num_games", &PyGameManager::num_games,
+             "Get the number of games");
 }
