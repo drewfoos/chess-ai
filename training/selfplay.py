@@ -498,6 +498,7 @@ def training_loop(
     use_swa: bool = True,
     syzygy_path: str | None = None,
     adaptive: AdaptiveConfig | None = None,
+    resume_from: str | None = None,
 ):
     """Full reinforcement learning training loop.
 
@@ -531,6 +532,16 @@ def training_loop(
     model = ChessNetwork(config).to(device)
     optimizer = create_optimizer(model, lr=lr, weight_decay=weight_decay)
 
+    # Resume from checkpoint if specified
+    start_gen = 1
+    if resume_from:
+        print(f"Resuming from checkpoint: {resume_from}")
+        checkpoint = torch.load(resume_from, map_location=device, weights_only=False)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        start_gen = checkpoint['generation'] + 1
+        print(f"  Loaded generation {checkpoint['generation']}, resuming from gen {start_gen}")
+
     # Stochastic Weight Averaging: use averaged model for self-play (smoother policy)
     swa_model = None
     if use_swa:
@@ -545,12 +556,13 @@ def training_loop(
         adaptive = AdaptiveConfig(enabled=False, full_sims=num_simulations,
                                    full_max_moves=max_moves, full_games=games_per_gen)
 
-    print(f"Starting training loop: {generations} generations, {games_per_gen} games/gen")
+    end_gen = start_gen + generations - 1
+    print(f"Starting training loop: generations {start_gen}-{end_gen}, {games_per_gen} games/gen")
     print(f"Device: {device}, Model: {blocks} blocks, {filters} filters"
           f"{', SWA enabled' if use_swa else ''}"
           f"{', adaptive' if adaptive.enabled else ''}")
 
-    for gen in range(1, generations + 1):
+    for gen in range(start_gen, end_gen + 1):
         gen_start = time.time()
 
         # Adaptive settings: adjust sims/max_moves/games per generation
@@ -559,7 +571,7 @@ def training_loop(
         selfplay_config.max_moves = gen_max_moves
 
         print(f"\n{'='*60}")
-        print(f"Generation {gen}/{generations}"
+        print(f"Generation {gen}/{end_gen}"
               f" (sims={gen_sims}, max_moves={gen_max_moves}, games={gen_games})")
         print(f"{'='*60}")
 
@@ -723,6 +735,7 @@ def main():
     loop_parser.add_argument('--early-sims', type=int, default=100, help='Simulations for early generations')
     loop_parser.add_argument('--early-max-moves', type=int, default=150, help='Max moves for early generations')
     loop_parser.add_argument('--early-games', type=int, default=200, help='Games per early generation')
+    loop_parser.add_argument('--resume-from', type=str, default=None, help='Resume from a checkpoint file (e.g. selfplay_output/checkpoints/model_gen_5.pt)')
 
     args = parser.parse_args()
 
@@ -778,6 +791,7 @@ def main():
             max_moves=args.max_moves,
             syzygy_path=getattr(args, 'syzygy', None),
             adaptive=adaptive_config,
+            resume_from=getattr(args, 'resume_from', None),
         )
 
 
