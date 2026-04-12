@@ -30,12 +30,17 @@ public:
 // Search parameters
 struct SearchParams {
     int num_iterations = 800;
-    float c_puct = 2.5f;
-    float fpu_reduction_root = 0.44f;
-    float fpu_reduction = 0.25f;
+    // Dynamic c_puct: c_init + c_factor * log((N + c_base) / c_base)
+    // Lc0 current defaults
+    float c_puct_init = 3.0f;
+    float c_puct_base = 19652.0f;
+    float c_puct_factor = 2.0f;
+    float fpu_reduction_root = 1.2f;
+    float fpu_reduction = 1.2f;
     float dirichlet_alpha = 0.3f;
     float dirichlet_epsilon = 0.25f;
     bool add_noise = true;    // Add Dirichlet noise at root (for self-play)
+    float policy_softmax_temp = 2.2f;  // Temperature applied to NN policy logits
 };
 
 // Search result
@@ -67,6 +72,8 @@ private:
     float evaluate(Node* node, const Position& pos);
     void backpropagate(Node* node, float value);
     void add_dirichlet_noise(Node* root);
+
+    float dynamic_cpuct(int parent_visits) const;
 
     // Position tracking during selection
     void apply_moves_to_root(const Position& root_pos, Node* node, Position& out_pos);

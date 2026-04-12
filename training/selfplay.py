@@ -7,6 +7,7 @@ Usage:
 
 import argparse
 import os
+import random
 import time
 from dataclasses import dataclass, field
 
@@ -26,6 +27,17 @@ class SelfPlayConfig:
     max_moves: int = 512
     resign_threshold: float = -0.95
     consecutive_resign: int = 5
+    q_ratio: float = 0.0  # Blend ratio: 0 = pure game result, 1 = pure search Q
+    playout_cap_randomization: bool = True   # Alternate full/quick search
+    playout_cap_fraction: float = 0.25       # Fraction of moves that get full search
+    playout_cap_quick_sims: int = 100        # Simulations for quick search moves
+    kld_adaptive: bool = True               # Adapt visit count based on KL divergence
+    kld_min_sims: int = 100                 # Minimum simulations (used when KLD is low)
+    kld_max_sims: int = 800                 # Maximum simulations (used when KLD is high)
+    kld_threshold: float = 0.5              # KLD above this gets max sims
+    syzygy_path: str | None = None          # Path to Syzygy tablebase files (None = disabled)
+    random_opening_fraction: float = 0.05   # Fraction of games with random openings
+    random_opening_moves: int = 8           # Max random moves for opening randomization
 
 
 @dataclass
@@ -33,18 +45,101 @@ class GameRecord:
     planes: list[np.ndarray] = field(default_factory=list)
     policies: list[np.ndarray] = field(default_factory=list)
     values: list[np.ndarray] = field(default_factory=list)
+    moves_left: list[float] = field(default_factory=list)
+    surprise: list[float] = field(default_factory=list)
+    use_policy: list[bool] = field(default_factory=list)  # True = full search, False = quick search
     result: str = '*'
     num_moves: int = 0
     moves_uci: list[str] = field(default_factory=list)
 
 
+def _try_load_syzygy(path: str | None):
+    """Try to load Syzygy tablebases. Returns tablebase object or None."""
+    if path is None:
+        return None
+    try:
+        import chess.syzygy
+        tb = chess.syzygy.open_tablebase(path)
+        return tb
+    except Exception:
+        return None
+
+
+def rescore_with_tablebases(
+    positions: list[tuple],
+    board_history: list[chess.Board],
+    tablebase,
+) -> list[tuple]:
+    """Rescore endgame positions using Syzygy tablebases.
+
+    For positions with ≤5 pieces, replace the game-result WDL with the
+    tablebase-correct result. Rescores backward from the first TB hit.
+    """
+    if tablebase is None:
+        return positions
+
+    # Find the earliest position where we have a TB result
+    tb_wdl = [None] * len(positions)
+    for i, board in enumerate(board_history):
+        if chess.popcount(board.occupied) <= 5:
+            try:
+                wdl_val = tablebase.probe_wdl(board)
+                # wdl_val: 2=win, 1=cursed win, 0=draw, -1=blessed loss, -2=loss
+                # Convert to WDL from side-to-move perspective
+                if wdl_val >= 1:
+                    tb_wdl[i] = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+                elif wdl_val <= -1:
+                    tb_wdl[i] = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+                else:
+                    tb_wdl[i] = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+            except Exception:
+                pass
+
+    # Propagate TB results backward: once we hit a TB position, all prior
+    # positions in the game get that result (adjusted for perspective)
+    last_tb_wdl = None
+    last_tb_stm = None
+    for i in range(len(positions) - 1, -1, -1):
+        if tb_wdl[i] is not None:
+            last_tb_wdl = tb_wdl[i]
+            last_tb_stm = board_history[i].turn
+        if last_tb_wdl is not None:
+            planes, policy_target, side_to_move, root_q, surprise, is_full = positions[i]
+            # Adjust perspective if needed
+            if side_to_move == last_tb_stm:
+                corrected = last_tb_wdl.copy()
+            else:
+                corrected = last_tb_wdl[[2, 1, 0]].copy()  # flip win/loss
+            positions[i] = (planes, policy_target, side_to_move, root_q, surprise, is_full, corrected)
+        else:
+            planes, policy_target, side_to_move, root_q, surprise, is_full = positions[i]
+            positions[i] = (planes, policy_target, side_to_move, root_q, surprise, is_full, None)
+
+    return positions
+
+
 def play_game(mcts: MCTS, config: SelfPlayConfig) -> GameRecord:
     """Play a single self-play game."""
+    if mcts.nn_cache is not None:
+        mcts.nn_cache.clear()
     board = chess.Board()
     record = GameRecord()
 
-    positions = []  # (planes, policy_target, side_to_move)
+    # Opening randomization: play random moves to diversify openings
+    if config.random_opening_fraction > 0 and random.random() < config.random_opening_fraction:
+        n_random = random.randint(2, config.random_opening_moves)
+        for _ in range(n_random):
+            legal = list(board.legal_moves)
+            if not legal or board.is_game_over():
+                break
+            board.push(random.choice(legal))
+            record.moves_uci.append(board.peek().uci())
+
+    positions = []  # (planes, policy_target, side_to_move, root_q, surprise, is_full)
+    board_history = []  # board snapshots for tablebase rescoring
     resign_count = 0
+    full_sims = mcts.config.num_simulations
+    prev_kld = 0.0  # KL divergence from previous move (for adaptive visits)
 
     for move_num in range(config.max_moves):
         if board.is_game_over(claim_draw=True):
@@ -56,12 +151,44 @@ def play_game(mcts: MCTS, config: SelfPlayConfig) -> GameRecord:
         else:
             mcts.config.temperature = 0.01
 
+        # Playout cap randomization: randomly choose full or quick search
+        is_full_search = True
+        if config.playout_cap_randomization:
+            is_full_search = random.random() < config.playout_cap_fraction
+
+        if is_full_search and config.kld_adaptive:
+            # KLD-adaptive: scale sims based on previous move's KL divergence
+            t = min(prev_kld / config.kld_threshold, 1.0)
+            adaptive_sims = int(config.kld_min_sims + t * (config.kld_max_sims - config.kld_min_sims))
+            mcts.config.num_simulations = adaptive_sims
+        elif not is_full_search:
+            mcts.config.num_simulations = config.playout_cap_quick_sims
+        else:
+            mcts.config.num_simulations = full_sims
+
         result = mcts.search(board)
         if result.best_move is None:
             break
 
+        # Compute diff-focus surprise: how much MCTS changed the raw NN evaluation
+        surprise = 0.0
+        if result.raw_policy is not None:
+            # Policy surprise: sum of |search_policy - raw_policy| over legal moves
+            policy_diff = np.abs(result.policy_target - result.raw_policy)
+            surprise += float(policy_diff.sum())
+            # Value surprise: |root_value - raw_value|
+            surprise += abs(result.root_value - result.raw_value)
+            # KL divergence for adaptive visit count (next move)
+            # KLD = sum(p * log(p / q)) where p = search policy, q = raw policy
+            p = result.policy_target
+            q = result.raw_policy
+            mask = p > 1e-8
+            if mask.any():
+                prev_kld = float((p[mask] * np.log(p[mask] / (q[mask] + 1e-8))).sum())
+
         planes = encode_board(board)
-        positions.append((planes, result.policy_target, board.turn))
+        positions.append((planes, result.policy_target, board.turn, result.root_value, surprise, is_full_search))
+        board_history.append(board.copy())
 
         # Check resign condition
         if result.root_value < config.resign_threshold:
@@ -78,6 +205,9 @@ def play_game(mcts: MCTS, config: SelfPlayConfig) -> GameRecord:
         record.moves_uci.append(result.best_move.uci())
         board.push(result.best_move)
 
+    # Restore full simulation count
+    mcts.config.num_simulations = full_sims
+
     # Determine game result if not resigned
     if record.result == '*':
         outcome = board.outcome(claim_draw=True)
@@ -90,26 +220,60 @@ def play_game(mcts: MCTS, config: SelfPlayConfig) -> GameRecord:
         else:
             record.result = '0-1'
 
-    # Label all positions with WDL
-    for planes, policy_target, side_to_move in positions:
-        if record.result == '1/2-1/2':
-            wdl = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+    # Tablebase rescoring (optional): replace endgame results with TB-correct WDL
+    tablebase = _try_load_syzygy(config.syzygy_path)
+    if tablebase is not None:
+        positions = rescore_with_tablebases(positions, board_history, tablebase)
+        tablebase.close()
+
+    # Label all positions with WDL + moves-left + optional Q-blending
+    total_moves = len(positions)
+    q_ratio = config.q_ratio
+
+    for i, pos_data in enumerate(positions):
+        # Unpack — TB rescoring adds an optional 7th element (corrected WDL or None)
+        if len(pos_data) == 7:
+            planes, policy_target, side_to_move, root_q, pos_surprise, is_full, tb_wdl = pos_data
+        else:
+            planes, policy_target, side_to_move, root_q, pos_surprise, is_full = pos_data
+            tb_wdl = None
+
+        # Use tablebase WDL if available, otherwise game-result WDL
+        if tb_wdl is not None:
+            z_wdl = tb_wdl
+        elif record.result == '1/2-1/2':
+            z_wdl = np.array([0.0, 1.0, 0.0], dtype=np.float32)
         elif record.result == '1-0':
             if side_to_move == chess.WHITE:
-                wdl = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+                z_wdl = np.array([1.0, 0.0, 0.0], dtype=np.float32)
             else:
-                wdl = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+                z_wdl = np.array([0.0, 0.0, 1.0], dtype=np.float32)
         else:  # 0-1
             if side_to_move == chess.BLACK:
-                wdl = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+                z_wdl = np.array([1.0, 0.0, 0.0], dtype=np.float32)
             else:
-                wdl = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+                z_wdl = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+
+        # Q-value blending: blend game result WDL with search Q as soft WDL
+        if q_ratio > 0:
+            # Convert root_q ∈ [-1, 1] to soft WDL
+            # q > 0 → more win, q < 0 → more loss, q ≈ 0 → draw
+            q_win = max(0.0, root_q)
+            q_loss = max(0.0, -root_q)
+            q_draw = 1.0 - q_win - q_loss
+            q_wdl = np.array([q_win, q_draw, q_loss], dtype=np.float32)
+            wdl = (1.0 - q_ratio) * z_wdl + q_ratio * q_wdl
+        else:
+            wdl = z_wdl
 
         record.planes.append(planes)
         record.policies.append(policy_target)
         record.values.append(wdl)
+        record.surprise.append(pos_surprise)
+        record.moves_left.append(float(total_moves - i))
+        record.use_policy.append(is_full)
 
-    record.num_moves = len(positions)
+    record.num_moves = total_moves
     return record
 
 
@@ -130,6 +294,9 @@ def generate_games(
     all_planes = []
     all_policies = []
     all_values = []
+    all_moves_left = []
+    all_surprise = []
+    all_use_policy = []
 
     start = time.time()
 
@@ -151,6 +318,9 @@ def generate_games(
         all_planes.extend(record.planes)
         all_policies.extend(record.policies)
         all_values.extend(record.values)
+        all_moves_left.extend(record.moves_left)
+        all_surprise.extend(record.surprise)
+        all_use_policy.extend(record.use_policy)
 
         total_positions = len(all_planes)
         print(
@@ -168,6 +338,9 @@ def generate_games(
         planes=np.array(all_planes, dtype=np.float32),
         policies=np.array(all_policies, dtype=np.float32),
         values=np.array(all_values, dtype=np.float32),
+        moves_left=np.array(all_moves_left, dtype=np.float32),
+        surprise=np.array(all_surprise, dtype=np.float32),
+        use_policy=np.array(all_use_policy, dtype=np.bool_),
     )
 
     print(f"Generated {num_games} games, {total_positions} positions in {elapsed:.1f}s")
@@ -179,7 +352,7 @@ def training_loop(
     generations: int = 10,
     games_per_gen: int = 50,
     train_epochs: int = 5,
-    batch_size: int = 256,
+    batch_size: int = 2048,
     lr: float = 1e-3,
     weight_decay: float = 1e-4,
     num_simulations: int = 400,
@@ -190,6 +363,8 @@ def training_loop(
     device: str = 'auto',
     max_moves: int = 512,
     resign_threshold: float = -0.95,
+    use_swa: bool = True,
+    syzygy_path: str | None = None,
 ):
     """Full reinforcement learning training loop.
 
@@ -202,7 +377,7 @@ def training_loop(
 
     After all generations, export final TorchScript model.
     """
-    from torch.utils.data import DataLoader
+    from torch.utils.data import DataLoader, WeightedRandomSampler
     from training.dataset import ChessDataset
     from training.train import compute_loss, create_optimizer
     from training.export import export_torchscript
@@ -223,11 +398,18 @@ def training_loop(
     model = ChessNetwork(config).to(device)
     optimizer = create_optimizer(model, lr=lr, weight_decay=weight_decay)
 
+    # Stochastic Weight Averaging: use averaged model for self-play (smoother policy)
+    swa_model = None
+    if use_swa:
+        from torch.optim.swa_utils import AveragedModel
+        swa_model = AveragedModel(model)
+
     mcts_config = MCTSConfig(num_simulations=num_simulations)
-    selfplay_config = SelfPlayConfig(max_moves=max_moves, resign_threshold=resign_threshold)
+    selfplay_config = SelfPlayConfig(max_moves=max_moves, resign_threshold=resign_threshold, syzygy_path=syzygy_path)
 
     print(f"Starting training loop: {generations} generations, {games_per_gen} games/gen")
-    print(f"Device: {device}, Model: {blocks} blocks, {filters} filters")
+    print(f"Device: {device}, Model: {blocks} blocks, {filters} filters"
+          f"{', SWA enabled' if use_swa else ''}")
 
     for gen in range(1, generations + 1):
         gen_start = time.time()
@@ -235,11 +417,12 @@ def training_loop(
         print(f"Generation {gen}/{generations}")
         print(f"{'='*60}")
 
-        # 1. Generate self-play games
+        # 1. Generate self-play games (use SWA model if available)
         data_path = os.path.join(data_dir, f'gen_{gen:03d}.npz')
-        model.eval()
+        play_model = swa_model if (swa_model is not None and gen > 1) else model
+        play_model.eval()
         num_positions = generate_games(
-            model, games_per_gen, data_path,
+            play_model, games_per_gen, data_path,
             mcts_config=mcts_config,
             selfplay_config=selfplay_config,
             device=device,
@@ -252,34 +435,60 @@ def training_loop(
             os.path.join(data_dir, f'gen_{g:03d}.npz')
             for g in range(window_start, gen + 1)
         ]
-        dataset = ChessDataset(npz_paths)
-        dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=True)
+        dataset = ChessDataset(npz_paths, mirror=True)
+        if dataset.surprise_weights is not None:
+            # Diff-focus sampling: oversample positions where MCTS disagreed with raw NN
+            weights = dataset.surprise_weights + 1e-6  # Avoid zero weights
+            sampler = WeightedRandomSampler(weights, len(dataset), replacement=True)
+            dataloader = DataLoader(dataset, batch_size=batch_size, sampler=sampler, drop_last=True)
+        else:
+            dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=True)
 
-        # 3. Train for train_epochs epochs
+        # 3. Train for train_epochs epochs (with mixed precision on CUDA)
         model.train()
         total_loss_sum = 0.0
         policy_loss_sum = 0.0
         value_loss_sum = 0.0
         num_batches = 0
 
+        use_amp = (device == 'cuda')
+        scaler = torch.amp.GradScaler(enabled=use_amp)
+
         for epoch in range(train_epochs):
-            for planes, policy_target, value_target in dataloader:
-                planes = planes.to(device)
-                policy_target = policy_target.to(device)
-                value_target = value_target.to(device)
+            for batch in dataloader:
+                planes = batch[0].to(device)
+                policy_target = batch[1].to(device)
+                value_target = batch[2].to(device)
+                mlh_target = None
+                policy_mask = None
+                bi = 3
+                if bi < len(batch) and batch[bi].dtype in (torch.float32, torch.float64):
+                    mlh_target = batch[bi].to(device)
+                    bi += 1
+                if bi < len(batch) and batch[bi].dtype == torch.bool:
+                    policy_mask = batch[bi].to(device)
 
                 optimizer.zero_grad()
-                policy_logits, value_logits = model(planes)
-                total_loss, policy_loss, value_loss = compute_loss(
-                    policy_logits, value_logits, policy_target, value_target
-                )
-                total_loss.backward()
-                optimizer.step()
+                with torch.amp.autocast(device_type=device, enabled=use_amp):
+                    policy_logits, value_logits, mlh_pred = model(planes)
+                    total_loss, policy_loss, value_loss = compute_loss(
+                        policy_logits, value_logits, policy_target, value_target,
+                        mlh_pred, mlh_target, policy_mask,
+                    )
+                scaler.scale(total_loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
+                scaler.step(optimizer)
+                scaler.update()
 
                 total_loss_sum += total_loss.item()
                 policy_loss_sum += policy_loss.item()
                 value_loss_sum += value_loss.item()
                 num_batches += 1
+
+        # Update SWA model after training
+        if swa_model is not None:
+            swa_model.update_parameters(model)
 
         # 4. Save checkpoint
         checkpoint_path = os.path.join(checkpoint_dir, f'model_gen_{gen}.pt')
@@ -319,9 +528,9 @@ def training_loop(
     print(f"\nTraining complete. Final model exported to {final_path}")
 
 
-if __name__ == '__main__':
+def main():
     parser = argparse.ArgumentParser(description='Self-play training for chess AI')
-    subparsers = parser.add_subparsers(dest='command', required=True)
+    subparsers = parser.add_subparsers(dest='command')
 
     # Generate subcommand
     gen_parser = subparsers.add_parser('generate', help='Generate self-play games')
@@ -338,7 +547,7 @@ if __name__ == '__main__':
     loop_parser.add_argument('--generations', type=int, default=10)
     loop_parser.add_argument('--games-per-gen', type=int, default=50)
     loop_parser.add_argument('--train-epochs', type=int, default=5)
-    loop_parser.add_argument('--batch-size', type=int, default=256)
+    loop_parser.add_argument('--batch-size', type=int, default=2048)
     loop_parser.add_argument('--lr', type=float, default=1e-3)
     loop_parser.add_argument('--simulations', type=int, default=400)
     loop_parser.add_argument('--blocks', type=int, default=10)
@@ -347,8 +556,15 @@ if __name__ == '__main__':
     loop_parser.add_argument('--output-dir', type=str, default='selfplay_output')
     loop_parser.add_argument('--device', type=str, default='auto')
     loop_parser.add_argument('--max-moves', type=int, default=512)
+    loop_parser.add_argument('--syzygy', type=str, default=None, help='Path to Syzygy tablebase files')
 
     args = parser.parse_args()
+
+    # Default to 'loop' if no subcommand given
+    if args.command is None:
+        args.command = 'loop'
+        args = loop_parser.parse_args()
+        args.command = 'loop'
 
     if args.command == 'generate':
         device = args.device
@@ -383,4 +599,9 @@ if __name__ == '__main__':
             output_dir=args.output_dir,
             device=args.device,
             max_moves=args.max_moves,
+            syzygy_path=getattr(args, 'syzygy', None),
         )
+
+
+if __name__ == '__main__':
+    main()

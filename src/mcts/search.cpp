@@ -83,14 +83,21 @@ void Search::apply_moves_to_root(const Position& root_pos, Node* node, Position&
 Search::Search(Evaluator& evaluator, const SearchParams& params)
     : evaluator_(evaluator), params_(params) {}
 
+float Search::dynamic_cpuct(int parent_visits) const {
+    return params_.c_puct_init + params_.c_puct_factor * std::log(
+        (parent_visits + params_.c_puct_base) / params_.c_puct_base
+    );
+}
+
 Node* Search::select(Node* node) {
     while (!node->is_leaf()) {
         bool is_root = (node->parent() == nullptr);
         float fpu_reduction = is_root ? params_.fpu_reduction_root : params_.fpu_reduction;
         float parent_q = node->mean_value();
         float fpu_value = parent_q - fpu_reduction;
+        float c_puct = dynamic_cpuct(node->visit_count());
 
-        node = node->select_child(params_.c_puct, fpu_value);
+        node = node->select_child(c_puct, fpu_value);
     }
     return node;
 }

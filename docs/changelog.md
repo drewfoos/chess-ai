@@ -8,7 +8,56 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 
 ## [Unreleased]
 
-Nothing yet.
+### Added — Performance
+- Batched MCTS inference: gather-batch-scatter loop collects N leaf positions per iteration for a single GPU forward pass (configurable `batch_size`, default 16)
+- Virtual loss: unscored virtual visits prevent traversal collisions within a batch (Lc0-style)
+- NN evaluation cache: caches up to 20K position evaluations by FEN to avoid redundant inference
+- Playout cap randomization: alternates full/quick search (25% full by default), trains policy only on full-search positions (~2x data efficiency)
+- KLD-adaptive visit count: scales simulations (100-800) based on KL divergence between raw policy and search policy
+- Syzygy tablebase rescoring: optional post-processing replaces endgame WDL with tablebase-correct results (`--syzygy` flag)
+- Updated search parameters to Lc0 current defaults: CPuct=3.0, PST=2.2, FPU=1.2
+- Two-fold repetition detection: treats 2-fold repetitions as draws in search tree (prevents repetition-seeking)
+- WDL rescale/contempt: configurable draw aversion shifts value away from 0 (for evaluation play)
+- Shaped Dirichlet noise (KataGo): concentrates exploration noise on plausible moves
+- Uncertainty boosting (Ceres): exploration bonus proportional to child value variance
+- Variance-scaled cPUCT (KataGo): dynamic exploration coefficient scales with position complexity
+- Node value variance tracking: `sum_sq_value` enables per-node uncertainty estimation
+- Smart pruning: stops MCTS early when best move has insurmountable visit lead (factor 1.33)
+- Opening randomization: 5% of games play 2-8 random legal moves from starting position for diversity
+- Auxiliary soft policy target (KataGo-style): raises search distribution to power 1/T (T=4), weighted 2x, forces network to learn about non-obvious moves
+- `python -m training` shortcut for launching the training loop with sensible defaults
+
+### Changed
+- Training batch size default increased from 256 to 2048 (matching Lc0)
+
+### Added — Lc0 Optimizations (Tier 1 + Tier 2)
+- Dynamic c_puct: logarithmic growth with parent visit count (AlphaZero defaults: c_init=2.5, c_base=19652, c_factor=2.0) in Python MCTS and C++ search
+- Policy softmax temperature (1.61): widens NN prior distribution before PUCT in Python MCTS and C++ NeuralEvaluator
+- Gradient clipping: `clip_grad_norm_(max_norm=10.0)` in training loop
+- LR warmup: 250-step linear warmup via `SequentialLR(LinearLR + MultiStepLR)`
+- Mish activation: replaced all ReLU in SE-ResNet, policy head, and value head
+- Moves-left head (MLH): auxiliary network output predicting remaining plies, Huber loss (δ=10, scaled 1/20)
+- Q-value blending: configurable `q_ratio` blends game result WDL with search root Q-value
+- MCTS-solver: terminal node certainty propagation (proven wins/losses/draws skip unnecessary search)
+- Attention policy head: Q@K^T scaled dot-product attention over 64 square tokens, promotion offsets, gather-based mapping to 1858 (replaces classical FC policy head)
+- SGD + Nesterov momentum: `create_optimizer(optimizer_type='sgd')` option alongside AdamW
+- Tree reuse: `MCTS.reuse_tree()` extracts subtree for play mode; `search(root=)` accepts existing root
+- Diff-focus sampling: records policy/value surprise per position, `WeightedRandomSampler` oversamples informative positions
+- Stochastic Weight Averaging (SWA): `AveragedModel` for smoother self-play policy
+- Glorot normal initialization: `xavier_normal_` on all conv/FC weights, proper BN init
+- `docs/lc0-optimizations.md`: comprehensive research document with 14 optimizations in 3 tiers (all implemented)
+
+### Changed
+- `ChessNetwork` now returns 3 outputs: `(policy, value, moves_left)` 
+- Default policy head is now attention-based (`use_attention_policy=True`); classical FC head available via config
+- `MCTSConfig` expanded: `c_puct_init`, `c_puct_base`, `c_puct_factor`, `fpu_reduction_root`, `policy_softmax_temperature`
+- `SelfPlayConfig` expanded: `q_ratio` for Q-value blending
+- `GameRecord` now includes `moves_left` field
+- MCTS `Node` has `terminal_status` for solver propagation
+- `_ExportWrapper` handles 3-output model (MLH excluded from TorchScript export)
+
+### Fixed
+- Halfmove clock not reset on non-capture promotions (`position.cpp`)
 
 ---
 

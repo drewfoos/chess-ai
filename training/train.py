@@ -17,7 +17,7 @@ import time
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.optim.lr_scheduler import MultiStepLR
+from torch.optim.lr_scheduler import MultiStepLR, LinearLR, SequentialLR
 from torch.utils.data import DataLoader
 
 from training.config import NetworkConfig
@@ -30,31 +30,75 @@ def compute_loss(
     value_logits: torch.Tensor,
     policy_target: torch.Tensor,
     value_target: torch.Tensor,
+    mlh_pred: torch.Tensor | None = None,
+    mlh_target: torch.Tensor | None = None,
+    policy_mask: torch.Tensor | None = None,
+    soft_policy_weight: float = 2.0,
+    soft_policy_temperature: float = 4.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Compute combined policy + value loss.
+    """Compute combined policy + value + moves-left + soft policy loss.
 
     Args:
         policy_logits: Raw logits from policy head (B, 1858)
         value_logits: Raw logits from value head (B, 3)
         policy_target: MCTS visit distribution target (B, 1858)
         value_target: WDL target (B, 3)
+        mlh_pred: Moves-left prediction from MLH head (B,), optional
+        mlh_target: Moves-left target (B,), optional
+        policy_mask: Boolean mask (B,) — True = use policy loss for this sample (playout cap)
+        soft_policy_weight: Weight for auxiliary soft policy loss (KataGo-style)
+        soft_policy_temperature: Temperature for soft policy target (higher = softer)
 
     Returns:
         (total_loss, policy_loss, value_loss) tuple.
     """
     # Policy loss: cross-entropy with soft targets
     log_probs = F.log_softmax(policy_logits, dim=1)
-    policy_loss = -(policy_target * log_probs).sum(dim=1).mean()
+    per_sample_policy = -(policy_target * log_probs).sum(dim=1)
+    if policy_mask is not None and policy_mask.any() and not policy_mask.all():
+        # Only compute policy loss for full-search positions
+        policy_loss = per_sample_policy[policy_mask].mean()
+    else:
+        policy_loss = per_sample_policy.mean()
+
+    # Auxiliary soft policy loss (KataGo): raise search distribution to power 1/T,
+    # renormalize, and compute cross-entropy. Forces network to learn about non-obvious moves.
+    if soft_policy_weight > 0:
+        soft_target = policy_target.pow(1.0 / soft_policy_temperature)
+        soft_target = soft_target / (soft_target.sum(dim=1, keepdim=True) + 1e-8)
+        per_sample_soft = -(soft_target * log_probs).sum(dim=1)
+        if policy_mask is not None and policy_mask.any() and not policy_mask.all():
+            soft_policy_loss = per_sample_soft[policy_mask].mean()
+        else:
+            soft_policy_loss = per_sample_soft.mean()
+        policy_loss = policy_loss + soft_policy_weight * soft_policy_loss
 
     # Value loss: cross-entropy with soft WDL targets
     value_log_probs = F.log_softmax(value_logits, dim=1)
     value_loss = -(value_target * value_log_probs).sum(dim=1).mean()
 
-    return policy_loss + value_loss, policy_loss, value_loss
+    total = policy_loss + value_loss
+
+    # Moves-left loss: Huber loss (delta=10), scaled by 1/20 (Lc0 convention)
+    if mlh_pred is not None and mlh_target is not None:
+        mlh_loss = F.huber_loss(mlh_pred, mlh_target, delta=10.0) / 20.0
+        total = total + mlh_loss
+
+    return total, policy_loss, value_loss
 
 
-def create_optimizer(model: ChessNetwork, lr: float = 1e-3, weight_decay: float = 1e-4):
-    """Create AdamW optimizer with decoupled weight decay."""
+def create_optimizer(
+    model: ChessNetwork,
+    lr: float = 1e-3,
+    weight_decay: float = 1e-4,
+    optimizer_type: str = 'adamw',
+):
+    """Create optimizer. Supports 'adamw' (default) and 'sgd' (Lc0-style Nesterov)."""
+    if optimizer_type == 'sgd':
+        return torch.optim.SGD(
+            model.parameters(), lr=lr, momentum=0.9,
+            nesterov=True, weight_decay=weight_decay,
+        )
     return torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
 
 
@@ -69,7 +113,7 @@ def train_step(
     model.train()
     optimizer.zero_grad()
 
-    policy_logits, value_logits = model(planes)
+    policy_logits, value_logits, _ = model(planes)
     loss, _, _ = compute_loss(policy_logits, value_logits, policy_target, value_target)
 
     loss.backward()
@@ -108,12 +152,21 @@ def train(
 
     optimizer = create_optimizer(model, lr=lr, weight_decay=weight_decay)
 
-    scheduler = None
+    # LR warmup (250 steps) + optional step decay
+    warmup_steps = 250
+    warmup_scheduler = LinearLR(optimizer, start_factor=1e-6, end_factor=1.0, total_iters=warmup_steps)
     if lr_milestones:
-        scheduler = MultiStepLR(optimizer, milestones=lr_milestones, gamma=lr_gamma)
-        print(f"LR schedule: milestones={lr_milestones}, gamma={lr_gamma}")
+        decay_scheduler = MultiStepLR(optimizer, milestones=lr_milestones, gamma=lr_gamma)
+        scheduler = SequentialLR(optimizer, [warmup_scheduler, decay_scheduler], milestones=[warmup_steps])
+        print(f"LR schedule: warmup {warmup_steps} steps, milestones={lr_milestones}, gamma={lr_gamma}")
+    else:
+        scheduler = warmup_scheduler
+        print(f"LR schedule: warmup {warmup_steps} steps")
 
     os.makedirs(checkpoint_dir, exist_ok=True)
+
+    use_amp = (device == 'cuda')
+    scaler = torch.amp.GradScaler(enabled=use_amp)
 
     for epoch in range(epochs):
         epoch_loss = 0.0
@@ -122,29 +175,34 @@ def train(
         num_batches = 0
         start = time.time()
 
-        for planes, policies, values in loader:
-            planes = planes.to(device)
-            policies = policies.to(device)
-            values = values.to(device)
+        for batch in loader:
+            planes = batch[0].to(device)
+            policies = batch[1].to(device)
+            values = batch[2].to(device)
+            mlh_target = batch[3].to(device) if len(batch) > 3 else None
 
             model.train()
             optimizer.zero_grad()
 
-            policy_logits, value_logits = model(planes)
-            loss, p_loss, v_loss = compute_loss(
-                policy_logits, value_logits, policies, values
-            )
+            with torch.amp.autocast(device_type=device, enabled=use_amp):
+                policy_logits, value_logits, mlh_pred = model(planes)
+                loss, p_loss, v_loss = compute_loss(
+                    policy_logits, value_logits, policies, values,
+                    mlh_pred, mlh_target,
+                )
 
-            loss.backward()
-            optimizer.step()
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
+            scaler.step(optimizer)
+            scaler.update()
+
+            scheduler.step()
 
             epoch_loss += loss.item()
             epoch_policy_loss += p_loss.item()
             epoch_value_loss += v_loss.item()
             num_batches += 1
-
-        if scheduler:
-            scheduler.step()
 
         elapsed = time.time() - start
         avg_loss = epoch_loss / max(num_batches, 1)

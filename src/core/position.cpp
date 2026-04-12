@@ -251,7 +251,7 @@ void Position::make_move(Move m, UndoInfo& undo) {
     castling_ = castling_ & castle_mask[from] & castle_mask[to];
 
     // Update clocks
-    if (board_[to] == PAWN || m.is_capture()) {
+    if (board_[to] == PAWN || m.is_capture() || m.is_promotion()) {
         halfmove_clock_ = 0;
     } else {
         halfmove_clock_++;

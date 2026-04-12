@@ -9,8 +9,10 @@
 
 namespace neural {
 
-NeuralEvaluator::NeuralEvaluator(const std::string& model_path, const std::string& device)
+NeuralEvaluator::NeuralEvaluator(const std::string& model_path, const std::string& device,
+                                 float policy_softmax_temp)
     : device_(device == "cuda" && torch::cuda::is_available() ? torch::kCUDA : torch::kCPU)
+    , policy_softmax_temp_(policy_softmax_temp)
     , encode_buffer_(TENSOR_SIZE)
 {
     try {
@@ -62,6 +64,13 @@ mcts::EvalResult NeuralEvaluator::evaluate(const Position& pos, const Move* move
     for (int i = 0; i < num_moves; i++) {
         int idx = move_to_policy_index(moves[i], pos.side_to_move());
         logits[i] = (idx >= 0) ? policy_acc[0][idx] : -1000.0f;
+    }
+
+    // Apply policy softmax temperature (>1.0 widens the distribution)
+    if (policy_softmax_temp_ != 1.0f) {
+        for (int i = 0; i < num_moves; i++) {
+            logits[i] /= policy_softmax_temp_;
+        }
     }
 
     // Softmax over legal moves

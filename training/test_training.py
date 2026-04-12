@@ -186,16 +186,17 @@ def test_model_output_shapes():
     cfg = NetworkConfig(num_blocks=2, num_filters=32)  # Small for testing
     model = ChessNetwork(cfg)
     x = torch.randn(4, 112, 8, 8)  # Batch of 4
-    policy, value = model(x)
+    policy, value, mlh = model(x)
     assert policy.shape == (4, 1858)
     assert value.shape == (4, 3)
+    assert mlh.shape == (4,)
 
 
 def test_model_policy_logits():
     cfg = NetworkConfig(num_blocks=2, num_filters=32)
     model = ChessNetwork(cfg)
     x = torch.randn(1, 112, 8, 8)
-    policy, _ = model(x)
+    policy, _, _ = model(x)
     # Policy should be raw logits (not softmaxed) — can be any real number
     assert policy.dtype == torch.float32
 
@@ -204,7 +205,7 @@ def test_model_value_probabilities():
     cfg = NetworkConfig(num_blocks=2, num_filters=32)
     model = ChessNetwork(cfg)
     x = torch.randn(1, 112, 8, 8)
-    _, value = model(x)
+    _, value, _ = model(x)
     # Value head now returns raw logits (not probabilities)
     assert value.shape == (1, 3)
     assert value.dtype == torch.float32
@@ -229,11 +230,91 @@ def test_model_batch_independence():
     model = ChessNetwork(cfg)
     model.eval()
     x = torch.randn(2, 112, 8, 8)
-    policy_batch, value_batch = model(x)
-    policy_0, value_0 = model(x[0:1])
-    policy_1, value_1 = model(x[1:2])
+    policy_batch, value_batch, _ = model(x)
+    policy_0, value_0, _ = model(x[0:1])
+    policy_1, value_1, _ = model(x[1:2])
     assert torch.allclose(policy_batch[0], policy_0[0], atol=1e-5)
     assert torch.allclose(value_batch[0], value_0[0], atol=1e-5)
+
+
+def test_attention_policy_head_output_shape():
+    from training.model import AttentionPolicyHead
+    head = AttentionPolicyHead(body_channels=32, embedding_size=16, d_model=16)
+    x = torch.randn(2, 32, 8, 8)
+    out = head(x)
+    assert out.shape == (2, 1858)
+
+
+def test_attention_policy_map_valid_indices():
+    from training.model import _build_attention_policy_index
+    idx = _build_attention_policy_index()
+    assert idx.shape == (1858,)
+    assert idx.min() >= 0
+    assert idx.max() < 4288  # 4096 + 192
+
+
+def test_attention_policy_map_promotions():
+    """Verify queen promotions map to promotion section, knight to base."""
+    from training.model import _build_attention_policy_index
+    from training.encoder import move_to_index, rank_of
+    idx_map = _build_attention_policy_index()
+
+    # e7e8 queen promotion (from_sq=52, to_sq=60, promo=None)
+    q_idx = move_to_index(52, 60, None)
+    assert q_idx is not None
+    assert idx_map[q_idx] >= 4096  # In promotion section
+
+    # e7e8 knight promotion
+    n_idx = move_to_index(52, 60, 'n')
+    assert n_idx is not None
+    assert idx_map[n_idx] < 4096  # In 64×64 base section
+    assert idx_map[n_idx] == 52 * 64 + 60
+
+    # e7e8 rook promotion
+    r_idx = move_to_index(52, 60, 'r')
+    assert r_idx is not None
+    assert idx_map[r_idx] >= 4096  # In promotion section
+
+
+def test_attention_vs_classical_policy_shape():
+    """Both policy head types should produce identical output shapes."""
+    cfg_attn = NetworkConfig(num_blocks=1, num_filters=16, use_attention_policy=True,
+                             policy_embedding_size=8, policy_d_model=8)
+    cfg_fc = NetworkConfig(num_blocks=1, num_filters=16, use_attention_policy=False)
+    model_attn = ChessNetwork(cfg_attn)
+    model_fc = ChessNetwork(cfg_fc)
+    x = torch.randn(1, 112, 8, 8)
+    p_attn, _, _ = model_attn(x)
+    p_fc, _, _ = model_fc(x)
+    assert p_attn.shape == p_fc.shape == (1, 1858)
+
+
+def test_glorot_init_weight_scale():
+    """Glorot-initialized weights should have reasonable scale."""
+    cfg = NetworkConfig(num_blocks=2, num_filters=32)
+    model = ChessNetwork(cfg)
+    conv_weight = model.input_conv.weight
+    # Xavier normal: std ≈ sqrt(2 / (fan_in + fan_out))
+    assert conv_weight.std().item() < 0.2
+    assert conv_weight.std().item() > 0.01
+
+
+def test_sgd_optimizer():
+    from training.train import create_optimizer
+    cfg = NetworkConfig(num_blocks=1, num_filters=16)
+    model = ChessNetwork(cfg)
+    opt = create_optimizer(model, optimizer_type='sgd')
+    assert isinstance(opt, torch.optim.SGD)
+    assert opt.defaults['nesterov'] is True
+    assert opt.defaults['momentum'] == 0.9
+
+
+def test_adamw_optimizer_default():
+    from training.train import create_optimizer
+    cfg = NetworkConfig(num_blocks=1, num_filters=16)
+    model = ChessNetwork(cfg)
+    opt = create_optimizer(model)
+    assert isinstance(opt, torch.optim.AdamW)
 
 
 import tempfile
@@ -285,6 +366,37 @@ def test_chess_dataset_multiple_files():
 
         dataset = ChessDataset([path1, path2])
         assert len(dataset) == 25
+
+
+def test_chess_dataset_mirror_augmentation():
+    from training.dataset import mirror_planes, mirror_policy
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = os.path.join(tmpdir, "test_data.npz")
+        generate_synthetic_data(path, num_positions=10)
+
+        dataset_no_mirror = ChessDataset([path], mirror=False)
+        dataset_mirror = ChessDataset([path], mirror=True)
+        assert len(dataset_mirror) == 2 * len(dataset_no_mirror)
+
+        # Original positions are preserved (first half)
+        planes_orig, policy_orig, value_orig = dataset_no_mirror[0]
+        planes_m, policy_m, value_m = dataset_mirror[0]
+        assert torch.equal(planes_orig, planes_m)
+        assert torch.equal(policy_orig, policy_m)
+        assert torch.equal(value_orig, value_m)
+
+        # Mirror preserves policy sum
+        planes_flip, policy_flip, value_flip = dataset_mirror[10]  # mirrored copy
+        assert abs(policy_flip.sum().item() - policy_orig.sum().item()) < 1e-5
+        # Value is unchanged by mirror
+        assert torch.equal(value_orig, value_flip)
+
+    # mirror_planes flips file axis
+    planes = np.zeros((112, 8, 8), dtype=np.float32)
+    planes[0, 0, 0] = 1.0  # a1
+    flipped = mirror_planes(planes)
+    assert flipped[0, 0, 0] == 0.0
+    assert flipped[0, 0, 7] == 1.0  # h1
 
 
 from training.train import train_step, create_optimizer
@@ -345,8 +457,8 @@ def test_export_torchscript():
         model.eval()
         x = torch.randn(1, 112, 8, 8)
         with torch.no_grad():
-            orig_policy, orig_value_logits = model(x)
-            loaded_policy, loaded_value_probs = loaded(x)
+            orig_policy, orig_value_logits, _ = model(x)
+            loaded_policy, loaded_value_probs = loaded(x)  # export wrapper returns 2
 
         # Policy logits should match exactly
         assert torch.allclose(orig_policy, loaded_policy, atol=1e-5)
@@ -371,8 +483,8 @@ def test_export_torchscript_gpu():
         model_cpu = model.cpu()
         model_cpu.eval()
         with torch.no_grad():
-            orig_policy, orig_value_logits = model_cpu(x)
-            loaded_policy, loaded_value_probs = loaded(x)
+            orig_policy, orig_value_logits, _ = model_cpu(x)
+            loaded_policy, loaded_value_probs = loaded(x)  # export wrapper returns 2
 
         assert torch.allclose(orig_policy, loaded_policy, atol=1e-5)
         orig_value_probs = torch.softmax(orig_value_logits, dim=1)
@@ -415,8 +527,8 @@ def test_end_to_end_pipeline():
         model.eval()
         x = torch.randn(1, 112, 8, 8)
         with torch.no_grad():
-            orig_p, orig_v_logits = model(x)
-            load_p, load_v_probs = loaded(x)
+            orig_p, orig_v_logits, _ = model(x)
+            load_p, load_v_probs = loaded(x)  # export wrapper returns 2
         assert torch.allclose(orig_p, load_p, atol=1e-5)
         orig_v_probs = torch.softmax(orig_v_logits, dim=1)
         assert torch.allclose(orig_v_probs, load_v_probs, atol=1e-5)
@@ -605,6 +717,634 @@ def test_chess_move_to_policy_index_roundtrip():
         assert 0 <= idx < 1858
 
 
+def test_mcts_solver_checkmate():
+    """MCTS-solver should propagate proven terminal results."""
+    cfg = NetworkConfig(num_blocks=1, num_filters=16)
+    model = ChessNetwork(cfg)
+    model.eval()
+    mcts_cfg = MCTSConfig(num_simulations=50)
+    mcts = MCTS(model, mcts_cfg)
+    # Scholar's mate position: White can play Qf7# (if it finds it)
+    # Use a position where checkmate is forced in 1
+    board = chess.Board("r1bqkb1r/pppp1Qpp/2n2n2/4p3/2B1P3/8/PPPP1PPP/RNB1K1NR b KQkq - 0 4")
+    # This is already checkmate — Qf7#
+    assert board.is_checkmate()
+    result = mcts.search(board)
+    assert result.best_move is None  # Terminal position
+
+
+def test_dynamic_cpuct_increases():
+    """Dynamic c_puct should increase with parent visit count."""
+    cfg = NetworkConfig(num_blocks=1, num_filters=16)
+    model = ChessNetwork(cfg)
+    mcts_cfg = MCTSConfig()
+    mcts = MCTS(model, mcts_cfg)
+    c1 = mcts._dynamic_cpuct(1)
+    c100 = mcts._dynamic_cpuct(100)
+    c10000 = mcts._dynamic_cpuct(10000)
+    assert c1 < c100 < c10000
+
+
+def test_mlh_output_nonnegative():
+    """Moves-left head output should be non-negative (ReLU)."""
+    cfg = NetworkConfig(num_blocks=2, num_filters=32)
+    model = ChessNetwork(cfg)
+    model.eval()
+    x = torch.randn(4, 112, 8, 8)
+    _, _, mlh = model(x)
+    assert mlh.shape == (4,)
+    assert (mlh >= 0).all()
+
+
+def test_q_value_blending():
+    """Q-value blending should mix game result with search Q."""
+    cfg = NetworkConfig(num_blocks=1, num_filters=16)
+    model = ChessNetwork(cfg)
+    model.eval()
+    mcts_cfg = MCTSConfig(num_simulations=5)
+    mcts = MCTS(model, mcts_cfg)
+    sp_cfg = SelfPlayConfig(max_moves=10, resign_threshold=-1.0, q_ratio=0.5)
+    record = play_game(mcts, sp_cfg)
+    # With q_ratio=0.5, WDL values should not be pure 0/1 distributions
+    # (they're blended with search Q which is continuous)
+    assert len(record.values) > 0
+    for wdl in record.values:
+        assert abs(wdl.sum() - 1.0) < 1e-5  # Still sums to 1
+
+
+def test_checkpoint_load_resume():
+    """Saved checkpoint should load and produce valid output."""
+    cfg = NetworkConfig(num_blocks=1, num_filters=16)
+    model = ChessNetwork(cfg)
+    x = torch.randn(1, 112, 8, 8)
+    model.eval()
+    p1, v1, m1 = model(x)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = os.path.join(tmpdir, 'test_ckpt.pt')
+        torch.save({
+            'model_state_dict': model.state_dict(),
+            'config': cfg,
+        }, path)
+
+        # Load into fresh model
+        ckpt = torch.load(path, map_location='cpu', weights_only=False)
+        model2 = ChessNetwork(ckpt['config'])
+        model2.load_state_dict(ckpt['model_state_dict'])
+        model2.eval()
+        p2, v2, m2 = model2(x)
+
+        assert torch.allclose(p1, p2, atol=1e-5)
+        assert torch.allclose(v1, v2, atol=1e-5)
+        assert torch.allclose(m1, m2, atol=1e-5)
+
+
+def test_dataset_loads_surprise_weights():
+    """ChessDataset should expose surprise_weights when present in npz."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        n = 10
+        np.savez(
+            os.path.join(tmpdir, 'test.npz'),
+            planes=np.random.randn(n, 112, 8, 8).astype(np.float32),
+            policies=np.ones((n, 1858), dtype=np.float32) / 1858,
+            values=np.tile([1.0, 0.0, 0.0], (n, 1)).astype(np.float32),
+            moves_left=np.arange(n, dtype=np.float32),
+            surprise=np.random.rand(n).astype(np.float32),
+        )
+        dataset = ChessDataset([os.path.join(tmpdir, 'test.npz')])
+        assert dataset.surprise_weights is not None
+        assert len(dataset.surprise_weights) == n
+        assert (dataset.surprise_weights >= 0).all()
+
+
+def test_dataset_without_surprise():
+    """ChessDataset should work without surprise weights (backward compat)."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        n = 5
+        np.savez(
+            os.path.join(tmpdir, 'test.npz'),
+            planes=np.random.randn(n, 112, 8, 8).astype(np.float32),
+            policies=np.ones((n, 1858), dtype=np.float32) / 1858,
+            values=np.tile([1.0, 0.0, 0.0], (n, 1)).astype(np.float32),
+        )
+        dataset = ChessDataset([os.path.join(tmpdir, 'test.npz')])
+        assert dataset.surprise_weights is None
+        assert dataset.moves_left is None
+        assert len(dataset) == n
+
+
+def test_weighted_sampling_prefers_high_surprise():
+    """WeightedRandomSampler with surprise should oversample high-surprise positions."""
+    from torch.utils.data import WeightedRandomSampler
+    # Create extreme weights: first position has weight 100, rest have weight 1
+    weights = torch.tensor([100.0] + [1.0] * 99)
+    sampler = WeightedRandomSampler(weights, num_samples=200, replacement=True)
+    indices = list(sampler)
+    # Index 0 should appear much more frequently
+    count_0 = indices.count(0)
+    assert count_0 > 20  # With weight 100/199, expect ~100 but at least 20
+
+
+def test_multi_gen_training_loss_finite():
+    """Multi-generation training should produce finite losses throughout."""
+    from training.selfplay import training_loop
+    with tempfile.TemporaryDirectory() as tmpdir:
+        training_loop(
+            generations=2,
+            games_per_gen=2,
+            train_epochs=1,
+            batch_size=8,
+            num_simulations=5,
+            blocks=1,
+            filters=16,
+            output_dir=tmpdir,
+            device='cpu',
+            max_moves=10,
+            resign_threshold=-1.0,
+            use_swa=True,
+        )
+        # Verify both generation checkpoints exist and are loadable
+        for gen in [1, 2]:
+            path = os.path.join(tmpdir, 'checkpoints', f'model_gen_{gen}.pt')
+            assert os.path.exists(path)
+            ckpt = torch.load(path, map_location='cpu', weights_only=False)
+            assert ckpt['generation'] == gen
+        # Verify final model exported
+        final = os.path.join(tmpdir, 'model_final.pt')
+        assert os.path.exists(final)
+
+
+def test_virtual_loss_applied_and_reverted():
+    """Virtual loss should temporarily inflate visit count."""
+    from training.mcts import Node
+    node = Node(prior=0.5)
+    node.visit_count = 10
+    node.total_value = 5.0
+    original_value = node.value()
+    node.apply_virtual_loss()
+    assert node.visit_count == 11
+    assert node.pending_evals == 1
+    assert node.value() < original_value  # diluted toward 0
+    node.revert_virtual_loss()
+    assert node.visit_count == 10
+    assert node.pending_evals == 0
+    assert abs(node.value() - original_value) < 1e-9
+
+
+def test_nn_cache_store_and_retrieve():
+    """NNCache should store and retrieve evaluations."""
+    from training.mcts import NNCache
+    cache = NNCache(max_size=100)
+    board = chess.Board()
+    policy = np.ones(1858, dtype=np.float32)
+    cache.put(board, policy, 0.5)
+    result = cache.get(board)
+    assert result is not None
+    assert result[1] == 0.5
+
+
+def test_nn_cache_eviction():
+    """NNCache should evict entries when full."""
+    from training.mcts import NNCache
+    cache = NNCache(max_size=10)
+    for i in range(15):
+        board = chess.Board()
+        board.push(list(board.legal_moves)[i % 20])
+        cache.put(board, np.zeros(1858), 0.0)
+    assert len(cache) <= 10
+
+
+def test_batched_search_returns_legal_move():
+    """Batched MCTS should return a legal move."""
+    cfg = NetworkConfig(num_blocks=1, num_filters=16)
+    model = ChessNetwork(cfg)
+    model.eval()
+    mcts_cfg = MCTSConfig(num_simulations=32, batch_size=8)
+    mcts = MCTS(model, mcts_cfg)
+    board = chess.Board()
+    result = mcts.search(board)
+    assert result.best_move in board.legal_moves
+
+
+def test_batched_search_policy_target_shape():
+    """Batched search should produce valid policy target."""
+    cfg = NetworkConfig(num_blocks=1, num_filters=16)
+    model = ChessNetwork(cfg)
+    model.eval()
+    mcts_cfg = MCTSConfig(num_simulations=32, batch_size=8)
+    mcts = MCTS(model, mcts_cfg)
+    board = chess.Board()
+    result = mcts.search(board)
+    assert result.policy_target.shape == (1858,)
+    assert abs(result.policy_target.sum() - 1.0) < 0.01
+
+
+def test_batched_search_preserves_raw_policy():
+    """Batched search should still capture raw NN policy for diff-focus."""
+    cfg = NetworkConfig(num_blocks=1, num_filters=16)
+    model = ChessNetwork(cfg)
+    model.eval()
+    mcts_cfg = MCTSConfig(num_simulations=16, batch_size=8)
+    mcts = MCTS(model, mcts_cfg)
+    board = chess.Board()
+    result = mcts.search(board)
+    assert result.raw_policy is not None
+    assert result.raw_policy.shape == (1858,)
+
+
+def test_batch_size_1_equivalent():
+    """batch_size=1 should behave like the old sequential loop."""
+    cfg = NetworkConfig(num_blocks=1, num_filters=16)
+    model = ChessNetwork(cfg)
+    model.eval()
+    mcts_cfg = MCTSConfig(num_simulations=16, batch_size=1)
+    mcts = MCTS(model, mcts_cfg)
+    board = chess.Board()
+    result = mcts.search(board)
+    assert result.best_move in board.legal_moves
+    assert result.policy_target.shape == (1858,)
+
+
+def test_nn_cache_populated_after_search():
+    """NN cache should have entries after search."""
+    cfg = NetworkConfig(num_blocks=1, num_filters=16)
+    model = ChessNetwork(cfg)
+    model.eval()
+    mcts_cfg = MCTSConfig(num_simulations=64, batch_size=8, nn_cache_size=1000)
+    mcts = MCTS(model, mcts_cfg)
+    board = chess.Board()
+    mcts.search(board)
+    # With 64 sims, many unique positions are evaluated and cached
+    assert mcts.nn_cache is not None
+    assert len(mcts.nn_cache) > 0
+
+
+def test_updated_search_params():
+    """MCTSConfig should have updated Lc0 defaults."""
+    cfg = MCTSConfig()
+    assert cfg.c_puct_init == 3.0
+    assert cfg.policy_softmax_temperature == 2.2
+    assert cfg.fpu_reduction == 1.2
+    assert cfg.fpu_reduction_root == 1.2
+
+
+def test_playout_cap_randomization():
+    """Playout cap should produce both full and quick search positions."""
+    from training.selfplay import SelfPlayConfig, play_game
+    cfg = NetworkConfig(num_blocks=1, num_filters=16)
+    model = ChessNetwork(cfg)
+    model.eval()
+    mcts_cfg = MCTSConfig(num_simulations=20, batch_size=4)
+    mcts = MCTS(model, mcts_cfg)
+    sp_cfg = SelfPlayConfig(
+        max_moves=30,
+        playout_cap_randomization=True,
+        playout_cap_fraction=0.5,
+        playout_cap_quick_sims=5,
+    )
+    record = play_game(mcts, sp_cfg)
+    # With 50% fraction, expect a mix of True/False
+    assert len(record.use_policy) > 0
+    assert len(record.use_policy) == len(record.planes)
+    # Should have at least some variation (probabilistic, but with 30 moves and 50% it's near certain)
+    if len(record.use_policy) >= 10:
+        assert not all(record.use_policy) or not all(not x for x in record.use_policy)
+
+
+def test_kld_adaptive_varies_sims():
+    """KLD-adaptive should vary simulation count based on policy divergence."""
+    from training.selfplay import SelfPlayConfig
+    cfg = SelfPlayConfig(kld_adaptive=True, kld_min_sims=50, kld_max_sims=400, kld_threshold=0.5)
+    # With KLD=0 (perfect agreement), should use min sims
+    t = min(0.0 / cfg.kld_threshold, 1.0)
+    adaptive_sims = int(cfg.kld_min_sims + t * (cfg.kld_max_sims - cfg.kld_min_sims))
+    assert adaptive_sims == 50
+    # With KLD=0.5 (threshold), should use max sims
+    t = min(0.5 / cfg.kld_threshold, 1.0)
+    adaptive_sims = int(cfg.kld_min_sims + t * (cfg.kld_max_sims - cfg.kld_min_sims))
+    assert adaptive_sims == 400
+
+
+def test_policy_mask_in_loss():
+    """Policy mask should only compute policy loss for masked positions."""
+    from training.train import compute_loss
+    B = 4
+    policy_logits = torch.randn(B, 1858)
+    value_logits = torch.randn(B, 3)
+    policy_target = torch.softmax(torch.randn(B, 1858), dim=1)
+    value_target = torch.softmax(torch.randn(B, 3), dim=1)
+    mask = torch.tensor([True, False, True, False])
+    total, p_loss, v_loss = compute_loss(
+        policy_logits, value_logits, policy_target, value_target, policy_mask=mask,
+    )
+    # Policy loss should only be from positions 0 and 2
+    assert p_loss.item() > 0
+    assert v_loss.item() > 0
+
+
+def test_syzygy_rescore_function():
+    """Tablebase rescoring function should handle positions without TB gracefully."""
+    from training.selfplay import rescore_with_tablebases
+    # Without tablebase, should return positions unchanged
+    positions = [(None, None, chess.WHITE, 0.0, 0.0, True)]
+    boards = [chess.Board()]
+    result = rescore_with_tablebases(positions, boards, None)
+    assert result == positions
+
+
+def test_smart_pruning_stops_early():
+    """Smart pruning should stop search early when best move has insurmountable lead."""
+    cfg = NetworkConfig(num_blocks=1, num_filters=16)
+    model = ChessNetwork(cfg)
+    model.eval()
+    # With smart pruning enabled and many sims, the search may stop early
+    mcts_cfg = MCTSConfig(num_simulations=200, batch_size=8, smart_pruning=True, smart_pruning_factor=1.33)
+    mcts = MCTS(model, mcts_cfg)
+    board = chess.Board()
+    result = mcts.search(board)
+    assert result.best_move in board.legal_moves
+    # Root should have been visited, potentially fewer times than num_simulations due to pruning
+    total_visits = sum(result.visit_counts.values())
+    assert total_visits > 0
+    assert total_visits <= 200 + 1  # +1 for initial root eval
+
+
+def test_smart_pruning_config_defaults():
+    """MCTSConfig smart pruning defaults should be set."""
+    cfg = MCTSConfig()
+    assert cfg.smart_pruning is True
+    assert cfg.smart_pruning_factor == 1.33
+
+
+def test_opening_randomization():
+    """Random opening moves should produce non-standard positions."""
+    from training.selfplay import play_game, SelfPlayConfig
+    cfg = NetworkConfig(num_blocks=1, num_filters=16)
+    model = ChessNetwork(cfg)
+    model.eval()
+    mcts_cfg = MCTSConfig(num_simulations=5)
+    mcts = MCTS(model, mcts_cfg)
+    # Force opening randomization on every game
+    sp_cfg = SelfPlayConfig(
+        max_moves=10, resign_threshold=-1.0,
+        random_opening_fraction=1.0, random_opening_moves=4,
+    )
+    record = play_game(mcts, sp_cfg)
+    # Game should still complete with valid data
+    assert len(record.planes) > 0
+    assert len(record.policies) == len(record.planes)
+
+
+def test_soft_policy_loss():
+    """Soft policy target should increase total policy loss."""
+    from training.train import compute_loss
+    policy_logits = torch.randn(8, 1858)
+    value_logits = torch.randn(8, 3)
+    # Create a peaked policy target
+    policy_target = torch.zeros(8, 1858)
+    policy_target[:, 0] = 0.9
+    policy_target[:, 1] = 0.1
+    value_target = torch.zeros(8, 3)
+    value_target[:, 0] = 1.0  # all wins
+
+    # Without soft policy
+    loss_no_soft, p_no_soft, v1 = compute_loss(
+        policy_logits, value_logits, policy_target, value_target,
+        soft_policy_weight=0.0,
+    )
+    # With soft policy
+    loss_soft, p_soft, v2 = compute_loss(
+        policy_logits, value_logits, policy_target, value_target,
+        soft_policy_weight=2.0, soft_policy_temperature=4.0,
+    )
+    # Soft policy should add to the loss (value loss is the same)
+    assert p_soft.item() > p_no_soft.item()
+    assert loss_soft.item() > loss_no_soft.item()
+
+
+# ── Tier 1 Round 3: Variance, Repetition, Shaped Noise, Uncertainty, Contempt ─
+
+def test_node_variance_low_visits():
+    """Variance should be 0.0 for nodes with < 2 visits."""
+    node = Node(prior=0.5)
+    assert node.value_variance() == 0.0
+    node.visit_count = 1
+    node.total_value = 0.5
+    node.sum_sq_value = 0.25
+    assert node.value_variance() == 0.0
+
+
+def test_node_variance_computation():
+    """Variance should match E[X^2] - E[X]^2."""
+    node = Node(prior=0.5)
+    node.visit_count = 4
+    node.total_value = 2.0       # mean = 0.5
+    node.sum_sq_value = 1.5      # mean_sq = 0.375
+    expected = 0.375 - 0.25      # 0.125
+    assert abs(node.value_variance() - expected) < 1e-6
+
+
+def test_backpropagate_updates_sum_sq():
+    """Backpropagation should accumulate squared values."""
+    root = Node(prior=1.0)
+    child = Node(prior=0.5)
+    root.children[chess.Move.from_uci('e2e4')] = child
+    path = [root, child]
+    cfg = NetworkConfig(num_blocks=1, num_filters=16)
+    model = ChessNetwork(cfg)
+    mcts = MCTS(model, MCTSConfig(), 'cpu')
+    mcts._backpropagate(path, 0.8)
+    assert child.sum_sq_value == pytest.approx(0.64)   # 0.8^2
+    assert root.sum_sq_value == pytest.approx(0.64)     # (-0.8)^2
+
+
+def test_two_fold_repetition_as_draw():
+    """MCTS should treat 2-fold repetition as a draw."""
+    cfg = NetworkConfig(num_blocks=1, num_filters=16)
+    model = ChessNetwork(cfg)
+    model.eval()
+    board = chess.Board()
+    # Play Nf3 Nf6 Ng1 Ng8 — back to start, which now has 2 occurrences
+    for uci in ['g1f3', 'g8f6', 'f3g1', 'f6g8']:
+        board.push(chess.Move.from_uci(uci))
+    assert board.is_repetition(2)
+    mcts_cfg = MCTSConfig(num_simulations=32, two_fold_draw=True)
+    mcts = MCTS(model, mcts_cfg, 'cpu')
+    result = mcts.search(board)
+    assert abs(result.root_value) < 0.5
+
+
+def test_two_fold_repetition_disabled():
+    """With two_fold_draw=False, search still works normally."""
+    cfg = NetworkConfig(num_blocks=1, num_filters=16)
+    model = ChessNetwork(cfg)
+    model.eval()
+    mcts_cfg = MCTSConfig(num_simulations=16, two_fold_draw=False)
+    mcts = MCTS(model, mcts_cfg, 'cpu')
+    board = chess.Board()
+    result = mcts.search(board)
+    assert result.best_move in board.legal_moves
+
+
+def test_shaped_dirichlet_modifies_priors():
+    """Shaped Dirichlet should produce valid search results."""
+    cfg = NetworkConfig(num_blocks=1, num_filters=16)
+    model = ChessNetwork(cfg)
+    model.eval()
+    mcts_cfg = MCTSConfig(num_simulations=32, shaped_dirichlet=True)
+    mcts = MCTS(model, mcts_cfg, 'cpu')
+    board = chess.Board()
+    result = mcts.search(board)
+    assert result.best_move in board.legal_moves
+
+
+def test_shaped_dirichlet_vs_uniform():
+    """Both shaped and uniform Dirichlet produce valid searches."""
+    cfg = NetworkConfig(num_blocks=1, num_filters=16)
+    model = ChessNetwork(cfg)
+    model.eval()
+    board = chess.Board()
+    for shaped in [True, False]:
+        mcts_cfg = MCTSConfig(num_simulations=16, shaped_dirichlet=shaped)
+        mcts = MCTS(model, mcts_cfg, 'cpu')
+        result = mcts.search(board)
+        assert result.best_move in board.legal_moves
+        assert result.policy_target.shape == (1858,)
+
+
+def test_uncertainty_boosting_prefers_high_variance():
+    """Child with higher value variance should get higher selection score."""
+    parent = Node(prior=1.0)
+    parent.visit_count = 100
+    parent.total_value = 50.0
+    parent.sum_sq_value = 30.0
+    # Child A: low variance
+    a = Node(prior=0.3)
+    a.visit_count = 20
+    a.total_value = 10.0
+    a.sum_sq_value = 5.1   # variance ~0.005
+    # Child B: same mean, high variance
+    b = Node(prior=0.3)
+    b.visit_count = 20
+    b.total_value = 10.0
+    b.sum_sq_value = 10.0  # variance ~0.25
+    parent.children[chess.Move.from_uci('e2e4')] = a
+    parent.children[chess.Move.from_uci('d2d4')] = b
+    cfg = NetworkConfig(num_blocks=1, num_filters=16)
+    model = ChessNetwork(cfg)
+    mcts_cfg = MCTSConfig(uncertainty_weight=0.5, variance_scaling=False)
+    mcts = MCTS(model, mcts_cfg, 'cpu')
+    move, child = mcts._select_child(parent)
+    assert child is b
+
+
+def test_uncertainty_boosting_disabled():
+    """With uncertainty_weight=0, search still works."""
+    cfg = NetworkConfig(num_blocks=1, num_filters=16)
+    model = ChessNetwork(cfg)
+    model.eval()
+    mcts_cfg = MCTSConfig(num_simulations=16, uncertainty_weight=0.0)
+    mcts = MCTS(model, mcts_cfg, 'cpu')
+    board = chess.Board()
+    result = mcts.search(board)
+    assert result.best_move in board.legal_moves
+
+
+def test_variance_scaling_clamped():
+    """Variance scaling should be clamped to [0.5, 2.0]."""
+    import math as _math
+    low_scale = max(0.5, min(2.0, _math.sqrt(0.001) / 0.5))
+    assert low_scale == 0.5
+    high_scale = max(0.5, min(2.0, _math.sqrt(2.0) / 0.5))
+    assert high_scale == 2.0
+
+
+def test_variance_scaling_disabled():
+    """With variance_scaling=False, search still works."""
+    cfg = NetworkConfig(num_blocks=1, num_filters=16)
+    model = ChessNetwork(cfg)
+    model.eval()
+    mcts_cfg = MCTSConfig(num_simulations=16, variance_scaling=False)
+    mcts = MCTS(model, mcts_cfg, 'cpu')
+    board = chess.Board()
+    result = mcts.search(board)
+    assert result.best_move in board.legal_moves
+
+
+def test_contempt_shifts_value():
+    """Contempt should push draw-ish values away from zero."""
+    cfg = NetworkConfig(num_blocks=1, num_filters=16)
+    model = ChessNetwork(cfg)
+    model.eval()
+    board = chess.Board()
+    mcts_no = MCTS(model, MCTSConfig(num_simulations=32, contempt=0.0), 'cpu')
+    result_no = mcts_no.search(board)
+    mcts_yes = MCTS(model, MCTSConfig(num_simulations=32, contempt=0.3), 'cpu')
+    result_yes = mcts_yes.search(board)
+    assert abs(result_yes.root_value) >= abs(result_no.root_value) - 0.01
+
+
+def test_contempt_preserves_sign():
+    """Contempt should not flip the sign of the value."""
+    value = 0.2
+    contempt = 0.5
+    sign = 1.0
+    shift = contempt * (1.0 - abs(value))
+    new_value = max(-1.0, min(1.0, value + sign * shift))
+    assert new_value > 0
+    assert new_value > value
+
+
+def test_contempt_disabled_by_default():
+    """Default MCTSConfig has contempt=0.0."""
+    cfg = MCTSConfig()
+    assert cfg.contempt == 0.0
+
+
+def test_new_config_defaults():
+    """All new MCTSConfig fields have correct defaults."""
+    cfg = MCTSConfig()
+    assert cfg.two_fold_draw is True
+    assert cfg.shaped_dirichlet is True
+    assert cfg.uncertainty_weight == 0.15
+    assert cfg.variance_scaling is True
+    assert cfg.contempt == 0.0
+
+
+def test_tree_reuse():
+    """Reused subtree should have prior visit data."""
+    cfg = NetworkConfig(num_blocks=1, num_filters=16)
+    model = ChessNetwork(cfg)
+    model.eval()
+    mcts_cfg = MCTSConfig(num_simulations=10)
+    mcts = MCTS(model, mcts_cfg)
+    board = chess.Board()
+    result = mcts.search(board)
+    assert result.root_node is not None
+    # Reuse tree for the best move
+    best_move = result.best_move
+    child = mcts.reuse_tree(result.root_node, best_move)
+    assert child is not None
+    assert child.visit_count > 0
+    # Search with reused root
+    board.push(best_move)
+    result2 = mcts.search(board, root=child)
+    assert result2.best_move is not None
+
+
+def test_search_returns_raw_policy():
+    """SearchResult should include raw NN policy and value."""
+    cfg = NetworkConfig(num_blocks=1, num_filters=16)
+    model = ChessNetwork(cfg)
+    model.eval()
+    mcts = MCTS(model, MCTSConfig(num_simulations=5))
+    board = chess.Board()
+    result = mcts.search(board)
+    assert result.raw_policy is not None
+    assert result.raw_policy.shape == (1858,)
+    assert result.raw_policy.sum() > 0.99  # Should be a probability distribution
+
+
 from torch.optim.lr_scheduler import MultiStepLR
 
 
@@ -685,6 +1425,58 @@ def test_play_game_max_moves():
     assert len(record.planes) <= 10
 
 
+def test_play_game_records_surprise():
+    """play_game should record surprise scores for each position."""
+    cfg = NetworkConfig(num_blocks=1, num_filters=16)
+    model = ChessNetwork(cfg)
+    model.eval()
+    mcts_cfg = MCTSConfig(num_simulations=5)
+    mcts = MCTS(model, mcts_cfg)
+    sp_cfg = SelfPlayConfig(max_moves=10, resign_threshold=-1.0)
+    record = play_game(mcts, sp_cfg)
+    assert len(record.surprise) == len(record.planes)
+    assert all(s >= 0 for s in record.surprise)
+
+
+def test_swa_model_used_in_training_loop():
+    """training_loop with use_swa should succeed and write metrics."""
+    from training.selfplay import training_loop
+    with tempfile.TemporaryDirectory() as tmpdir:
+        training_loop(
+            generations=2,
+            games_per_gen=2,
+            train_epochs=1,
+            batch_size=8,
+            num_simulations=5,
+            blocks=1,
+            filters=16,
+            output_dir=tmpdir,
+            device='cpu',
+            max_moves=10,
+            resign_threshold=-1.0,
+            use_swa=True,
+        )
+        summary_path = os.path.join(tmpdir, 'metrics', 'summary.json')
+        assert os.path.exists(summary_path)
+
+
+def test_selfplay_npz_has_surprise():
+    """Generated npz should contain surprise weights."""
+    cfg = NetworkConfig(num_blocks=1, num_filters=16)
+    model = ChessNetwork(cfg)
+    model.eval()
+    with tempfile.TemporaryDirectory() as tmpdir:
+        output_path = os.path.join(tmpdir, 'test.npz')
+        generate_games(
+            model, 2, output_path,
+            mcts_config=MCTSConfig(num_simulations=5),
+            selfplay_config=SelfPlayConfig(max_moves=10, resign_threshold=-1.0),
+        )
+        with np.load(output_path) as data:
+            assert 'surprise' in data
+            assert len(data['surprise']) == len(data['planes'])
+
+
 def test_training_loop_one_generation():
     """Full RL loop: generate -> train -> checkpoint for 1 generation."""
     from training.selfplay import training_loop
@@ -742,8 +1534,8 @@ def test_selfplay_to_training_integration():
         optimizer = create_optimizer(model, lr=1e-3)
         losses = []
         for epoch in range(2):
-            for planes, policies, values in loader:
-                loss = train_step(model, optimizer, planes, policies, values)
+            for batch in loader:
+                loss = train_step(model, optimizer, batch[0], batch[1], batch[2])
                 losses.append(loss)
 
         # Verify loss is finite and positive

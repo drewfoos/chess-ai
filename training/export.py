@@ -20,7 +20,7 @@ class _ExportWrapper(torch.nn.Module):
         self.model = model
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        policy_logits, value_logits = self.model(x)
+        policy_logits, value_logits, _mlh = self.model(x)
         value_probs = torch.softmax(value_logits, dim=1)
         return policy_logits, value_probs
 
