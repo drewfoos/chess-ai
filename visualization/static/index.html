@@ -158,7 +158,25 @@
             margin-bottom: 16px;
             padding-bottom: 12px;
             border-bottom: 1px solid var(--border);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
         }
+        .card h2 .card-action {
+            font-size: 0.85em;
+            text-transform: none;
+            letter-spacing: 0;
+            font-weight: 500;
+            color: var(--text-muted);
+            background: transparent;
+            border: 1px solid var(--border);
+            border-radius: 5px;
+            padding: 3px 9px;
+            cursor: pointer;
+            transition: all 0.15s;
+        }
+        .card h2 .card-action:hover { color: #fff; border-color: var(--border-accent); }
+        .card h2 .card-action.copied { color: #6c63ff; border-color: #6c63ff; }
 
         /* Charts */
         .chart-container { position: relative; height: 280px; }
@@ -318,7 +336,7 @@
             </div>
 
             <div class="card">
-                <h2>Training Loss</h2>
+                <h2>Training Loss<button class="card-action" id="copy-loss-text" title="Copy a markdown table + sparkline of all generations to clipboard">Copy as text</button></h2>
                 <div class="chart-container">
                     <canvas id="lossChart"></canvas>
                 </div>
@@ -599,6 +617,80 @@ function loadGame() {
 
 // --- Polling ---
 var isConnected = false;
+var latestGens = [];
+
+// Build a plaintext "copy as text" summary: a sparkline of total-loss
+// across all gens, plus a markdown table of recent generations. Pastes
+// cleanly into Slack / GitHub / chat / docs.
+function buildLossText(gens) {
+    if (!gens || gens.length === 0) return 'No generations yet.';
+    var losses = gens.map(function(g) { return g.training.total_loss; });
+    var min = Math.min.apply(null, losses);
+    var max = Math.max.apply(null, losses);
+    var blocks = ['\u2581','\u2582','\u2583','\u2584','\u2585','\u2586','\u2587','\u2588'];
+    var span = max - min || 1;
+    var spark = losses.map(function(v) {
+        var idx = Math.min(7, Math.max(0, Math.round((v - min) / span * 7)));
+        return blocks[idx];
+    }).join('');
+
+    var minIdx = losses.indexOf(min);
+    var maxIdx = losses.indexOf(max);
+    var header = 'Training loss (gen ' + gens[0].generation + '\u2013' +
+        gens[gens.length-1].generation + '): ' + spark + '\n' +
+        'min ' + min.toFixed(3) + ' (gen ' + gens[minIdx].generation + ')' +
+        ' \u2014 max ' + max.toFixed(3) + ' (gen ' + gens[maxIdx].generation + ')' +
+        ' \u2014 now ' + losses[losses.length-1].toFixed(3) + '\n\n';
+
+    // Markdown table of last 25 gens (or all if fewer). Keep it readable
+    // in Slack/GitHub without wrapping.
+    var N = Math.min(25, gens.length);
+    var recent = gens.slice(-N);
+    var lines = [
+        '| Gen | Network | Games | Total | Policy | Value |',
+        '|-----|---------|-------|-------|--------|-------|'
+    ];
+    recent.forEach(function(g) {
+        var net = g.network ? (g.network.blocks + 'b' + g.network.filters + 'f') : '-';
+        var t = g.training;
+        lines.push('| ' + g.generation + ' | ' + net + ' | ' + g.num_games +
+            ' | ' + t.total_loss.toFixed(3) +
+            ' | ' + t.policy_loss.toFixed(3) +
+            ' | ' + t.value_loss.toFixed(3) + ' |');
+    });
+    if (gens.length > N) lines.unshift('(showing last ' + N + ' of ' + gens.length + ' generations)\n');
+    return header + lines.join('\n');
+}
+
+document.getElementById('copy-loss-text').addEventListener('click', function() {
+    var btn = this;
+    var text = buildLossText(latestGens);
+    // Prefer modern Clipboard API; fall back to a hidden textarea for
+    // non-secure contexts (http://localhost works either way in Chrome).
+    var onDone = function() {
+        btn.textContent = 'Copied!';
+        btn.classList.add('copied');
+        setTimeout(function() { btn.textContent = 'Copy as text'; btn.classList.remove('copied'); }, 1500);
+    };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(onDone).catch(function() {
+            fallbackCopy(text); onDone();
+        });
+    } else {
+        fallbackCopy(text); onDone();
+    }
+});
+
+function fallbackCopy(text) {
+    var ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.select();
+    try { document.execCommand('copy'); } catch (e) {}
+    document.body.removeChild(ta);
+}
 
 async function fetchSummary() {
     try {
@@ -624,6 +716,8 @@ function updateDashboard(data) {
         (data.total_positions || 0).toLocaleString();
 
     var gens = data.generations || [];
+    // Cache for the "Copy as text" button; avoids a second fetch on click.
+    latestGens = gens;
     if (gens.length > 0) {
         var latest = gens[gens.length - 1];
         document.getElementById('stat-loss').textContent =
