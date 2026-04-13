@@ -643,20 +643,35 @@ function buildLossText(gens) {
         ' \u2014 now ' + losses[losses.length-1].toFixed(3) + '\n\n';
 
     // Markdown table of last 25 gens (or all if fewer). Keep it readable
-    // in Slack/GitHub without wrapping.
+    // in Slack/GitHub without wrapping. The Event column flags resume
+    // boundaries and tier transitions so the loss numbers around them
+    // can be read in context (a loss bump right after 'resume' or
+    // 'tier' is expected, not a regression).
     var N = Math.min(25, gens.length);
     var recent = gens.slice(-N);
+    var startIdx = gens.length - N;
     var lines = [
-        '| Gen | Network | Games | Total | Policy | Value |',
-        '|-----|---------|-------|-------|--------|-------|'
+        '| Gen | Network | Games | Total | Policy | Value | Event |',
+        '|-----|---------|-------|-------|--------|-------|-------|'
     ];
-    recent.forEach(function(g) {
+    recent.forEach(function(g, i) {
+        var absIdx = startIdx + i;
         var net = g.network ? (g.network.blocks + 'b' + g.network.filters + 'f') : '-';
         var t = g.training;
+        var events = [];
+        if (g.resumed) events.push('resume');
+        var prev = absIdx > 0 ? gens[absIdx - 1] : null;
+        if (prev && prev.network && g.network &&
+            (prev.network.blocks !== g.network.blocks ||
+             prev.network.filters !== g.network.filters)) {
+            events.push('tier ' + prev.network.blocks + 'b' + prev.network.filters +
+                '\u2192' + g.network.blocks + 'b' + g.network.filters);
+        }
         lines.push('| ' + g.generation + ' | ' + net + ' | ' + g.num_games +
             ' | ' + t.total_loss.toFixed(3) +
             ' | ' + t.policy_loss.toFixed(3) +
-            ' | ' + t.value_loss.toFixed(3) + ' |');
+            ' | ' + t.value_loss.toFixed(3) +
+            ' | ' + (events.join(', ') || '') + ' |');
     });
     if (gens.length > N) lines.unshift('(showing last ' + N + ' of ' + gens.length + ' generations)\n');
     return header + lines.join('\n');
