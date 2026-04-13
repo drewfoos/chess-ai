@@ -8,6 +8,20 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 
 ## [Unreleased]
 
+### Added — Syzygy Endgame Tablebases In-Search
+- Vendored Fathom (`external/fathom/src/`) and built it as a static lib linked into `chess_core`
+- New `src/syzygy/syzygy.{h,cpp}` exposes a thin C++ wrapper: `TableBase::init(path)`, `probe_wdl(pos) → {hit, WDL}`, `shutdown()`, plus `ready()` / `max_pieces()` / `hits()` diagnostics
+- Probe is skipped (returns `hit=false`) when piece count > `TB_LARGEST`, when castling rights are nonzero, or when `halfmove_clock != 0` (Fathom contract). `BLESSED_LOSS` / `CURSED_WIN` are reported as `DRAW` to stay 50-move-rule safe — matches Lc0 behavior.
+- `Search::gather_leaf` and `GameManager::gather_leaf_from_game` now probe Syzygy *before* the NN cache check; on a hit the leaf is marked terminal (status=±1 or 2) with the exact value, virtual loss is reverted along the path, and `propagate_terminal` upgrades ancestor solver state — bypassing NN evaluation entirely for resolved endgames.
+- `SearchParams::use_syzygy` (default `true`) and pybind11 config key `use_syzygy` to toggle.
+- pybind11 module exposes `syzygy_init(path) -> int`, `syzygy_shutdown()`, `syzygy_max_pieces()`, `syzygy_hits()` for Python-side wiring.
+- UCI: `option name SyzygyPath type string default <empty>`; `setoption name SyzygyPath value <dir>` calls `TableBase::init(value)` and emits an `info string` reporting max-pieces (or "no tablebases found"). Empty / `<empty>` value calls `shutdown()` to disable.
+- Tests: `tests/test_syzygy.cpp` covers KQvK win/loss orientation, KvK draw, halfmove-clock skip, castling-rights skip, and over-piece-count skip (each test skips itself when `syzygy/` isn't present in the repo); `test_uci.cpp` adds an option-advertisement check and a setoption smoke test.
+- Build: `fathom` target compiles with `/std:c11 /experimental:c11atomics` on MSVC (tbprobe.c uses `<stdatomic.h>`, and MSVC 17.13 still gates C11 atomics behind the experimental flag).
+
+### Fixed
+- UCI: always emit a final `info depth/nodes/nps/time/score cp/pv` line before `bestmove`. The periodic callback is rate-limited (every 500ms or 100 iters), so short searches (e.g. `go nodes 200`) could finish without producing any info line — Arena/Lichess rely on at least one.
+
 ### Changed — Adaptive Defaults Tuned for Consumer GPUs
 - `AdaptiveConfig` defaults rebalanced: `mid_until=20` (was 15), `early_games=300` (was 200), `mid_games=200` (was 100), `full_games=150` (was 50)
 - Motivation: on RTX 3080-class hardware with TRT + multivisit MCTS, self-play is ~90s / 120 games while training is ~2-3 min, so games/gen can be much higher without extending wall-clock per gen — the original 50/100/200 schedule was tuned for CPU-era throughput and starved the sliding window of fresh data

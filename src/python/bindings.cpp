@@ -13,6 +13,7 @@
 #include "neural/position_history.h"
 #include "neural/policy_map.h"
 #include "neural/encoder.h"
+#include "syzygy/syzygy.h"
 #ifdef HAS_TENSORRT
 #include "neural/trt_evaluator.h"
 #endif
@@ -79,6 +80,7 @@ void apply_config(mcts::SearchParams& params, const py::dict& config) {
         else if (key == "mlh_weight")      params.mlh_weight = item.second.cast<float>();
         else if (key == "mlh_cap")         params.mlh_cap = item.second.cast<float>();
         else if (key == "mlh_q_threshold") params.mlh_q_threshold = item.second.cast<float>();
+        else if (key == "use_syzygy")      params.use_syzygy = item.second.cast<bool>();
         else {
             throw std::runtime_error("Unknown config key: " + key);
         }
@@ -254,6 +256,18 @@ PYBIND11_MODULE(_core, m) {
 
     // Initialize attack tables once at module load
     attacks::init();
+
+    // Syzygy tablebase init/teardown. Call syzygy_init(path) once at startup
+    // to enable in-search WDL probing; returns the largest piece count
+    // supported (0 if no tables found in the directory).
+    m.def("syzygy_init", [](const std::string& path) -> int {
+        return syzygy::TableBase::init(path);
+    }, py::arg("path"),
+       "Initialize Syzygy tablebases from `path`. Returns max piece count, 0 if none, -1 on error.");
+    m.def("syzygy_shutdown", []() { syzygy::TableBase::shutdown(); });
+    m.def("syzygy_max_pieces", []() { return syzygy::TableBase::max_pieces(); });
+    m.def("syzygy_hits", []() { return syzygy::TableBase::hits(); },
+          "Number of successful TB probes since process start.");
 
     // Expose SearchResult
     py::class_<PySearchResult>(m, "SearchResult")

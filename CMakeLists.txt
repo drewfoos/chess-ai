@@ -19,6 +19,30 @@ add_library(chess_core
 )
 target_include_directories(chess_core PUBLIC src)
 
+# Syzygy endgame tablebase support (Fathom, vendored under external/fathom).
+# Builds unconditionally — the wrapper no-ops if TableBase::init() is never
+# called, so there's no runtime cost when tablebases aren't present.
+add_library(fathom STATIC external/fathom/src/tbprobe.c)
+target_include_directories(fathom PUBLIC external/fathom/src)
+set_target_properties(fathom PROPERTIES
+    C_STANDARD 11
+    C_STANDARD_REQUIRED YES
+    C_EXTENSIONS OFF
+)
+if(MSVC)
+    # Fathom's tbchess.c uses POSIX-isms; silence MSVC's CRT-secure warnings.
+    target_compile_definitions(fathom PRIVATE _CRT_SECURE_NO_WARNINGS)
+    # Fathom triggers /W4 noise on MSVC; quiet it down without affecting our code.
+    target_compile_options(fathom PRIVATE /W0)
+    # VS generator doesn't always honor C_STANDARD for C; force C11 explicitly
+    # so <stdatomic.h> in tbprobe.c compiles. /experimental:c11atomics is still
+    # required on MSVC 17.13 to actually enable the atomic_* types.
+    target_compile_options(fathom PRIVATE /std:c11 /experimental:c11atomics)
+endif()
+
+target_sources(chess_core PRIVATE src/syzygy/syzygy.cpp)
+target_link_libraries(chess_core PUBLIC fathom)
+
 add_executable(chess_engine src/main.cpp)
 target_link_libraries(chess_engine PRIVATE chess_core)
 
@@ -44,6 +68,7 @@ if(BUILD_TESTS)
         tests/test_mcts.cpp
         tests/test_neural.cpp
         tests/test_uci.cpp
+        tests/test_syzygy.cpp
     )
     target_link_libraries(chess_tests PRIVATE chess_core GTest::gtest_main)
     include(GoogleTest)

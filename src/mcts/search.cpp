@@ -1,6 +1,7 @@
 #include "mcts/search.h"
 #include "core/movegen.h"
 #include "core/bitboard.h"
+#include "syzygy/syzygy.h"
 #include <numeric>
 #include <random>
 #include <algorithm>
@@ -346,6 +347,29 @@ void Search::gather_leaf(Node* root, const neural::PositionHistory& history,
         revert_virtual_loss_path(path_nodes);
         backpropagate(node, -value);
         return;
+    }
+
+    // Syzygy WDL probe: in deep endgames the tablebase is ground-truth, so
+    // we resolve the leaf without consulting the NN. Sets terminal_status
+    // so MCTS-solver can propagate the result up the tree.
+    if (params_.use_syzygy && syzygy::TableBase::ready()) {
+        syzygy::ProbeResult tb = syzygy::TableBase::probe_wdl(current_pos);
+        if (tb.hit) {
+            // Encoding (matches expand_node): status==1 → STM loses,
+            // status==-1 → STM wins, status==2 → draw.
+            int8_t status;
+            float value;
+            switch (tb.wdl) {
+                case syzygy::WDL::WIN:  status =  -1; value =  1.0f; break;
+                case syzygy::WDL::LOSS: status =   1; value = -1.0f; break;
+                default:                status =   2; value =  0.0f; break;
+            }
+            node->set_terminal_status(status);
+            revert_virtual_loss_path(path_nodes);
+            backpropagate(node, value);
+            propagate_terminal(node);
+            return;
+        }
     }
 
     // Check NN cache

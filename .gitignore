@@ -69,8 +69,9 @@ lichess-bot/
 # External engines (Stockfish etc. for eval gauntlets)
 engines/
 
-# Syzygy endgame tablebases (downloaded on demand, ~940MB for 3-4-5 piece)
-syzygy/
+# Syzygy endgame tablebases (downloaded on demand, ~940MB for 3-4-5 piece).
+# Root-anchored so `src/syzygy/` (the wrapper source) isn't caught.
+/syzygy/
 
 # Binary test fixtures (ONNX / TorchScript / TRT engines — generated on demand)
 tests/fixtures/

@@ -66,6 +66,18 @@ TEST_F(UCITest, UciCommandReturnsUciok) {
     handler.loop();
     EXPECT_NE(out.str().find("id name ChessAI"), std::string::npos);
     EXPECT_NE(out.str().find("uciok"), std::string::npos);
+    EXPECT_NE(out.str().find("option name SyzygyPath"), std::string::npos);
+}
+
+TEST_F(UCITest, SetOptionSyzygyPathInvalidEmitsInfo) {
+    // Pointing at a non-tablebase directory should not crash; engine
+    // emits an "info string" telling the GUI nothing was loaded.
+    std::istringstream in("setoption name SyzygyPath value /this/path/does/not/exist\nquit\n");
+    std::ostringstream out;
+    mcts::RandomEvaluator eval;
+    uci::UCIHandler handler(eval, {}, in, out);
+    handler.loop();
+    EXPECT_NE(out.str().find("info string Syzygy"), std::string::npos);
 }
 
 TEST_F(UCITest, IsReadyReturnsReadyok) {

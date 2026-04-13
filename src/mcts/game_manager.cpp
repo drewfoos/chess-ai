@@ -4,6 +4,7 @@
 #include "core/movegen.h"
 #include "core/bitboard.h"
 #include "core/move_parser.h"
+#include "syzygy/syzygy.h"
 #include <numeric>
 #include <random>
 #include <algorithm>
@@ -555,6 +556,26 @@ int GameManager::gather_leaf_from_game(int game_idx, std::vector<PendingLeaf>& b
         revert_virtual_loss_path(path_nodes);
         backpropagate(node, -value);
         return 1;
+    }
+
+    // Syzygy WDL probe — same logic as Search::gather_leaf. Resolves the
+    // leaf without an NN slot when the position is in the loaded tablebase.
+    if (params_.use_syzygy && syzygy::TableBase::ready()) {
+        syzygy::ProbeResult tb = syzygy::TableBase::probe_wdl(current_pos);
+        if (tb.hit) {
+            int8_t status;
+            float value;
+            switch (tb.wdl) {
+                case syzygy::WDL::WIN:  status =  -1; value =  1.0f; break;
+                case syzygy::WDL::LOSS: status =   1; value = -1.0f; break;
+                default:                status =   2; value =  0.0f; break;
+            }
+            node->set_terminal_status(status);
+            revert_virtual_loss_path(path_nodes);
+            backpropagate(node, value);
+            propagate_terminal(node);
+            return 1;
+        }
     }
 
     // NN cache check

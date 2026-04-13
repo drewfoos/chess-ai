@@ -1,4 +1,5 @@
 #include "uci/uci.h"
+#include "syzygy/syzygy.h"
 #include <chrono>
 #include <algorithm>
 
@@ -63,6 +64,7 @@ void UCIHandler::handle_uci() {
     send("option name UCI_Chess960 type check default false");
     send("option name Ponder type check default false");
     send("option name Move Overhead type spin default 50 min 0 max 5000");
+    send("option name SyzygyPath type string default <empty>");
     send("uciok");
 }
 
@@ -156,6 +158,20 @@ void UCIHandler::handle_setoption(std::istringstream& args) {
         try { base_params_.num_iterations = std::stoi(value); } catch (...) {}
     } else if (name == "Move Overhead") {
         try { move_overhead_ms_ = std::max(0, std::stoi(value)); } catch (...) {}
+    } else if (name == "SyzygyPath") {
+        // Empty / "<empty>" disables tablebases. Otherwise reload from path.
+        if (value.empty() || value == "<empty>") {
+            syzygy::TableBase::shutdown();
+            send("info string Syzygy tablebases disabled");
+        } else {
+            int max_pieces = syzygy::TableBase::init(value);
+            if (max_pieces > 0) {
+                send("info string Syzygy tablebases loaded (max " +
+                     std::to_string(max_pieces) + " pieces) from " + value);
+            } else {
+                send("info string Syzygy: no tablebases found at " + value);
+            }
+        }
     }
     // Hash, Threads, UCI_Chess960, Ponder — accepted and silently ignored.
 }
@@ -241,6 +257,26 @@ void UCIHandler::start_search(const TimeControl& tc) {
         }
 
         std::string best = result.best_move.is_none() ? "0000" : result.best_move.to_uci();
+
+        // Final info line before bestmove. The periodic callback is rate-limited
+        // (every 500ms or 100 iters) so very short searches can finish without
+        // emitting any info — GUIs like Arena expect at least one.
+        {
+            int pseudo_depth = 1;
+            int it = result.total_nodes;
+            while (it > 1) { pseudo_depth++; it >>= 1; }
+            int final_nps = (elapsed_ms > 0)
+                ? static_cast<int>(result.total_nodes * 1000 / elapsed_ms) : 0;
+            int score_cp = static_cast<int>(result.root_value * 128.0f);
+            score_cp = std::max(-12800, std::min(12800, score_cp));
+            send("info depth " + std::to_string(pseudo_depth) +
+                 " nodes " + std::to_string(result.total_nodes) +
+                 " nps " + std::to_string(final_nps) +
+                 " time " + std::to_string(elapsed_ms) +
+                 " score cp " + std::to_string(score_cp) +
+                 " pv " + best);
+        }
+
         send("bestmove " + best);
 
         searching_.store(false);

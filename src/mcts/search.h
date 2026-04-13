@@ -60,8 +60,8 @@ struct SearchParams {
     float c_puct_init = 3.0f;
     float c_puct_base = 19652.0f;
     float c_puct_factor = 2.0f;
-    float fpu_reduction_root = 1.2f;
-    float fpu_reduction = 1.2f;
+    float fpu_reduction_root = 0.5f;
+    float fpu_reduction = 0.5f;
     // Lc0 "FpuStrategyAtRoot=absolute": treat unvisited root children as if they
     // had a fixed value (typically ~1.0), forcing the search to touch every root
     // child at least once before exploiting. Overrides fpu_reduction_root at root.
@@ -92,6 +92,13 @@ struct SearchParams {
     float mlh_weight = 0.0f;
     float mlh_cap = 10.0f;
     float mlh_q_threshold = 0.6f;
+
+    // Syzygy endgame tablebase probing inside MCTS. When piece count drops
+    // to <= TB_LARGEST and TableBase::init() has succeeded, leaves are
+    // resolved exactly via the WDL tablebase instead of NN evaluation.
+    // Skips probing when castling rights or the 50-move clock are nonzero
+    // (Fathom restriction). No-op if no tables loaded.
+    bool use_syzygy = true;
 };
 
 // Search result
