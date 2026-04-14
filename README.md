@@ -10,7 +10,7 @@
 
 # Chess AI
 
-An AlphaZero-style chess engine built from scratch on a single consumer GPU — C++ MCTS, PyTorch training, TensorRT inference, and a full self-play reinforcement learning loop. No forks of Leela or Stockfish; every component (bitboard move generation, MCTS, SE-ResNet, self-play pipeline) is original.
+An AlphaZero-style chess engine built from scratch on a single consumer GPU — C++ MCTS, PyTorch training, TensorRT inference, and a full self-play reinforcement learning loop. No forks of Leela or Stockfish; every component (bitboard move generation, MCTS, SE-ResNet, self-play pipeline) is original, to understand the AlphaZero architecture end-to-end.
 
 ---
 
@@ -30,11 +30,11 @@ Everything targets a single RTX 3080 + Ryzen 7 5800X. Smaller or larger GPUs wor
 
 ## 2. Why It Matters
 
-The project exists to demonstrate technical depth across three fields — reinforcement learning, neural networks, and chess engine internals — in code the author can fully explain, for a PhD application.
-
 The challenge isn't "build a strong engine" — Stockfish and Leela are open source. The challenge is **reaching a strong Elo on one consumer GPU** instead of a distributed cluster. Pure-Zero from random weights would take months of wall-clock on a 3080; Leela only got there with a volunteer GPU farm. The hybrid supervised-pretrain → self-play arc used here turns that into a weeks-scale project while keeping the AlphaZero learning dynamic intact for the final phase.
 
-Goal: **1800–2000+ Elo** in a system the author can defend line-by-line.
+Every component is written from scratch so the entire system — RL loop, MCTS, neural network, chess engine internals — is understood line by line rather than treated as a black box.
+
+Goal: **1800–2000+ Elo** on consumer hardware.
 
 ---
 
