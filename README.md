@@ -4,7 +4,7 @@
   <img src="https://img.shields.io/badge/PyTorch-2.11-ee4c2c?style=flat-square&logo=pytorch&logoColor=white" alt="PyTorch">
   <img src="https://img.shields.io/badge/CUDA-12.6-76b900?style=flat-square&logo=nvidia&logoColor=white" alt="CUDA 12.6">
   <img src="https://img.shields.io/badge/TensorRT-10.x-76b900?style=flat-square&logo=nvidia&logoColor=white" alt="TensorRT 10">
-  <img src="https://img.shields.io/badge/tests-199%20C%2B%2B%20%7C%20144%20Python-brightgreen?style=flat-square" alt="Tests">
+  <img src="https://img.shields.io/badge/tests-199%20C%2B%2B%20%7C%20146%20Python-brightgreen?style=flat-square" alt="Tests">
   <img src="https://img.shields.io/badge/license-MIT-green?style=flat-square" alt="MIT License">
 </p>
 
@@ -95,7 +95,7 @@ Smaller / larger GPUs work — just reduce/raise `--parallel-games` and the netw
 - Tree reuse, virtual loss, playout cap randomization
 
 ### Neural Network & Inference
-- SE-ResNet: 10 residual blocks, 128 filters, squeeze-and-excitation, Mish activation
+- SE-ResNet: configurable depth/width (10b×128f baseline, 20b×256f for serious runs), squeeze-and-excitation, Mish activation
 - Attention policy head: scaled dot-product attention over 64 squares → 1858 moves
 - Value head (WDL), moves-left head (Huber auxiliary)
 - **Two inference backends**, selected at runtime:
@@ -107,13 +107,14 @@ Smaller / larger GPUs work — just reduce/raise `--parallel-games` and the netw
 ### Training Pipeline
 - Self-play RL loop: generate → train → export (TorchScript + ONNX → TRT) → repeat
 - Policy cross-entropy + value cross-entropy + moves-left Huber
-- AdamW with 250-step LR warmup + MultiStepLR decay, grad clipping
+- AdamW with LR warmup + MultiStepLR decay, grad clipping
 - Stochastic Weight Averaging (SWA) for smoother self-play weights
 - Mixed-precision training (FP16 via PyTorch AMP)
 - Mirror data augmentation (horizontal flip) → 2× training data
 - Diff-focus sampling, Q-value blending, opening randomization, Syzygy rescoring (optional)
 - Sliding window over recent generations, auxiliary soft-policy target (KataGo)
-- **Tiered networks:** start at 6b64f for fast early generations, scale up to 10b128f once data accumulates. Opt-in via `network_schedule=[(0, 6, 64), (20, 10, 128)]`.
+- **Tiered networks:** optional `network_schedule=[(0, 6, 64), (20, 10, 128)]` style schedule rebuilds the model + optimizer + SWA at tier boundaries; saved architecture is honored on resume.
+- **Supervised pretraining (optional cold-start):** Lichess PGN → one-hot shards (phase A) and Stockfish multi-PV distillation → soft-policy shards (phase B). Both feed the same streaming trainer with `--resume-from` so RL picks up from the supervised checkpoint.
 - `--resume-from` any checkpoint; architecture is read from the checkpoint itself (no silent mismatches).
 
 ### Play & Visualization
@@ -284,13 +285,17 @@ roughly 2–3× the LibTorch-FP16 baseline. Checkpoints land in
 ### Supervised pretraining from Lichess games (optional cold-start boost)
 
 Self-play from random weights is expensive. If you'd rather warm-start the network
-from human games first, the `training/pretrain_dataset.py` + `training/pretrain.py`
-pair does that end-to-end.
+from human games first, the pretraining stack does that end-to-end:
+
+- `training/pretrain_dataset.py` — Phase A shard builder (one-hot policy from PGN)
+- `training/stockfish_label.py` — Phase B labeler (Stockfish multi-PV soft policy)
+- `scripts/phase_b_parallel.py` — orchestrator that fans out N parallel SF workers
+- `training/pretrain.py` — streaming supervised trainer (shared by both phases)
 
 **Phase A — one-hot policy from a Lichess PGN dump:**
 
 1. Download a monthly database from <https://database.lichess.org/> (e.g.
-   `lichess_db_standard_rated_2026-03.pgn.zst`) and `zstd -d` it. Keeps both
+   `lichess_db_standard_rated_2026-03.pgn.zst`) and `zstd -d` it. Both
    `.pgn` and `.pgn.zst` are supported as input.
 2. Build shards (filters by Elo and time control, encodes 112×8×8 tensors with
    real 8-step history):
@@ -298,25 +303,51 @@ pair does that end-to-end.
    python -m training.pretrain_dataset ^
      --pgn lichess_db_standard_rated_2026-03.pgn ^
      --out-dir pretrain_data\phase_a ^
-     --min-elo 2400 --min-base-s 480 ^
-     --shard-size 100000
+     --min-elo 2000 --min-base-s 480 ^
+     --shard-size 100000 --max-positions 20000000
    ```
-3. Train on the shards (streams groups of shards to keep peak memory bounded):
+3. Train on the shards (streams shard groups to keep peak memory bounded;
+   `StreamingShardDataset` dodges the Windows kernel SHM leak that would
+   otherwise fire after ~50 iterations with `num_workers>0`):
    ```bat
    python -m training.pretrain ^
      --shard-dir pretrain_data\phase_a ^
-     --out checkpoints\pretrain_phase_a.pt ^
-     --blocks 10 --filters 128 --epochs 1
+     --out checkpoints\phase_a.pt ^
+     --blocks 20 --filters 256 --epochs 1 ^
+     --batch-size 1024 --lr 1e-3 --warmup-steps 500
    ```
 4. Launch self-play RL from the pretrained weights:
    ```bat
-   python -m training loop --resume-from checkpoints\pretrain_phase_a.pt
+   python -m training loop --resume-from checkpoints\phase_a.pt
    ```
 
-**Phase B (optional) — Stockfish multi-PV distillation** gives soft policy
-targets from `training/stockfish_label.py` (requires a local `stockfish`
-binary). Its shards drop into `training.pretrain` with `--soft-policy-weight 0.2`
-and `--resume-from <phase_a.pt>`. See the module docstrings for details.
+**Phase B — Stockfish multi-PV distillation (soft policy targets):**
+
+Labels positions with Stockfish at fixed depth + `multipv=N`, converting cp
+scores to a softmax policy and a Lc0-style WDL value. Shards drop into the
+same `training.pretrain` entry point via `--soft-policy-weight 0.2` and
+`--resume-from <phase_a.pt>`.
+
+On a Ryzen 5800X, 16 SF workers × 1 thread each outperforms 2 threads × 8
+workers for `multipv=10` searches (lazy-SMP overhead). The orchestrator
+pre-partitions the PGN into disjoint game ranges and handles crash resume by
+counting existing shards:
+
+```bat
+python scripts/phase_b_parallel.py ^
+  --pgn lichess_db_standard_rated_2026-03.pgn ^
+  --out-dir pretrain_data\phase_b ^
+  --stockfish engines\stockfish\stockfish-windows-x86-64-avx2.exe ^
+  --workers 16 --threads 1 --depth 13 --multipv 10 ^
+  --positions-per-worker 125000 --games-per-worker 200000
+
+python -m training.pretrain ^
+  --shard-dir pretrain_data\phase_b ^
+  --out checkpoints\phase_b.pt ^
+  --resume-from checkpoints\phase_a.pt ^
+  --soft-policy-weight 0.2 ^
+  --epochs 1 --batch-size 1024 --lr 5e-4 --warmup-steps 500
+```
 
 The Lichess `.pgn` / `.pgn.zst` files and `pretrain_data/` are gitignored.
 
@@ -356,9 +387,16 @@ build\Release\chess_engine.exe uci     <model.pt>  cuda    # LibTorch backend
 build\Release\chess_engine.exe uci_trt <engine.trt>        # TensorRT backend
 ```
 
-**On Lichess:** clone [lichess-bot](https://github.com/lichess-bot-devs/lichess-bot.git),
-set your token in `.env`, point its config at the `chess_engine.exe` above, and run
-`python lichess-bot.py -v`.
+**On Lichess:** clone [lichess-bot](https://github.com/lichess-bot-devs/lichess-bot.git)
+into `./lichess-bot/`, put `LICHESS_BOT_TOKEN=...` in `.env`, and launch via
+the bundled wrapper, which loads `.env`, prepends `$TENSORRT_PATH\bin` to
+`PATH`, and points lichess-bot at a `chess_engine_trt.cmd` shim that invokes
+`chess_engine.exe uci_trt <engine.trt>` (lichess-bot's `engine_options` only
+accepts `--key=value` flags, so positional args go through the cmd wrapper):
+
+```powershell
+.\run_bot.ps1
+```
 
 ---
 
@@ -406,19 +444,6 @@ docs/                Architecture, changelog, technical references
 build.ps1            One-shot Windows build script
 train.py             Interactive training launcher
 ```
-
----
-
-## Implementation Status
-
-| Phase | Description | Status |
-|:-----:|-------------|:------:|
-| 1 | Engine Core — bitboard, move generation, perft | Done |
-| 2 | MCTS Search — PUCT, batching, solver, pruning | Done |
-| 3 | Neural Network — SE-ResNet, attention policy, training | Done |
-| 4 | Self-Play Pipeline — RL loop, data generation, augmentation | Done |
-| 5 | C++ Inference — LibTorch + TensorRT, pybind11 bindings | Done |
-| 6 | Visualization — training dashboard, play interface, Lichess bot | Done |
 
 ---
 
