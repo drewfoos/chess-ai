@@ -12,10 +12,14 @@ dependencies = [
     "torch",
     "chess",
     "flask",
+    # torch.onnx.export (used by training/build_trt_engine.py) needs the
+    # onnx serializer. The NVIDIA `tensorrt` wheel only includes the ONNX
+    # parser (reads .onnx) — producing them is on us.
+    "onnx",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest"]
+dev = ["pytest", "onnxruntime"]
 # TensorRT is enabled by default in cmake.args below. The Python `tensorrt`
 # package is installed separately from NVIDIA's SDK (vendor wheel). Requires
 # TENSORRT_PATH env var pointing at the SDK root (e.g. C:\TensorRT-10.16.1.11)

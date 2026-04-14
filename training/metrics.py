@@ -25,6 +25,9 @@ class TrainingMetrics:
     value_loss: float
     num_batches: int
     learning_rate: float
+    # Auxiliary KataGo-style soft-policy CE, tracked separately so dashboards
+    # don't conflate it with the hard policy CE in `policy_loss`.
+    soft_policy_loss: float = 0.0
 
 
 class MetricsLogger:

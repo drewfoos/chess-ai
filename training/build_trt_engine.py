@@ -141,7 +141,16 @@ def refit_engine(
     if engine is None:
         raise RuntimeError(f"Failed to deserialize engine at {engine_path}")
 
-    refitter = trt.Refitter(engine, logger)
+    try:
+        refitter = trt.Refitter(engine, logger)
+    except TypeError as e:
+        # TensorRT's Refitter constructor returns nullptr for engines built
+        # without REFIT, which pybind11 surfaces as TypeError. Normalize to
+        # RuntimeError so callers only need to catch one type.
+        raise RuntimeError(
+            f"Engine at {engine_path} is not refittable "
+            f"(built without REFIT flag?): {e}"
+        )
     onnx_refitter = trt.OnnxParserRefitter(refitter, logger)
     if not onnx_refitter.refit_from_file(onnx_path):
         errs = '\n'.join(

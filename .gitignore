@@ -26,6 +26,7 @@ compile_commands.json
 CLAUDE.md
 brainstorm.md
 docs/superpowers/
+HANDOFF.md
 
 # Python
 __pycache__/
@@ -46,7 +47,9 @@ _skbuild/
 # Training data & output
 *.gz
 *.npz
+*.pgn
 data/
+pretrain_data/
 checkpoints/
 runs/
 selfplay_output/

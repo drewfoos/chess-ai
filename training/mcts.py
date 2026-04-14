@@ -24,8 +24,12 @@ class MCTSConfig:
     c_puct_init: float = 3.0
     c_puct_base: float = 19652.0
     c_puct_factor: float = 2.0
-    fpu_reduction: float = 1.2
-    fpu_reduction_root: float = 1.2
+    # Lc0 current defaults: non-root ~0.5 (FpuValue), root overridden by absolute
+    # strategy (fpu_absolute_root). Lowering non-root from the old 1.2 reduces
+    # over-pessimism on unvisited children, letting the tree commit visits to
+    # promising moves sooner.
+    fpu_reduction: float = 0.5
+    fpu_reduction_root: float = 0.5
     dirichlet_alpha: float = 0.3
     dirichlet_epsilon: float = 0.25
     temperature: float = 1.0

@@ -33,37 +33,28 @@ def compute_loss(
     mlh_pred: torch.Tensor | None = None,
     mlh_target: torch.Tensor | None = None,
     policy_mask: torch.Tensor | None = None,
-    soft_policy_weight: float = 2.0,
+    soft_policy_weight: float = 0.2,
     soft_policy_temperature: float = 4.0,
     wdl_label_smoothing: float = 0.05,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Compute combined policy + value + moves-left + soft policy loss.
 
-    Args:
-        policy_logits: Raw logits from policy head (B, 1858)
-        value_logits: Raw logits from value head (B, 3)
-        policy_target: MCTS visit distribution target (B, 1858)
-        value_target: WDL target (B, 3)
-        mlh_pred: Moves-left prediction from MLH head (B,), optional
-        mlh_target: Moves-left target (B,), optional
-        policy_mask: Boolean mask (B,) — True = use policy loss for this sample (playout cap)
-        soft_policy_weight: Weight for auxiliary soft policy loss (KataGo-style)
-        soft_policy_temperature: Temperature for soft policy target (higher = softer)
-
     Returns:
-        (total_loss, policy_loss, value_loss) tuple.
+        (total_loss, hard_policy_ce, value_loss, soft_policy_ce).
+        total_loss includes the soft-policy term weighted; hard_policy_ce and
+        soft_policy_ce are reported separately so metrics don't conflate them.
     """
-    # Policy loss: cross-entropy with soft targets
+    # Hard policy loss: cross-entropy against MCTS visit distribution.
     log_probs = F.log_softmax(policy_logits, dim=1)
     per_sample_policy = -(policy_target * log_probs).sum(dim=1)
     if policy_mask is not None and policy_mask.any() and not policy_mask.all():
-        # Only compute policy loss for full-search positions
         policy_loss = per_sample_policy[policy_mask].mean()
     else:
         policy_loss = per_sample_policy.mean()
 
     # Auxiliary soft policy loss (KataGo): raise search distribution to power 1/T,
-    # renormalize, and compute cross-entropy. Forces network to learn about non-obvious moves.
+    # renormalize, and compute CE. Forces the net to learn non-obvious moves.
+    soft_policy_loss = torch.zeros((), device=policy_logits.device, dtype=policy_loss.dtype)
     if soft_policy_weight > 0:
         soft_target = policy_target.pow(1.0 / soft_policy_temperature)
         soft_target = soft_target / (soft_target.sum(dim=1, keepdim=True) + 1e-8)
@@ -72,7 +63,6 @@ def compute_loss(
             soft_policy_loss = per_sample_soft[policy_mask].mean()
         else:
             soft_policy_loss = per_sample_soft.mean()
-        policy_loss = policy_loss + soft_policy_weight * soft_policy_loss
 
     # Value loss: cross-entropy with soft WDL targets.
     # Label smoothing (Lc0/KataGo): blend hard target with uniform [1/3,1/3,1/3]
@@ -84,14 +74,14 @@ def compute_loss(
     value_log_probs = F.log_softmax(value_logits, dim=1)
     value_loss = -(smoothed_target * value_log_probs).sum(dim=1).mean()
 
-    total = policy_loss + value_loss
+    total = policy_loss + soft_policy_weight * soft_policy_loss + value_loss
 
     # Moves-left loss: Huber loss (delta=10), scaled by 1/20 (Lc0 convention)
     if mlh_pred is not None and mlh_target is not None:
         mlh_loss = F.huber_loss(mlh_pred, mlh_target, delta=10.0) / 20.0
         total = total + mlh_loss
 
-    return total, policy_loss, value_loss
+    return total, policy_loss, value_loss, soft_policy_loss
 
 
 def create_optimizer(
@@ -121,7 +111,7 @@ def train_step(
     optimizer.zero_grad()
 
     policy_logits, value_logits, _ = model(planes)
-    loss, _, _ = compute_loss(policy_logits, value_logits, policy_target, value_target)
+    loss, _, _, _ = compute_loss(policy_logits, value_logits, policy_target, value_target)
 
     loss.backward()
     optimizer.step()
@@ -193,7 +183,7 @@ def train(
 
             with torch.amp.autocast(device_type=device, enabled=use_amp):
                 policy_logits, value_logits, mlh_pred = model(planes)
-                loss, p_loss, v_loss = compute_loss(
+                loss, p_loss, v_loss, _sp_loss = compute_loss(
                     policy_logits, value_logits, policies, values,
                     mlh_pred, mlh_target,
                 )

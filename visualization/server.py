@@ -11,6 +11,7 @@ import json
 import os
 import subprocess
 import threading
+import time
 
 from flask import Flask, jsonify, send_from_directory, request
 
@@ -19,6 +20,32 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ENGINE_PATH = os.path.join(REPO_ROOT, 'build', 'Release', 'chess_engine.exe')
 STOCKFISH_PATH = os.path.join(
     REPO_ROOT, 'engines', 'stockfish', 'stockfish-windows-x86-64-avx2.exe')
+
+
+def _engine_env() -> dict:
+    """Return a copy of os.environ with LibTorch / TensorRT bin dirs prepended
+    to PATH so chess_engine.exe (a subprocess) can resolve its native DLLs.
+
+    chess_mcts registers these via os.add_dll_directory for this Python
+    process, but that's not inherited by child processes — they need PATH.
+    """
+    env = os.environ.copy()
+    extras: list[str] = []
+    try:
+        from chess_mcts import _paths as _p  # type: ignore
+        for d in (getattr(_p, 'LIBTORCH_LIB', ''), getattr(_p, 'TENSORRT_BIN', '')):
+            if d and os.path.isdir(d):
+                extras.append(d)
+    except Exception:
+        pass
+    trt_root = os.environ.get('TENSORRT_PATH')
+    if trt_root:
+        trt_bin = os.path.join(trt_root, 'bin')
+        if os.path.isdir(trt_bin) and trt_bin not in extras:
+            extras.append(trt_bin)
+    if extras:
+        env['PATH'] = os.pathsep.join(extras) + os.pathsep + env.get('PATH', '')
+    return env
 
 
 def _scan_runs():
@@ -93,6 +120,11 @@ def _scan_models():
                 continue
             full = os.path.join(root, f)
             rel = os.path.relpath(full, REPO_ROOT).replace('\\', '/')
+            # Skip raw state_dict checkpoints — the engine needs TorchScript.
+            # Training saves per-generation checkpoints under `checkpoints/`;
+            # exported TorchScript / TRT models sit at the run root.
+            if '/checkpoints/' in rel + '/':
+                continue
             parts = rel.split('/')
             run = parts[1] if len(parts) > 2 else ''
             out.append({
@@ -109,7 +141,8 @@ def _scan_models():
 def _spawn_engine(model_path: str | None):
     """Launch chess_engine.exe in UCI mode, optionally loading a model.
 
-    Returns the process or raises RuntimeError.
+    Retries once on handshake failure (can happen when training rewrites the
+    .trt mid-spawn). On final failure, includes engine stderr in the message.
     """
     if not os.path.exists(ENGINE_PATH):
         raise RuntimeError(f"Engine not built: {ENGINE_PATH}")
@@ -127,31 +160,55 @@ def _spawn_engine(model_path: str | None):
         else:
             cmd = [ENGINE_PATH, 'uci', abs_model, 'cuda']
 
-    proc = subprocess.Popen(
-        cmd,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        bufsize=1,
-    )
-    proc.stdin.write("uci\n")
-    proc.stdin.flush()
-    while True:
-        line = proc.stdout.readline()
-        if not line:
-            raise RuntimeError("Engine terminated during UCI handshake")
-        if line.strip() == "uciok":
-            break
-    proc.stdin.write("isready\n")
-    proc.stdin.flush()
-    while True:
-        line = proc.stdout.readline()
-        if not line:
-            raise RuntimeError("Engine terminated during readyok handshake")
-        if line.strip() == "readyok":
-            break
-    return proc
+    def _attempt():
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+            env=_engine_env(),
+        )
+        try:
+            proc.stdin.write("uci\n")
+            proc.stdin.flush()
+            while True:
+                line = proc.stdout.readline()
+                if not line:
+                    err = (proc.stderr.read() or '').strip()
+                    raise RuntimeError(
+                        "Engine terminated during UCI handshake"
+                        + (f": {err}" if err else "")
+                    )
+                if line.strip() == "uciok":
+                    break
+            proc.stdin.write("isready\n")
+            proc.stdin.flush()
+            while True:
+                line = proc.stdout.readline()
+                if not line:
+                    err = (proc.stderr.read() or '').strip()
+                    raise RuntimeError(
+                        "Engine terminated during readyok handshake"
+                        + (f": {err}" if err else "")
+                    )
+                if line.strip() == "readyok":
+                    break
+            return proc
+        except Exception:
+            try:
+                if proc.poll() is None:
+                    proc.kill()
+            except Exception:
+                pass
+            raise
+
+    try:
+        return _attempt()
+    except RuntimeError:
+        time.sleep(0.5)
+        return _attempt()
 
 
 def _spawn_stockfish():
@@ -164,6 +221,7 @@ def _spawn_stockfish():
         stderr=subprocess.PIPE,
         text=True,
         bufsize=1,
+        env=_engine_env(),
     )
     proc.stdin.write("uci\n")
     proc.stdin.flush()

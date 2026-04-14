@@ -1107,8 +1107,8 @@ def test_updated_search_params():
     cfg = MCTSConfig()
     assert cfg.c_puct_init == 3.0
     assert cfg.policy_softmax_temperature == 1.61
-    assert cfg.fpu_reduction == 1.2
-    assert cfg.fpu_reduction_root == 1.2
+    assert cfg.fpu_reduction == 0.5
+    assert cfg.fpu_reduction_root == 0.5
 
 
 def test_playout_cap_randomization():
@@ -1157,12 +1157,13 @@ def test_policy_mask_in_loss():
     policy_target = torch.softmax(torch.randn(B, 1858), dim=1)
     value_target = torch.softmax(torch.randn(B, 3), dim=1)
     mask = torch.tensor([True, False, True, False])
-    total, p_loss, v_loss = compute_loss(
+    total, p_loss, v_loss, sp_loss = compute_loss(
         policy_logits, value_logits, policy_target, value_target, policy_mask=mask,
     )
     # Policy loss should only be from positions 0 and 2
     assert p_loss.item() > 0
     assert v_loss.item() > 0
+    assert sp_loss.item() >= 0
 
 
 def test_syzygy_rescore_function():
@@ -1231,17 +1232,20 @@ def test_soft_policy_loss():
     value_target[:, 0] = 1.0  # all wins
 
     # Without soft policy
-    loss_no_soft, p_no_soft, v1 = compute_loss(
+    loss_no_soft, p_no_soft, v1, sp_no = compute_loss(
         policy_logits, value_logits, policy_target, value_target,
         soft_policy_weight=0.0,
     )
     # With soft policy
-    loss_soft, p_soft, v2 = compute_loss(
+    loss_soft, p_soft, v2, sp_yes = compute_loss(
         policy_logits, value_logits, policy_target, value_target,
         soft_policy_weight=2.0, soft_policy_temperature=4.0,
     )
-    # Soft policy should add to the loss (value loss is the same)
-    assert p_soft.item() > p_no_soft.item()
+    # Hard policy CE is identical (same logits/targets); soft term is an
+    # auxiliary that contributes only to `total`, not to `p_loss`.
+    assert torch.allclose(p_soft, p_no_soft)
+    assert sp_yes.item() > 0.0
+    assert sp_no.item() == 0.0
     assert loss_soft.item() > loss_no_soft.item()
 
 

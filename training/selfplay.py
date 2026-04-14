@@ -128,7 +128,11 @@ class SelfPlayConfig:
     max_moves: int = 512
     resign_threshold: float = -0.95
     consecutive_resign: int = 5
-    q_ratio: float = 0.0  # Blend ratio: 0 = pure game result, 1 = pure search Q
+    # Lc0-style Q-value blending into the value target: 0 = pure game result,
+    # 1 = pure search-Q. A moderate blend (~0.25) de-noises terminal-only
+    # training signal, especially in long games where the final result is a
+    # weak label for most positions.
+    q_ratio: float = 0.25
     playout_cap_randomization: bool = True   # Alternate full/quick search
     playout_cap_fraction: float = 0.25       # Fraction of moves that get full search
     playout_cap_quick_sims: int = 100        # Simulations for quick search moves
@@ -933,14 +937,20 @@ def _build_window_dataloader(
     return dataset, loader
 
 
-def _train_one_cycle(model, optimizer, dataloader, device, train_epochs):
-    """Run `train_epochs` epochs over `dataloader`. Returns (tot, pol, val, nb)."""
+def _train_one_cycle(model, optimizer, dataloader, device, train_epochs, scheduler=None):
+    """Run `train_epochs` epochs over `dataloader`.
+
+    Returns (total, policy_hard, value, soft_policy, num_batches). All four
+    loss terms are tracked separately so the dashboard can show hard vs soft
+    policy CE without conflating them.
+    """
     from training.train import compute_loss
 
     model.train()
     total_loss_sum = 0.0
     policy_loss_sum = 0.0
     value_loss_sum = 0.0
+    soft_policy_loss_sum = 0.0
     num_batches = 0
 
     use_amp = (device == 'cuda')
@@ -963,7 +973,7 @@ def _train_one_cycle(model, optimizer, dataloader, device, train_epochs):
             optimizer.zero_grad()
             with torch.amp.autocast(device_type=device, enabled=use_amp):
                 policy_logits, value_logits, mlh_pred = model(planes)
-                total_loss, policy_loss, value_loss = compute_loss(
+                total_loss, policy_loss, value_loss, soft_policy_loss = compute_loss(
                     policy_logits, value_logits, policy_target, value_target,
                     mlh_pred, mlh_target, policy_mask,
                 )
@@ -972,13 +982,16 @@ def _train_one_cycle(model, optimizer, dataloader, device, train_epochs):
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
             scaler.step(optimizer)
             scaler.update()
+            if scheduler is not None:
+                scheduler.step()
 
             total_loss_sum += total_loss.item()
             policy_loss_sum += policy_loss.item()
             value_loss_sum += value_loss.item()
+            soft_policy_loss_sum += soft_policy_loss.item()
             num_batches += 1
 
-    return total_loss_sum, policy_loss_sum, value_loss_sum, num_batches
+    return total_loss_sum, policy_loss_sum, value_loss_sum, soft_policy_loss_sum, num_batches
 
 
 def training_loop(
@@ -1006,6 +1019,8 @@ def training_loop(
     network_schedule: list[tuple[int, int, int]] | None = None,
     use_trt: bool = True,
     restore_from_checkpoint: list[str] | None = None,
+    lr_milestones: list[int] | None = None,
+    lr_gamma: float = 0.1,
 ):
     """Full reinforcement learning training loop.
 
@@ -1030,6 +1045,28 @@ def training_loop(
     from training.dataset import ChessDataset
     from training.train import compute_loss, create_optimizer
     from training.export import export_torchscript
+    from torch.optim.lr_scheduler import LinearLR, MultiStepLR, SequentialLR
+
+    def _build_warmup_scheduler(
+        opt,
+        steps: int = 250,
+        milestones: list[int] | None = None,
+        gamma: float = 0.1,
+    ):
+        """LinearLR warmup over `steps` batches; caller steps it per batch.
+
+        If `milestones` is given, a MultiStepLR decay is chained after warmup
+        via SequentialLR. Milestones are absolute batch-step indices measured
+        from scheduler construction. On resume / tier transition the scheduler
+        is rebuilt, so milestones restart counting from 0 at that point.
+        """
+        warmup = LinearLR(opt, start_factor=1e-6, end_factor=1.0, total_iters=steps)
+        if not milestones:
+            return warmup
+        # MultiStepLR milestones are relative to its own step counter, which
+        # SequentialLR starts from 0 after the warmup phase ends.
+        decay = MultiStepLR(opt, milestones=list(milestones), gamma=gamma)
+        return SequentialLR(opt, [warmup, decay], milestones=[steps])
 
     if device == 'auto':
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -1082,6 +1119,13 @@ def training_loop(
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         except (ValueError, KeyError) as e:
             print(f"  Optimizer state could not be restored ({e}); continuing with fresh optimizer.")
+        # Construct the LR warmup scheduler AFTER load_state_dict: LinearLR's
+        # initial step multiplies the current param_group['lr'] by start_factor,
+        # and later steps derive the next lr from the current lr via a formula
+        # that assumes lr was set by the scheduler (not restored from a
+        # checkpoint). Reversing the order causes lr to explode by ~1e6×
+        # after the first training step (lr=1e-3 → ~4 → ~1000).
+        scheduler = _build_warmup_scheduler(optimizer, milestones=lr_milestones, gamma=lr_gamma)
         # Restore tier schedule from checkpoint if caller didn't override it.
         # Lets auto-resume preserve the original run's scale-up plan instead
         # of silently dropping it (which would pin the net at the small tier).
@@ -1125,6 +1169,7 @@ def training_loop(
         config = NetworkConfig(num_blocks=blocks, num_filters=filters)
         model = ChessNetwork(config).to(device)
         optimizer = create_optimizer(model, lr=lr, weight_decay=weight_decay)
+        scheduler = _build_warmup_scheduler(optimizer, milestones=lr_milestones, gamma=lr_gamma)
 
     # Stochastic Weight Averaging: use averaged model for self-play (smoother policy)
     swa_model = None
@@ -1188,6 +1233,7 @@ def training_loop(
             config = NetworkConfig(num_blocks=target_blocks, num_filters=target_filters)
             model = ChessNetwork(config).to(device)
             optimizer = create_optimizer(model, lr=lr, weight_decay=weight_decay)
+            scheduler = _build_warmup_scheduler(optimizer, milestones=lr_milestones, gamma=lr_gamma)
             if use_swa:
                 from torch.optim.swa_utils import AveragedModel
                 swa_model = AveragedModel(model)
@@ -1205,7 +1251,7 @@ def training_loop(
                 if warmup_loader is not None:
                     print(f"  Warm-up training new net on window {warmup_start}-{warmup_end}"
                           f" ({train_epochs} epochs) before self-play")
-                    _train_one_cycle(model, optimizer, warmup_loader, device, train_epochs)
+                    _train_one_cycle(model, optimizer, warmup_loader, device, train_epochs, scheduler)
                     if swa_model is not None:
                         swa_model.update_parameters(model)
 
@@ -1274,8 +1320,9 @@ def training_loop(
         )
 
         # 3. Train for train_epochs epochs (with mixed precision on CUDA)
-        total_loss_sum, policy_loss_sum, value_loss_sum, num_batches = _train_one_cycle(
-            model, optimizer, dataloader, device, train_epochs,
+        (total_loss_sum, policy_loss_sum, value_loss_sum,
+         soft_policy_loss_sum, num_batches) = _train_one_cycle(
+            model, optimizer, dataloader, device, train_epochs, scheduler,
         )
 
         # Update SWA model after training
@@ -1316,9 +1363,11 @@ def training_loop(
         avg_total = total_loss_sum / max(num_batches, 1)
         avg_policy = policy_loss_sum / max(num_batches, 1)
         avg_value = value_loss_sum / max(num_batches, 1)
+        avg_soft = soft_policy_loss_sum / max(num_batches, 1)
         print(f"Gen {gen} complete: {num_positions} positions, "
               f"{len(dataset)} training samples (window {window_start}-{gen})")
-        print(f"  Loss: total={avg_total:.4f}, policy={avg_policy:.4f}, value={avg_value:.4f}")
+        print(f"  Loss: total={avg_total:.4f}, policy={avg_policy:.4f},"
+              f" value={avg_value:.4f}, soft_policy={avg_soft:.4f}")
         print(f"  Time: {gen_time:.1f}s, Checkpoint: {checkpoint_path}")
         training_metrics = TrainingMetrics(
             total_loss=avg_total,
@@ -1326,6 +1375,7 @@ def training_loop(
             value_loss=avg_value,
             num_batches=num_batches,
             learning_rate=optimizer.param_groups[0]['lr'],
+            soft_policy_loss=avg_soft,
         )
         metrics_logger.save_generation(
             generation=gen,
@@ -1384,6 +1434,10 @@ def main():
     loop_parser.add_argument('--no-use-trt', dest='use_trt', action='store_false', default=argparse.SUPPRESS, help='Disable TensorRT backend (use LibTorch only)')
     loop_parser.add_argument('--network-schedule', type=str, default=None,
                              help='Tiered net schedule, e.g. "1:6:64,20:10:128" (gen_start:blocks:filters, comma-separated)')
+    loop_parser.add_argument('--lr-milestones', type=str, default=None,
+                             help='Comma-separated batch-step indices for MultiStepLR decay after warmup, e.g. "30000,60000"')
+    loop_parser.add_argument('--lr-gamma', type=float, default=0.1,
+                             help='LR multiplier applied at each --lr-milestones step (default 0.1)')
 
     args = parser.parse_args()
 
@@ -1447,6 +1501,10 @@ def main():
         if not use_trt_explicit:
             restore.append('use_trt')
 
+        lr_milestones = None
+        if getattr(args, 'lr_milestones', None):
+            lr_milestones = [int(x) for x in args.lr_milestones.split(',') if x.strip()]
+
         training_loop(
             generations=args.generations,
             games_per_gen=args.games_per_gen,
@@ -1469,6 +1527,8 @@ def main():
             use_trt=getattr(args, 'use_trt', True),
             network_schedule=schedule,
             restore_from_checkpoint=restore,
+            lr_milestones=lr_milestones,
+            lr_gamma=getattr(args, 'lr_gamma', 0.1),
         )
 
 

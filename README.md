@@ -4,7 +4,7 @@
   <img src="https://img.shields.io/badge/PyTorch-2.11-ee4c2c?style=flat-square&logo=pytorch&logoColor=white" alt="PyTorch">
   <img src="https://img.shields.io/badge/CUDA-12.6-76b900?style=flat-square&logo=nvidia&logoColor=white" alt="CUDA 12.6">
   <img src="https://img.shields.io/badge/TensorRT-10.x-76b900?style=flat-square&logo=nvidia&logoColor=white" alt="TensorRT 10">
-  <img src="https://img.shields.io/badge/tests-184%20C%2B%2B%20%7C%20138%20Python-brightgreen?style=flat-square" alt="Tests">
+  <img src="https://img.shields.io/badge/tests-199%20C%2B%2B%20%7C%20144%20Python-brightgreen?style=flat-square" alt="Tests">
   <img src="https://img.shields.io/badge/license-MIT-green?style=flat-square" alt="MIT License">
 </p>
 
@@ -130,28 +130,45 @@ Smaller / larger GPUs work — just reduce/raise `--parallel-games` and the netw
 - **Windows 11** (instructions below assume PowerShell; WSL/Linux works but isn't documented here)
 - **Visual Studio 2022** with the *Desktop development with C++* workload
 - **CMake 3.20+** — [cmake.org](https://cmake.org/download/), ensure it's on `PATH`
-- **Python 3.11** — recommend [python.org](https://www.python.org/downloads/) installer
+- **Python 3.11 or 3.12** — recommend [python.org](https://www.python.org/downloads/) installer
 - **NVIDIA GPU** with CUDA 12.x drivers (RTX 2000+ for Tensor Cores)
 - **~15 GB free disk** (LibTorch ~4 GB, TensorRT ~3 GB, build artifacts ~1 GB)
 
-### 2. Clone & Python deps
+> ⚠️ **Run all build steps from "x64 Native Tools Command Prompt for VS 2022"**
+> (Start menu → Visual Studio 2022 folder). A plain PowerShell, Git Bash, or the
+> default *Developer PowerShell* (which targets x86) will fail during CMake's CUDA
+> compiler-ID test with `nvcc fatal: Cannot find compiler 'cl.exe' in PATH` or a
+> generator-platform mismatch. The x64 Native Tools prompt sets up `vcvars64`
+> automatically.
 
-```powershell
+### 2. Clone & Python venv
+
+```bat
 git clone <this repo> E:\dev\chess-ai
 cd E:\dev\chess-ai
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
+py -3.11 -m venv .venv
+.venv\Scripts\activate
+python -m pip install --upgrade pip
+
+:: Torch with matching CUDA build (3 GB download — the default pypi wheel is CPU-only).
+:: This MUST come before `pip install -e .` so scikit-build-core sees GPU torch.
 pip install torch --index-url https://download.pytorch.org/whl/cu126
 ```
 
-Other Python deps (`numpy`, `python-chess`, `flask`, `pybind11`) are installed
-automatically when you run `pip install -e .` in step 5 below — they're
-declared in `pyproject.toml` as project dependencies.
+Other Python deps (`numpy`, `python-chess`, `flask`, `onnx`, `pybind11`) install
+automatically when you run `pip install -e .` in step 5 — they're declared in
+`pyproject.toml`.
 
-### 3. Install LibTorch (required for C++ neural inference)
+### 3. LibTorch (only for the C++-only `build.ps1` workflow)
 
-Download the **LibTorch C++ Windows** zip (Release, CUDA 12.6) from
-<https://pytorch.org/get-started/locally/> and extract so that `libtorch/` sits at the repo root:
+If you're using the **Python workflow** (`pip install -e .`, step 5 below),
+**skip this step** — the PyTorch pip wheel already bundles LibTorch, and
+scikit-build-core discovers it automatically from your venv's site-packages.
+
+If you're building via `build.ps1` and don't want the full Python stack,
+download the **LibTorch C++ Windows** zip (Release, CUDA 12.6) from
+<https://pytorch.org/get-started/locally/> and extract so that `libtorch/`
+sits at the repo root:
 
 ```
 E:\dev\chess-ai\libtorch\
@@ -224,11 +241,14 @@ cmake --build build --config Release --parallel
 
 ### 6. Test
 
-```powershell
-# C++ tests (184 total, includes TRT tests when built with TensorRT)
+```bat
+:: C++ tests (199 total, includes TRT + Syzygy tests when built with those)
+:: For the pip/scikit-build path, the build dir is wheel-tagged:
+ctest --test-dir build\cp311-cp311-win_amd64 --build-config Release --output-on-failure
+:: For the build.ps1 path:
 ctest --test-dir build --build-config Release --output-on-failure
 
-# Python tests (138 total)
+:: Python tests (146 total)
 python -m pytest training/test_training.py -v
 ```
 
@@ -260,6 +280,45 @@ Throughput reference (RTX 3080, 10b128f net, TRT FP16, 400 sims, 128 parallel ga
 roughly 2–3× the LibTorch-FP16 baseline. Checkpoints land in
 `selfplay_output/checkpoints/model_gen_N.pt`; ONNX and TRT artifacts live alongside
 `cpp_model.pt` and are rebuilt automatically each generation.
+
+### Supervised pretraining from Lichess games (optional cold-start boost)
+
+Self-play from random weights is expensive. If you'd rather warm-start the network
+from human games first, the `training/pretrain_dataset.py` + `training/pretrain.py`
+pair does that end-to-end.
+
+**Phase A — one-hot policy from a Lichess PGN dump:**
+
+1. Download a monthly database from <https://database.lichess.org/> (e.g.
+   `lichess_db_standard_rated_2026-03.pgn.zst`) and `zstd -d` it. Keeps both
+   `.pgn` and `.pgn.zst` are supported as input.
+2. Build shards (filters by Elo and time control, encodes 112×8×8 tensors with
+   real 8-step history):
+   ```bat
+   python -m training.pretrain_dataset ^
+     --pgn lichess_db_standard_rated_2026-03.pgn ^
+     --out-dir pretrain_data\phase_a ^
+     --min-elo 2400 --min-base-s 480 ^
+     --shard-size 100000
+   ```
+3. Train on the shards (streams groups of shards to keep peak memory bounded):
+   ```bat
+   python -m training.pretrain ^
+     --shard-dir pretrain_data\phase_a ^
+     --out checkpoints\pretrain_phase_a.pt ^
+     --blocks 10 --filters 128 --epochs 1
+   ```
+4. Launch self-play RL from the pretrained weights:
+   ```bat
+   python -m training loop --resume-from checkpoints\pretrain_phase_a.pt
+   ```
+
+**Phase B (optional) — Stockfish multi-PV distillation** gives soft policy
+targets from `training/stockfish_label.py` (requires a local `stockfish`
+binary). Its shards drop into `training.pretrain` with `--soft-policy-weight 0.2`
+and `--resume-from <phase_a.pt>`. See the module docstrings for details.
+
+The Lichess `.pgn` / `.pgn.zst` files and `pretrain_data/` are gitignored.
 
 ### Tiered networks (recommended for cold starts)
 
@@ -310,6 +369,7 @@ src/
   core/          Board representation, types, move generation, attack tables
   mcts/          MCTS search, node arena, game manager (cross-game batching)
   neural/        Position encoder, policy map, NeuralEvaluator, TRTEvaluator
+  syzygy/        Fathom WDL wrapper (in-search endgame tablebase probing)
   uci/           UCI protocol handler, time management
   python/
     bindings.cpp   pybind11 entry -> chess_mcts._core
@@ -328,6 +388,9 @@ training/
   export.py          TorchScript + ONNX export
   build_trt_engine.py ONNX -> TensorRT FP16 engine builder
   metrics.py         Per-generation JSON metrics logger
+  pretrain_dataset.py Lichess PGN -> format-v2 .npz shards (Phase A warm start)
+  pretrain.py        Supervised pretraining loop over shard groups
+  stockfish_label.py Phase B: Stockfish multi-PV distillation for soft targets
 
 visualization/
   server.py          Flask API + UCI subprocess management
@@ -335,7 +398,10 @@ visualization/
     index.html       Training dashboard
     play.html        Interactive play page
 
-tests/               184 Google Test cases (neural + TRT tests opt-in at build)
+external/
+  fathom/            Vendored Syzygy tablebase probing library (C11)
+
+tests/               199 Google Test cases (neural + TRT + Syzygy tests opt-in at build)
 docs/                Architecture, changelog, technical references
 build.ps1            One-shot Windows build script
 train.py             Interactive training launcher
@@ -353,6 +419,18 @@ train.py             Interactive training launcher
 | 4 | Self-Play Pipeline — RL loop, data generation, augmentation | Done |
 | 5 | C++ Inference — LibTorch + TensorRT, pybind11 bindings | Done |
 | 6 | Visualization — training dashboard, play interface, Lichess bot | Done |
+
+---
+
+## Troubleshooting
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `nvcc fatal: Cannot find compiler 'cl.exe' in PATH` during CUDA compiler-ID test | Shell doesn't have MSVC on `PATH` | Use **x64 Native Tools Command Prompt for VS 2022** (not PowerShell or Developer PowerShell) |
+| `generator platform: Win32 Does not match the platform used previously: x64` | Mixing x86 and x64 shells between runs | `rmdir /s /q build` and restart from the x64 Native Tools prompt |
+| `#error: "C atomics require C11 or later"` or `"C atomic support is not enabled"` when compiling Fathom | MSVC gates C11 atomics behind `/experimental:c11atomics` | Already handled in `CMakeLists.txt`; ensure you're on MSVC 19.43+ (VS 17.13+) |
+| `torch.onnx.OnnxExporterError: Module onnx is not installed` during training tests | `onnx` missing from the venv | `pip install onnx` (now listed in `pyproject.toml`, so fresh installs pick it up) |
+| `library kineto not found` CMake warning | Harmless — optional perf profiler, not wired into the build | Ignore |
 
 ---
 
