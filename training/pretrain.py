@@ -106,7 +106,13 @@ def pretrain(
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
     use_amp = (device == 'cuda')
 
-    shard_paths = sorted(glob.glob(os.path.join(shard_dir, 'shard_*.npz')))
+    # Recursive so Phase B's orchestrator layout (part_NN/shard_*.npz) works
+    # alongside Phase A's flat layout.
+    shard_paths = sorted(
+        glob.glob(os.path.join(shard_dir, 'shard_*.npz'))
+        + glob.glob(os.path.join(shard_dir, '**', 'shard_*.npz'), recursive=True)
+    )
+    shard_paths = sorted(set(shard_paths))
     if not shard_paths:
         raise FileNotFoundError(f"No shard_*.npz files under {shard_dir}")
     print(f"Found {len(shard_paths)} shards under {shard_dir}")

@@ -17,7 +17,29 @@ from flask import Flask, jsonify, send_from_directory, request
 
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-ENGINE_PATH = os.path.join(REPO_ROOT, 'build', 'Release', 'chess_engine.exe')
+
+
+def _find_engine() -> str:
+    """Locate chess_engine.exe across CMake and scikit-build-core build dirs.
+
+    The legacy layout was build/Release/chess_engine.exe. After the
+    scikit-build-core migration (pip install -e .), it lives under
+    build/<wheel_tag>/Release/. Prefer the most recently built copy.
+    """
+    import glob
+    candidates = []
+    legacy = os.path.join(REPO_ROOT, 'build', 'Release', 'chess_engine.exe')
+    if os.path.isfile(legacy):
+        candidates.append(legacy)
+    candidates.extend(glob.glob(
+        os.path.join(REPO_ROOT, 'build', '*', 'Release', 'chess_engine.exe')
+    ))
+    if not candidates:
+        return legacy  # returned so error messages still point somewhere sensible
+    return max(candidates, key=os.path.getmtime)
+
+
+ENGINE_PATH = _find_engine()
 STOCKFISH_PATH = os.path.join(
     REPO_ROOT, 'engines', 'stockfish', 'stockfish-windows-x86-64-avx2.exe')
 

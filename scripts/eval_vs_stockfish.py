@@ -98,8 +98,8 @@ def play_match(our_cmd: list[str],
 
         for g in range(num_games):
             our_is_white = (g % 2 == 0)
-            our_engine.ucinewgame()
-            sf_engine.ucinewgame()
+            # python-chess SimpleEngine has no public ucinewgame(); engines
+            # reset state implicitly when play() gets a fresh board.
             outcome = play_game(our_engine, sf_engine, our_is_white, movetime_ms, max_plies)
             if outcome == '1-0':
                 result.wins += 1

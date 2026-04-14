@@ -49,14 +49,17 @@ class StockfishMultiPV:
         binary = os.path.abspath(binary)
         if not os.path.isfile(binary):
             raise FileNotFoundError(f"Stockfish binary not found: {binary}")
+        # Merge stderr into stdout so any SF warnings/crashes land in the
+        # worker log; the UCI parser already drops non-info/non-bestmove lines.
         self.proc = subprocess.Popen(
             [binary],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.STDOUT,
             text=True,
             bufsize=1,
         )
+        self._last_fen: str | None = None
         self.multipv = multipv
         self._send('uci')
         self._read_until('uciok')
@@ -89,6 +92,7 @@ class StockfishMultiPV:
         large cp values: +30000 - ply for a mate we give, -30000 + ply for a
         mate we receive (Lc0 convention).
         """
+        self._last_fen = fen
         self._send(f'position fen {fen}')
         self._send(f'go depth {depth}')
 
@@ -98,7 +102,11 @@ class StockfishMultiPV:
         while True:
             line = self.proc.stdout.readline()
             if not line:
-                raise RuntimeError("stockfish closed stdout unexpectedly")
+                rc = self.proc.poll()
+                raise RuntimeError(
+                    f"stockfish closed stdout unexpectedly "
+                    f"(returncode={rc}, fen={fen!r})"
+                )
             if line.startswith('bestmove'):
                 break
             if not line.startswith('info'):
@@ -250,6 +258,8 @@ def label_pgn(
     max_games: int | None = None,
     skip_opening_plies: int = 10,
     start_shard: int = 0,
+    skip_games: int = 0,
+    max_games_abs: int | None = None,
 ) -> None:
     """Walk `pgn_path`; for each qualifying game, sample positions and label
     them with Stockfish multipv. Writes shards under `out_dir`.
@@ -268,8 +278,25 @@ def label_pgn(
 
     try:
         with open_pgn_stream(pgn_path) as stream:
+            # Fast-forward past games already processed in a previous run.
+            # Header-only parse is fast (~100k games/s), so even a 10M-game
+            # skip adds only ~100s before labeling resumes. Used for resume
+            # after ctrl-c and for game-range partitioning in parallel
+            # orchestration (scripts/phase_b_parallel.py).
+            if skip_games > 0:
+                skipped = 0
+                t_skip = time.time()
+                for _ in iter_pgn_games(stream):
+                    skipped += 1
+                    if skipped >= skip_games:
+                        break
+                print(f"  skipped {skipped:,} games in {time.time() - t_skip:.1f}s")
+                games_read = skipped
+
             for game in iter_pgn_games(stream):
                 games_read += 1
+                if max_games_abs is not None and games_read > max_games_abs:
+                    break
                 if not headers_pass_filters(game.headers, min_elo, min_base_s, allowed_results):
                     continue
 
@@ -359,6 +386,12 @@ def main():
     parser.add_argument('--max-games', type=int, default=None)
     parser.add_argument('--skip-opening-plies', type=int, default=10)
     parser.add_argument('--start-shard', type=int, default=0)
+    parser.add_argument('--skip-games', type=int, default=0,
+                        help='Skip the first N games in the PGN before labeling. '
+                             'Used for resume-after-crash and parallel partitioning.')
+    parser.add_argument('--max-games-abs', type=int, default=None,
+                        help='Stop after the absolute game index reaches this value. '
+                             'With --skip-games, forms a half-open [skip, max) game window.')
     args = parser.parse_args()
 
     label_pgn(
@@ -378,6 +411,8 @@ def main():
         max_games=args.max_games,
         skip_opening_plies=args.skip_opening_plies,
         start_shard=args.start_shard,
+        skip_games=args.skip_games,
+        max_games_abs=args.max_games_abs,
     )
 
 

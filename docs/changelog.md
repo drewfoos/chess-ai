@@ -8,6 +8,21 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 
 ## [Unreleased]
 
+### Added — Supervised Pretraining Pipeline (Phase A + Phase B)
+- `training/pretrain_dataset.py`: streams a Lichess `.pgn` / `.pgn.zst` dump, filters by Elo + time control + game result, and writes format-v2 `.npz` shards with one-hot policy targets + WDL values (phase A). `ShardBuffer` packs dense planes to 104×uint64 bitboards so shards stay compatible with `ChessDataset` and the RL path.
+- `training/pretrain.py`: streaming supervised trainer. `StreamingShardDataset` (IterableDataset) feeds one persistent DataLoader for the whole run to dodge a Windows kernel shared-memory leak (OSError 1450, "no system resources") that surfaced after ~50 shard-group iterations with `num_workers>0`. Honors `--resume-from` so phase B continues from phase A weights and auto-rebuilds the model if the saved `NetworkConfig` differs from the CLI args. `--soft-policy-weight` routes phase-B soft-policy loss through `training.train.compute_loss`.
+- `training/stockfish_label.py`: phase-B Stockfish multi-PV distillation. `StockfishMultiPV` drives a SF subprocess speaking UCI; `cp_to_wdl()` maps best-move cp to Lc0-style WDL; `cp_scores_to_policy()` builds soft policy via `softmax(cp / T)` over the top-N PV moves. New `--skip-games N` / `--max-games-abs N` flags carve out a half-open `[skip, max)` PGN game window per worker for parallel orchestration and crash-resume.
+- `scripts/phase_b_parallel.py`: orchestrator that fans out N `stockfish_label` subprocesses over disjoint PGN game ranges, each writing to `part_NN/` so shard filenames never collide. Pre-partitioned ranges (no IPC queue) + position-count resume by counting `shard_*.npz` files. SIGINT/SIGTERM propagates to all workers with a 10s graceful window. Ran in ~6.4h for 2M positions on Ryzen 5800X (16 workers × 1 thread × depth 13 × multipv 10 — 1 thread/worker beats 2/worker on multipv=10 due to SF lazy-SMP overhead).
+- `run_bot.ps1`: loads `.env` (`LICHESS_BOT_TOKEN`), prepends `$TENSORRT_PATH\bin` to `PATH`, and launches lichess-bot. Pairs with `lichess-bot/chess_engine_trt.cmd`, a thin wrapper that invokes `chess_engine.exe uci_trt <engine.trt>` (lichess-bot's `engine_options` only supports `--key=value` flags, so positional args go through the cmd wrapper).
+- README adds a "Supervised pretraining from Lichess games" section; `.gitignore` adds `*.pgn` / `pretrain_data/` / `HANDOFF.md` so the 209 GB PGN dump and shard artifacts don't leak into commits.
+
+### Fixed
+- `training/pretrain.py` shard discovery is now recursive (`shard_*.npz` under `shard_dir/**`) so phase B's `part_NN/` layout is picked up alongside phase A's flat layout.
+- `training/stockfish_label.py` subprocess now captures `stderr` into `stdout` (was `DEVNULL`) and includes the last FEN + SF return code in the "closed stdout unexpectedly" exception — previously a mid-run SF crash left only a bare traceback with no clue which position killed it.
+- `scripts/phase_b_parallel.py` spawns workers with `python -u` so the Phase-B labeler's `print()` calls flush immediately to the per-worker log file (stdout is block-buffered when redirected to a non-tty, which was making alive workers look idle for 200+s).
+- `visualization/server.py` now resolves the engine binary via `_find_engine()` instead of a hardcoded `build/Release/chess_engine.exe` path. scikit-build-core emits to `build/<wheel-tag>/Release/` (e.g. `cp311-cp311-win_amd64`), so the old path broke the dashboard's `/play` subprocess whenever the engine was only built through `pip install -e .`.
+- `scripts/eval_vs_stockfish.py` no longer calls `engine.ucinewgame()` — `python-chess`'s `SimpleEngine` has no such public method; engines reset state implicitly on `play()` with a fresh `Board()`.
+
 ### Added — Syzygy Endgame Tablebases In-Search
 - Vendored Fathom (`external/fathom/src/`) and built it as a static lib linked into `chess_core`
 - New `src/syzygy/syzygy.{h,cpp}` exposes a thin C++ wrapper: `TableBase::init(path)`, `probe_wdl(pos) → {hit, WDL}`, `shutdown()`, plus `ready()` / `max_pieces()` / `hits()` diagnostics
