@@ -19,7 +19,7 @@ An AlphaZero-style chess engine built from scratch on a single consumer GPU — 
 A complete, self-contained chess system:
 
 - **Engine** (C++17): bitboard move generation, MCTS with PUCT, UCI protocol
-- **Network** (PyTorch): SE-ResNet with attention policy + WDL value + moves-left heads
+- **Network** (PyTorch): 20-block × 256-filter SE-ResNet (~25M params) with attention policy + WDL value + moves-left heads
 - **Inference** (C++): TensorRT FP16 (default) or LibTorch FP16 fallback, swappable behind one interface
 - **Training** (Python): supervised pretraining (Lichess PGN + Stockfish distillation) → self-play RL
 - **Play**: web UI, any UCI GUI (Arena/CuteChess), or Lichess bot
@@ -84,7 +84,7 @@ Goal: **1800–2000+ Elo** on consumer hardware.
 
 **MCTS** — PUCT selection with dynamic `c_puct`, MCTS-solver (proven W/L/D propagates), virtual loss, KataGo-style shaped Dirichlet noise, variance-scaled cPUCT, KLD-adaptive visit counts, smart pruning, tree reuse, Zobrist-keyed NN cache. A `GameManager` drives N concurrent games and batches their leaves into one GPU forward pass per step; a **multivisit** optimization collapses up to 8 same-child descents into a single evaluation when PUCT stays stable.
 
-**Network** — configurable SE-ResNet (10b×128f baseline, 20b×256f for serious runs), squeeze-and-excitation blocks, Mish activation, attention-based policy head over 64 square tokens producing 1858 move logits, WDL value head, auxiliary moves-left Huber head. Tiered-network schedule can start at 6b×64f and scale up at a configured generation.
+**Network** — SE-ResNet at 20 blocks × 256 filters (~25M params) for the active run; architecture is configurable down to 10b×128f or lower for smaller hardware. Squeeze-and-excitation blocks, Mish activation, attention-based policy head over 64 square tokens producing 1858 move logits, WDL value head, auxiliary moves-left Huber head. Optional tiered schedule can start at 6b×64f and scale up at a configured generation.
 
 **Inference** — `RawBatchEvaluator` is an abstract interface with two implementations: `TRTEvaluator` (default) using `enqueueV3` against a TRT engine built with dynamic batch profile `(1, 128, 256)`, and `NeuralEvaluator` using LibTorch FP16 as a fallback. Both use pinned host memory and async non-blocking DMA. The engine is rebuilt (or weight-refit) each generation; `BuilderFlag.REFIT` lets weight swaps finish in 5–10s vs a 30–90s full rebuild.
 
@@ -130,7 +130,7 @@ Ongoing training run (20 blocks × 256 filters, ~25M parameters):
 - Perft from starting position: 4,865,609 nodes at depth 5 in **0.18s** (~27M nodes/sec)
 - Phase A pretraining: 20M positions × 1 epoch at batch 1024 completed in ~3h
 - Phase B labeling: 2M positions with SF depth 13 / multipv 10 in **~6.4h** (16 workers × 1 thread)
-- Self-play throughput with TRT FP16 at 10b×128f / 400 sims / 128 parallel games: **~2–3×** the LibTorch-FP16 baseline
+- Self-play throughput with TRT FP16 vs LibTorch FP16 (same architecture): **~2–3×** on RTX 3080 at 128 parallel games
 - TRT weight refit: ~5–10s vs 30–90s full rebuild per generation
 
 **Test suite:** 199 Google Test cases (C++), 146 pytest cases (Python), all passing. Perft-validated against all 5 standard positions.
