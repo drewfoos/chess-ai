@@ -11,6 +11,12 @@ import random
 from dataclasses import dataclass, field
 from typing import Optional
 
+# Standard start position. Used by `_respawn_slot` to launch a fresh game
+# into a finished slot. If we ever diversify launch positions (opening
+# books, curriculum FENs), this constant moves behind a config hook that
+# `init_games_from_fen` and `_respawn_slot` both read.
+_STARTPOS_FEN = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
+
 
 @dataclass
 class StepRow:
@@ -311,8 +317,7 @@ class GamePoolManager:
         self._records[i].was_playthrough = (
             self.rng.random() < pt_frac if pt_frac > 0 else False
         )
-        start_fen = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
-        self.gm.init_game_from_fen(i, start_fen, [], cfg.full_sims)
+        self.gm.init_game_from_fen(i, _STARTPOS_FEN, [], cfg.full_sims)
 
     def _finalize_game(self, i, terminal_status, adjudicated):
         rec = self._records[i]
@@ -387,6 +392,11 @@ class GamePoolManager:
             step_count += 1
             advanced = self._step_and_harvest(on_game_done, target_games)
             if advanced == 0 and len(self._completed_games) < target_games:
+                # Stagnation: no slot advanced and no slot finalized. Kill
+                # one active slot as a draw and let the next step_stats run
+                # — if other slots were merely slow, they'll catch up. We
+                # only adjudicate one slot per tick (not all) so a transient
+                # stall doesn't cascade into a bulk-draw wipeout.
                 for i in range(self.n):
                     if not self._completed[i]:
                         self._finalize_game(i, terminal_status=2, adjudicated=True)
@@ -423,11 +433,14 @@ class GamePoolManager:
     def _harvest_slot(self, i, on_game_done, target_games):
         """Collect slot i's completed record, then either respawn or mark inactive."""
         record = self._records[i]
-        if record in self._completed_games:
-            return
         self._completed_games.append(record)
         if on_game_done is not None:
             on_game_done(record, len(self._completed_games))
+        # Two guards, both necessary:
+        #   _launched < target_games     — don't start more games than asked for
+        #   len(completed) < target_games — don't respawn on the very last completion
+        # (that slot is about to exit inactive; respawning would race the loop-exit
+        # check in run_pool).
         if self._launched < target_games and len(self._completed_games) < target_games:
             self._respawn_slot(i)
             self._launched += 1
