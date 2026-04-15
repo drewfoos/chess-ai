@@ -1,4 +1,4 @@
-"""GameLoopManager: per-step Python orchestration for self-play.
+"""GamePoolManager: per-step Python orchestration for self-play.
 
 Owns game lifecycle. C++ GameManager is a pure search engine that exposes
 RootStats; this module decides what move to play, when to resign, when to
@@ -117,11 +117,16 @@ def _kld(raw_policy_indices, visit_dist):
     return max(0.0, kld)
 
 
-class GameLoopManager:
-    """Drives a C++ GameManager per step and converts RootStats into
-    GameRecords. Stage 2 of the Lc0-parity refactor: owns playout-cap
-    randomization, KLD-adaptive target sims, temperature schedule, and
-    ply-cap adjudication.
+class GamePoolManager:
+    """Per-step Python orchestration for self-play.
+
+    Supports two execution modes on the same underlying C++ GameManager:
+      - run_until_all_complete(): fixed pool of N slots, runs each slot's
+        game to completion once (batch-boundary mode, original behavior).
+      - run_pool(target_games): continuous flow — as each slot's game ends,
+        immediately respawn a fresh game into it until `target_games` total
+        have completed. Used by play_games_batched to eliminate tail-latency
+        waste at batch boundaries.
     """
 
     def __init__(self, game_manager, cfg, discard_pool=None, rng_seed=None):
@@ -337,3 +342,9 @@ def _q_to_wdl(q):
     l = max(0.0, -q)
     d = 1.0 - w - l
     return (w, d, l)
+
+
+# Backward-compatibility alias. Existing callers (tests, play_games_batched's
+# legacy batch path) continue to import `GameLoopManager`. Remove once the
+# continuous-flow mode has been stable for several generations.
+GameLoopManager = GamePoolManager
