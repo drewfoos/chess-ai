@@ -70,7 +70,7 @@ Goal: **1800–2000+ Elo** on consumer hardware.
   +----------------------+         +---+---------------------------+--+
   |  build_trt_engine.py |             |                           |
   |  FP16, batch profile |             v                           v
-  |  (1, 128, 256)       |     +----------------+       +---------------------+
+  |  (1, 256, 512)       |     +----------------+       +---------------------+
   +----------+-----------+     |  TRTEvaluator  |<----->|   NeuralEvaluator   |
              |                 |  enqueueV3     |       |   LibTorch FP16     |
              v                 |  pinned bufs   |       |   (fallback)        |
@@ -243,15 +243,6 @@ build\cp311-cp311-win_amd64\Release\chess_engine.exe uci_trt <engine.trt>
 | `#error: "C atomics require C11 or later"` when compiling Fathom | MSVC gates C11 atomics behind `/experimental:c11atomics` | Handled in `CMakeLists.txt`; ensure MSVC 19.43+ (VS 17.13+) |
 | `OSError: [WinError 1450] Insufficient system resources` during pretrain | Windows kernel SHM leak from repeated DataLoader spawns | Already fixed via `StreamingShardDataset` — make sure you're running current `training/pretrain.py` |
 | `ImportError: DLL load failed` when `import chess_mcts` | `pip install -e .` not run, or `TENSORRT_PATH` unset at install time | Re-run `pip install -e .` with `TENSORRT_PATH` set |
-
----
-
-## Documentation
-
-- **[Architecture](docs/architecture.md)** — component-level design and data flow
-- **[Changelog](docs/changelog.md)** — detailed version history
-- **[How AlphaZero Engines Work](docs/how-alphazero-engines-work.md)** — technical primer
-- **[Lc0 Optimizations](docs/lc0-optimizations.md)** — research on optimizations adapted for consumer hardware
 
 ---
 
