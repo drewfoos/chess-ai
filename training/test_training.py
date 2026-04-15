@@ -2850,3 +2850,69 @@ def test_discarded_start_falls_back_when_pool_empty(tmp_path):
     )
     assert src == "opening_book"
     assert fen == "BOOKFEN"
+
+
+# ---------------------------------------------------------------------------
+# Stage 7: resign playthrough + EMA calibrator
+# ---------------------------------------------------------------------------
+
+
+def test_resign_calibrator_ema():
+    from training.resign_calibrator import ResignCalibrator
+    cal = ResignCalibrator(default=0.02, ema_alpha=0.3, percentile=0.95, warmup_generations=0)
+
+    samples = [0.10, 0.12, 0.05, 0.20, 0.08, 0.15, 0.18, 0.09, 0.11, 0.25]
+    new_w = cal.update(generation=1, playthrough_min_evals=samples)
+    expected_p95 = sorted(samples)[int(0.95 * (len(samples) - 1))]
+    expected = 0.7 * 0.02 + 0.3 * expected_p95
+    assert abs(new_w - expected) < 1e-6
+
+
+def test_resign_calibrator_warmup():
+    from training.resign_calibrator import ResignCalibrator
+    cal = ResignCalibrator(default=0.02, warmup_generations=3)
+    for gen in range(1, 4):
+        w = cal.update(generation=gen, playthrough_min_evals=[0.5] * 10)
+        assert w == 0.02
+    w = cal.update(generation=4, playthrough_min_evals=[0.5] * 10)
+    assert w != 0.02
+
+
+def test_resign_calibrator_false_positive_rate():
+    from training.resign_calibrator import ResignCalibrator
+    cal = ResignCalibrator(default=0.1, warmup_generations=0)
+    # current stays at 0.1 (warmup=0 but we never called update)
+    samples = [0.05, 0.08, 0.12, 0.20, 0.15]  # 2/5 below 0.1
+    fp = cal.false_positive_rate(samples)
+    assert abs(fp - 0.4) < 1e-9
+    assert cal.last_fp_rate == fp
+
+
+def test_resign_calibrator_empty_samples():
+    from training.resign_calibrator import ResignCalibrator
+    cal = ResignCalibrator(default=0.02, warmup_generations=0)
+    assert cal.update(generation=5, playthrough_min_evals=[]) == 0.02
+    assert cal.false_positive_rate([]) == 0.0
+
+
+def test_gameloopmanager_assigns_playthroughs():
+    """GameLoopManager samples resign_playthrough_fraction when constructing
+    per-game records. With a large game count the observed rate should be
+    close to the requested fraction, and with 0.0 none are flagged."""
+    from training.selfplay_loop import GameLoopManager
+    from training.config import SelfPlayConfig
+
+    class FakeGM:
+        def __init__(self, n):
+            self._n = n
+        def num_games(self):
+            return self._n
+
+    cfg = SelfPlayConfig(num_games=200, resign_playthrough_fraction=0.25)
+    loop = GameLoopManager(FakeGM(200), cfg, rng_seed=42)
+    flagged = sum(1 for r in loop._records if r.was_playthrough)
+    assert 25 <= flagged <= 75
+
+    cfg_zero = SelfPlayConfig(num_games=50, resign_playthrough_fraction=0.0)
+    loop0 = GameLoopManager(FakeGM(50), cfg_zero, rng_seed=42)
+    assert all(not r.was_playthrough for r in loop0._records)

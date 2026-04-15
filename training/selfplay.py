@@ -1010,6 +1010,9 @@ def generate_games(
     all_raw_nn_eval = []
     all_adjudicated = []
     all_was_playthrough = []
+    # Stage 7: per-game row counts so the calibrator can group playthrough
+    # rows by game (aggregate shard has no native game boundary).
+    all_game_lengths: list[int] = []
 
     start = time.time()
 
@@ -1034,6 +1037,7 @@ def generate_games(
                 record, all_best_eval, all_played_eval, all_raw_nn_eval,
                 all_adjudicated, all_was_playthrough,
             )
+            all_game_lengths.append(len(record.planes))
             print(
                 f"  Game {completed_count}/{num_games}: "
                 f"{record.num_moves} moves, {record.result}, "
@@ -1080,6 +1084,7 @@ def generate_games(
                 record, all_best_eval, all_played_eval, all_raw_nn_eval,
                 all_adjudicated, all_was_playthrough,
             )
+            all_game_lengths.append(len(record.planes))
 
             total_positions = len(all_planes)
             print(
@@ -1132,6 +1137,7 @@ def generate_games(
         raw_nn_eval=_stack_wdl(all_raw_nn_eval, total_positions),
         adjudicated=np.asarray(all_adjudicated, dtype=np.bool_),
         was_playthrough=np.asarray(all_was_playthrough, dtype=np.bool_),
+        game_lengths=np.asarray(all_game_lengths, dtype=np.int32),
     )
 
     print(f"Generated {num_games} games, {total_positions} positions in {elapsed:.1f}s")
@@ -1316,6 +1322,62 @@ def _train_one_cycle(model, optimizer, dataloader, device, train_epochs, schedul
             num_batches += 1
 
     return total_loss_sum, policy_loss_sum, value_loss_sum, soft_policy_loss_sum, num_batches
+
+
+def _derive_playthrough_min_evals(shard_path: str) -> list[float]:
+    """Scan an aggregate v2 shard and return per-playthrough-game min-W of
+    the eventual winner (row-by-row, STM-POV flipped if needed).
+
+    Returns an empty list for pre-v2 shards, shards without playthrough rows,
+    shards lacking `game_lengths`, or draws (which carry no winner signal).
+    """
+    try:
+        data = np.load(shard_path, allow_pickle=False)
+    except Exception:
+        return []
+    if "game_lengths" not in data.files or "was_playthrough" not in data.files:
+        return []
+    if "played_eval" not in data.files or "values" not in data.files:
+        return []
+    lengths = data["game_lengths"]
+    wp = data["was_playthrough"]
+    played = data["played_eval"]      # (N, 3) WDL stm-POV
+    values = data["values"]           # (N, 3) game result stm-POV
+    out: list[float] = []
+    cursor = 0
+    for gl in lengths:
+        gl = int(gl)
+        if gl <= 0:
+            continue
+        end = cursor + gl
+        game_wp = wp[cursor:end]
+        if not game_wp.any():
+            cursor = end
+            continue
+        # Decide winner from the first row's stamped `values` (STM POV).
+        # values = (w, d, l): if w >> l then STM at this row won; if l >> w,
+        # opponent of STM at this row won; draws we skip.
+        first_v = values[cursor]
+        if first_v[1] >= max(first_v[0], first_v[2]) - 1e-6:
+            cursor = end
+            continue
+        stm_first_won = first_v[0] > first_v[2]
+        # For each row in the game, compute eventual winner's W from this
+        # row's STM POV: if row's STM is the winner's color → played_eval[0];
+        # else played_eval[2] (the STM's loss prob = the winner's win prob).
+        per_row: list[float] = []
+        for i in range(cursor, end):
+            row_v = values[i]
+            row_stm_is_winner = (row_v[0] > row_v[2]) == stm_first_won
+            # Equivalent: the row's STM lines up with the winner iff its own
+            # game-result W > L. Simpler/robust: just check row_v directly.
+            row_stm_is_winner = row_v[0] > row_v[2]
+            w_for_winner = float(played[i][0] if row_stm_is_winner else played[i][2])
+            per_row.append(w_for_winner)
+        if per_row:
+            out.append(min(per_row))
+        cursor = end
+    return out
 
 
 def training_loop(
@@ -1552,6 +1614,14 @@ def training_loop(
         adaptive = AdaptiveConfig(enabled=False, full_sims=num_simulations,
                                    full_max_moves=max_moves, full_games=games_per_gen)
 
+    # Stage 7: EMA-auto-tune the resign threshold from playthrough shards.
+    # `selfplay_config.resign_w` is overwritten after each generation.
+    from training.resign_calibrator import ResignCalibrator
+    resign_calibrator = ResignCalibrator(
+        default=selfplay_config.resign_w,
+        warmup_generations=3,
+    )
+
     end_gen = start_gen + generations - 1
     print(f"Starting training loop: generations {start_gen}-{end_gen}, {games_per_gen} games/gen")
     print(f"Device: {device}, Model: {blocks} blocks, {filters} filters"
@@ -1644,6 +1714,14 @@ def training_loop(
             use_trt=use_trt,
             trt_engine_path=trt_engine_path,
         )
+
+        # Stage 7: EMA-update resign_w from this generation's playthrough
+        # games. During warmup the calibrator leaves resign_w at its default.
+        pt_samples = _derive_playthrough_min_evals(data_path)
+        if pt_samples:
+            resign_calibrator.false_positive_rate(pt_samples)
+        new_resign_w = resign_calibrator.update(generation=gen, playthrough_min_evals=pt_samples)
+        selfplay_config.resign_w = new_resign_w
 
         # 2. Load sliding window of recent generations
         window_start = max(1, gen - window_size + 1)

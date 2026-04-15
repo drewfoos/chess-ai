@@ -79,6 +79,9 @@ class SelfPlayConfig:
     resign_l: float = 0.98            # resign if own L exceeds
     resign_earliest_ply: int = 30     # no resign before this ply (avoids openings)
     adjudicated_weight: float = 0.5   # trainer down-weights adjudicated-draw rows
+    # Stage 7 (Lc0-parity): fraction of games that disable resign so the
+    # calibrator can observe the true distribution of eventual-winner min-W.
+    resign_playthrough_fraction: float = 0.10
 
     # --- Stage 5 (Lc0-parity): min-visit floor on temperature-sampled moves ---
     # None = auto-scale as max(5, 1% of target_sims). Otherwise an absolute

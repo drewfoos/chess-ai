@@ -131,6 +131,13 @@ class GameLoopManager:
         self.rng = random.Random(rng_seed)
         self.n = game_manager.num_games()
         self._records = [GameRecord() for _ in range(self.n)]
+        # Stage 7: flag a fraction of games as playthroughs — resign is
+        # suppressed so the calibrator can observe the true distribution of
+        # eventual-winner min-W. Read defensively: callers may supply a cfg
+        # object that predates this field.
+        pt_frac = float(getattr(cfg, "resign_playthrough_fraction", 0.0) or 0.0)
+        for rec in self._records:
+            rec.was_playthrough = self.rng.random() < pt_frac if pt_frac > 0 else False
         self._target_sims = [cfg.full_sims] * self.n
         self._last_kld = [0.0] * self.n
         self._completed = [False] * self.n
