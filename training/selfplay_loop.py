@@ -146,6 +146,11 @@ class GamePoolManager:
         self._target_sims = [cfg.full_sims] * self.n
         self._last_kld = [0.0] * self.n
         self._completed = [False] * self.n
+        # Continuous-flow state (used only by run_pool; run_until_all_complete
+        # ignores these fields). Initialized here so tests that poke state
+        # directly can rely on them existing.
+        self._completed_games: list[GameRecord] = []
+        self._launched: int = self.n       # slots initially launched by init_games()
 
     def _next_target_sims(self, game_idx, last_was_full):
         """Playout-cap randomization + KLD-adaptive interpolation."""
@@ -181,10 +186,14 @@ class GamePoolManager:
         """One cross-game batched step.
 
         Returns the number of games that made progress (either advanced a
-        move or completed). Used by run_until_all_complete to detect real
-        stagnation.
+        move or completed). Used by run_until_all_complete and run_pool to
+        detect real stagnation. Slots flagged `_completed[i]=True` get
+        target_sims=0 so C++ skips them entirely.
         """
-        targets = list(self._target_sims)
+        targets = [
+            0 if self._completed[i] else self._target_sims[i]
+            for i in range(self.n)
+        ]
         stats = self.gm.step_stats(targets)
         advanced = 0
         for i, s in enumerate(stats):
@@ -283,6 +292,28 @@ class GamePoolManager:
         # Compute next-step target.
         self._target_sims[i] = self._next_target_sims(i, was_full_search)
 
+    def _respawn_slot(self, i: int) -> None:
+        """Reset per-slot state and kick off a fresh game in C++ slot i.
+
+        Called from run_pool's finalize path after the slot's completed
+        GameRecord has been collected into `self._completed_games`.
+        Re-rolls the playthrough flag; resets target_sims, last_kld,
+        completed flag, and the per-slot GameRecord. Uses
+        chess_mcts.GameManager.init_game_from_fen which allocates a fresh
+        root Node for this slot without resetting the shared NodePool.
+        """
+        cfg = self.cfg
+        self._records[i] = GameRecord()
+        self._target_sims[i] = cfg.full_sims
+        self._last_kld[i] = 0.0
+        self._completed[i] = False
+        pt_frac = float(getattr(cfg, "resign_playthrough_fraction", 0.0) or 0.0)
+        self._records[i].was_playthrough = (
+            self.rng.random() < pt_frac if pt_frac > 0 else False
+        )
+        start_fen = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
+        self.gm.init_game_from_fen(i, start_fen, [], cfg.full_sims)
+
     def _finalize_game(self, i, terminal_status, adjudicated):
         rec = self._records[i]
         rec.adjudicated = adjudicated
@@ -324,6 +355,82 @@ class GamePoolManager:
                     if not self._completed[i]:
                         self._finalize_game(i, terminal_status=2, adjudicated=True)
         return self._records
+
+    def run_pool(self, target_games: int, on_game_done=None):
+        """Continuous-flow self-play: run until `target_games` games have completed.
+
+        As each slot's game reaches a terminal state (natural, resign, or
+        ply-cap adjudication), its GameRecord is collected and the slot is
+        either respawned (if more games are still needed) or marked inactive.
+        Inactive slots get target_sims=0 on subsequent step_stats calls, so
+        the C++ GameManager performs no work on them.
+
+        Args:
+            target_games: total completed games to produce.
+            on_game_done: optional callable (record, completion_idx) fired
+                per completed game in completion order.
+
+        Returns:
+            list[GameRecord] of exactly `target_games` finished games.
+        """
+        if target_games <= 0:
+            return []
+        max_steps = target_games * max(1, self.cfg.max_ply) + self.n
+        step_count = 0
+        while len(self._completed_games) < target_games:
+            if step_count >= max_steps:
+                for i in range(self.n):
+                    if not self._completed[i] and len(self._completed_games) < target_games:
+                        self._finalize_game(i, terminal_status=2, adjudicated=True)
+                        self._harvest_slot(i, on_game_done, target_games)
+                break
+            step_count += 1
+            advanced = self._step_and_harvest(on_game_done, target_games)
+            if advanced == 0 and len(self._completed_games) < target_games:
+                for i in range(self.n):
+                    if not self._completed[i]:
+                        self._finalize_game(i, terminal_status=2, adjudicated=True)
+                        self._harvest_slot(i, on_game_done, target_games)
+                        break
+        return list(self._completed_games)
+
+    def _step_and_harvest(self, on_game_done, target_games):
+        """One step_stats call + harvest/respawn of any completed slots.
+
+        Returns the number of slots that advanced (same semantics as
+        step_once) so run_pool can detect stagnation.
+        """
+        targets = [
+            0 if self._completed[i] else self._target_sims[i]
+            for i in range(self.n)
+        ]
+        stats = self.gm.step_stats(targets)
+        advanced = 0
+        for i, s in enumerate(stats):
+            if self._completed[i]:
+                continue
+            if s.terminal_status != 0:
+                self._finalize_game(i, terminal_status=s.terminal_status, adjudicated=False)
+                self._harvest_slot(i, on_game_done, target_games)
+                advanced += 1
+                continue
+            self._record_and_play(i, s)
+            advanced += 1
+            if self._completed[i]:
+                self._harvest_slot(i, on_game_done, target_games)
+        return advanced
+
+    def _harvest_slot(self, i, on_game_done, target_games):
+        """Collect slot i's completed record, then either respawn or mark inactive."""
+        record = self._records[i]
+        if record in self._completed_games:
+            return
+        self._completed_games.append(record)
+        if on_game_done is not None:
+            on_game_done(record, len(self._completed_games))
+        if self._launched < target_games and len(self._completed_games) < target_games:
+            self._respawn_slot(i)
+            self._launched += 1
 
 
 def _normalize(visits):
