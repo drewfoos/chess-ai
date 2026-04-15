@@ -25,6 +25,18 @@ from training.model import ChessNetwork
 from training.dataset import ChessDataset
 
 
+def blend_value_target(cfg, game_result, best_eval, played_eval, raw_nn_eval):
+    """Blend the four decomposed WDL signals into a single value target.
+
+    `cfg` weights must sum to 1.0 (asserted). Exists as a standalone function
+    so the trainer can swap blend weights without regenerating shards — the
+    shards carry the four signals decomposed, blending happens at load time.
+    """
+    a = cfg["game_result"]; b = cfg["best_eval"]; c = cfg["played_eval"]; d = cfg["raw_nn_eval"]
+    assert abs(a + b + c + d - 1.0) < 1e-5, f"value_blend weights must sum to 1: got {a+b+c+d}"
+    return a * game_result + b * best_eval + c * played_eval + d * raw_nn_eval
+
+
 def compute_loss(
     policy_logits: torch.Tensor,
     value_logits: torch.Tensor,
@@ -191,10 +203,14 @@ def train(
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
+            # AMP scaler may skip optimizer.step() on inf/nan gradients.
+            # When skipped, scaler.get_scale() drops, so a non-decreasing
+            # scale is the canonical signal that the step actually happened.
+            prev_scale = scaler.get_scale()
             scaler.step(optimizer)
             scaler.update()
-
-            scheduler.step()
+            if scaler.get_scale() >= prev_scale:
+                scheduler.step()
 
             epoch_loss += loss.item()
             epoch_policy_loss += p_loss.item()

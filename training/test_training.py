@@ -2544,3 +2544,60 @@ def test_kld_adaptive_in_cpp_path():
     loop.step_once()  # full search; computes KLD
     # Next target should be > min_sims (KLD between uniform raw and one-hot visits is high)
     assert loop._target_sims[0] > cfg.min_sims
+
+
+def test_record_schema_v2(tmp_path):
+    from training.records import write_shard, read_shard, ShardHeader, RecordRow
+    header = ShardHeader(final_wdl=(1.0, 0.0, 0.0), seed_source="opening_book",
+                         net_generation=42, was_playthrough=False, adjudicated=False)
+    rows = [
+        RecordRow(
+            planes=np.zeros((112, 8, 8), dtype=np.uint8),
+            visits_policy=np.zeros(1858, dtype=np.float32),
+            soft_policy=np.zeros(1858, dtype=np.float32),
+            best_eval=np.array([0.6, 0.3, 0.1], dtype=np.float32),
+            played_eval=np.array([0.55, 0.35, 0.10], dtype=np.float32),
+            raw_nn_eval=np.array([0.5, 0.4, 0.1], dtype=np.float32),
+            mlh=np.float32(25.0),
+            side_to_move=np.int8(0),
+            is_full_search=True,
+            was_playthrough=False,
+            adjudicated=False,
+        )
+    ]
+    path = tmp_path / "shard.npz"
+    write_shard(path, header, rows)
+    h2, rows2 = read_shard(path)
+
+    assert h2.final_wdl == header.final_wdl
+    assert h2.seed_source == "opening_book"
+    assert h2.net_generation == 42
+    assert len(rows2) == 1
+    np.testing.assert_array_equal(rows2[0].planes, rows[0].planes)
+    np.testing.assert_array_almost_equal(rows2[0].played_eval, rows[0].played_eval)
+    np.testing.assert_array_almost_equal(rows2[0].best_eval, rows[0].best_eval)
+    np.testing.assert_array_almost_equal(rows2[0].raw_nn_eval, rows[0].raw_nn_eval)
+    assert rows2[0].is_full_search is True
+    # Old v1 fields must NOT exist
+    raw = np.load(str(path))
+    assert "value_target" not in raw.files
+    assert "q_blend" not in raw.files
+
+
+def test_value_blend_config():
+    from training.train import blend_value_target
+    cfg = {"game_result": 0.7, "best_eval": 0.0, "played_eval": 0.25, "raw_nn_eval": 0.05}
+    game_result = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+    best_eval = np.array([0.6, 0.3, 0.1], dtype=np.float32)
+    played_eval = np.array([0.5, 0.4, 0.1], dtype=np.float32)
+    raw_nn_eval = np.array([0.4, 0.4, 0.2], dtype=np.float32)
+    out = blend_value_target(cfg, game_result, best_eval, played_eval, raw_nn_eval)
+    expected = 0.7 * game_result + 0.0 * best_eval + 0.25 * played_eval + 0.05 * raw_nn_eval
+    np.testing.assert_array_almost_equal(out, expected)
+
+
+def test_value_blend_weights_must_sum_to_one():
+    from training.train import blend_value_target
+    bad = {"game_result": 0.5, "best_eval": 0.5, "played_eval": 0.5, "raw_nn_eval": 0.0}
+    with pytest.raises(AssertionError):
+        blend_value_target(bad, np.zeros(3), np.zeros(3), np.zeros(3), np.zeros(3))

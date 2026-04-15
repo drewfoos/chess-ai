@@ -180,6 +180,16 @@ class GameRecord:
     result: str = '*'
     num_moves: int = 0
     moves_uci: list[str] = field(default_factory=list)
+    # v2 decomposed eval signals (Stage 3). One WDL triple per position, so the
+    # trainer can blend game_result / best / played / raw_nn at load time
+    # instead of being stuck with a baked-in q_ratio. Python fallback path
+    # populates approximations via _q_to_wdl; C++ path carries real values
+    # through _loop_record_to_legacy.
+    best_eval: list[np.ndarray] = field(default_factory=list)     # (3,) per row
+    played_eval: list[np.ndarray] = field(default_factory=list)   # (3,) per row
+    raw_nn_eval: list[np.ndarray] = field(default_factory=list)   # (3,) per row
+    adjudicated: list[bool] = field(default_factory=list)
+    was_playthrough: list[bool] = field(default_factory=list)
 
 
 _opening_book_cache: dict[str, list[str]] = {}
@@ -453,6 +463,19 @@ def _finalize_record(
         record.surprise.append(pos_surprise)
         record.moves_left.append(float(total_moves - i))
         record.use_policy.append(is_full)
+        # v2 decomposed signals (Python fallback): no real per-child/root WDL
+        # available, so approximate best/played/raw_nn from the same root_q
+        # used for q_wdl above. Trainer blend will converge on `game_result`
+        # weighting for this path unless/until we wire real WDLs through.
+        q_win = max(0.0, root_q)
+        q_loss = max(0.0, -root_q)
+        q_draw = 1.0 - q_win - q_loss
+        approx_wdl = np.array([q_win, q_draw, q_loss], dtype=np.float32)
+        record.best_eval.append(approx_wdl)
+        record.played_eval.append(approx_wdl)
+        record.raw_nn_eval.append(approx_wdl)
+        record.adjudicated.append(False)
+        record.was_playthrough.append(False)
 
     record.num_moves = total_moves
 
@@ -769,6 +792,13 @@ def _loop_record_to_legacy(
     # the per-legal-move visit distribution back to 1858-dim indices.
     positions: list[tuple] = []
     board_history: list = []
+    # Parallel arrays for v2 decomposed eval signals (populated in lock-step
+    # with `positions`). Zipped with _finalize_record's output after the fact.
+    loop_best: list[np.ndarray] = []
+    loop_played: list[np.ndarray] = []
+    loop_raw_nn: list[np.ndarray] = []
+    loop_adjudicated: list[bool] = []
+    loop_was_playthrough: list[bool] = []
 
     for row in lrec.rows:
         try:
@@ -792,8 +822,8 @@ def _loop_record_to_legacy(
             if s > 0:
                 policy_target /= s
 
-        # Scalar root Q approximation: played_eval (w,d,l) → w - l. Stage 3
-        # will carry real WDL through.
+        # Scalar root Q approximation: played_eval (w,d,l) → w - l. Preserved
+        # for legacy q-blend downstream; v2 fields below carry the real WDLs.
         w, _d, l = row.played_eval
         root_q = float(w - l)
 
@@ -805,6 +835,11 @@ def _loop_record_to_legacy(
         positions.append((planes, policy_target, board.turn, root_q, surprise, is_full))
         board_history.append(board.copy())
         record.moves_uci.append(row.played_uci or "")
+        loop_best.append(np.asarray(row.best_eval, dtype=np.float32))
+        loop_played.append(np.asarray(row.played_eval, dtype=np.float32))
+        loop_raw_nn.append(np.asarray(row.raw_nn_eval, dtype=np.float32))
+        loop_adjudicated.append(bool(getattr(row, "adjudicated", False)))
+        loop_was_playthrough.append(bool(row.was_playthrough))
 
     # Determine the final board state for result labeling. Replay moves
     # forward from startpos? The loop doesn't give us the actual moves
@@ -835,6 +870,17 @@ def _loop_record_to_legacy(
         final_board = chess.Board()
 
     _finalize_record(record, final_board, positions, board_history, selfplay_config)
+
+    # Overwrite _finalize_record's q-approximations with the real per-row
+    # decomposed eval signals the GameLoopManager already computed. Length
+    # matches record.planes (both built in lock-step from lrec.rows).
+    n = len(record.planes)
+    if len(loop_best) == n:
+        record.best_eval = loop_best
+        record.played_eval = loop_played
+        record.raw_nn_eval = loop_raw_nn
+        record.adjudicated = loop_adjudicated
+        record.was_playthrough = loop_was_playthrough
     return record
 
 
@@ -855,6 +901,39 @@ def _uci_to_policy_index(move: chess.Move, turn) -> int | None:
         promo_map = {chess.KNIGHT: 'n', chess.BISHOP: 'b', chess.ROOK: 'r'}
         promo = promo_map.get(move.promotion)
     return move_to_index(fr, to, promo)
+
+
+def _extend_v2(
+    record: "GameRecord",
+    all_best_eval: list,
+    all_played_eval: list,
+    all_raw_nn_eval: list,
+    all_adjudicated: list,
+    all_was_playthrough: list,
+) -> None:
+    """Extend per-row v2 aggregates from a finalized GameRecord.
+
+    Length-tolerant: if a fallback path populated fewer v2 rows than planes
+    (older fake game managers in tests, etc.), pad with neutral drawn WDL so
+    downstream shapes line up with all_planes.
+    """
+    n = len(record.planes)
+    neutral = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+    be = list(record.best_eval)
+    pe = list(record.played_eval)
+    rn = list(record.raw_nn_eval)
+    adj = list(record.adjudicated)
+    wp = list(record.was_playthrough)
+    while len(be) < n: be.append(neutral)
+    while len(pe) < n: pe.append(neutral)
+    while len(rn) < n: rn.append(neutral)
+    while len(adj) < n: adj.append(False)
+    while len(wp) < n: wp.append(False)
+    all_best_eval.extend(be[:n])
+    all_played_eval.extend(pe[:n])
+    all_raw_nn_eval.extend(rn[:n])
+    all_adjudicated.extend(adj[:n])
+    all_was_playthrough.extend(wp[:n])
 
 
 def generate_games(
@@ -899,6 +978,12 @@ def generate_games(
     all_moves_left = []
     all_surprise = []
     all_use_policy = []
+    # v2 decomposed eval signals (Stage 3).
+    all_best_eval = []
+    all_played_eval = []
+    all_raw_nn_eval = []
+    all_adjudicated = []
+    all_was_playthrough = []
 
     start = time.time()
 
@@ -919,6 +1004,10 @@ def generate_games(
             all_moves_left.extend(record.moves_left)
             all_surprise.extend(record.surprise)
             all_use_policy.extend(record.use_policy)
+            _extend_v2(
+                record, all_best_eval, all_played_eval, all_raw_nn_eval,
+                all_adjudicated, all_was_playthrough,
+            )
             print(
                 f"  Game {completed_count}/{num_games}: "
                 f"{record.num_moves} moves, {record.result}, "
@@ -960,6 +1049,10 @@ def generate_games(
             all_moves_left.extend(record.moves_left)
             all_surprise.extend(record.surprise)
             all_use_policy.extend(record.use_policy)
+            _extend_v2(
+                record, all_best_eval, all_played_eval, all_raw_nn_eval,
+                all_adjudicated, all_was_playthrough,
+            )
 
             total_positions = len(all_planes)
             print(
@@ -985,9 +1078,15 @@ def generate_games(
     # Release the dense array ASAP to keep peak RAM flat during save.
     del planes_arr
 
+    def _stack_wdl(arrs, n):
+        if not arrs:
+            return np.tile(np.array([0.0, 1.0, 0.0], dtype=np.float32), (n, 1))
+        return np.stack([np.asarray(a, dtype=np.float32) for a in arrs])
+
     np.savez_compressed(
         output_path,
         format_version=np.uint8(2),
+        schema_version=np.int32(2),
         bitboards=bitboards,
         stm=meta['stm'],
         castling=meta['castling'],
@@ -998,6 +1097,14 @@ def generate_games(
         moves_left=np.array(all_moves_left, dtype=np.float32),
         surprise=np.array(all_surprise, dtype=np.float32),
         use_policy=np.array(all_use_policy, dtype=np.bool_),
+        # v2 decomposed eval signals — final_wdl lives in `values` already
+        # (stamped by _finalize_record). best/played/raw_nn are the new
+        # per-row arrays the trainer blends at load time.
+        best_eval=_stack_wdl(all_best_eval, total_positions),
+        played_eval=_stack_wdl(all_played_eval, total_positions),
+        raw_nn_eval=_stack_wdl(all_raw_nn_eval, total_positions),
+        adjudicated=np.asarray(all_adjudicated, dtype=np.bool_),
+        was_playthrough=np.asarray(all_was_playthrough, dtype=np.bool_),
     )
 
     print(f"Generated {num_games} games, {total_positions} positions in {elapsed:.1f}s")

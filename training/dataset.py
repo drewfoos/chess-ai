@@ -174,7 +174,24 @@ class ChessDataset(Dataset):
     copy (a↔h files), doubling the effective dataset size.
     """
 
-    def __init__(self, npz_paths: list[str], mirror: bool = False):
+    def __init__(
+        self,
+        npz_paths: list[str],
+        mirror: bool = False,
+        value_blend: dict | None = None,
+        adjudicated_weight: float = 1.0,
+    ):
+        """
+        Args:
+            value_blend: when provided and v2 eval signals are present, blend
+                `values` (game_result) with best_eval/played_eval/raw_nn_eval
+                per row using these weights. Must sum to 1.0. When None, the
+                on-disk `values` array is used as-is.
+            adjudicated_weight: multiplier applied to sample weights for rows
+                flagged `adjudicated=True`. Default 1.0 (no effect). Lc0's
+                guidance is 0.5 — downweight ply-cap draws relative to real
+                terminals.
+        """
         bb_list: list[np.ndarray] = []
         stm_list: list[np.ndarray] = []
         castling_list: list[np.ndarray] = []
@@ -185,6 +202,10 @@ class ChessDataset(Dataset):
         mlh_list: list[np.ndarray] = []
         surprise_list: list[np.ndarray] = []
         use_policy_list: list[np.ndarray] = []
+        best_eval_list: list[np.ndarray] = []
+        played_eval_list: list[np.ndarray] = []
+        raw_nn_eval_list: list[np.ndarray] = []
+        adjudicated_list: list[np.ndarray] = []
 
         for path in npz_paths:
             data = np.load(path)
@@ -219,6 +240,14 @@ class ChessDataset(Dataset):
                 surprise_list.append(data['surprise'])
             if 'use_policy' in files:
                 use_policy_list.append(data['use_policy'])
+            if 'best_eval' in files:
+                best_eval_list.append(np.asarray(data['best_eval'], dtype=np.float32))
+            if 'played_eval' in files:
+                played_eval_list.append(np.asarray(data['played_eval'], dtype=np.float32))
+            if 'raw_nn_eval' in files:
+                raw_nn_eval_list.append(np.asarray(data['raw_nn_eval'], dtype=np.float32))
+            if 'adjudicated' in files:
+                adjudicated_list.append(np.asarray(data['adjudicated'], dtype=np.bool_))
 
         bitboards = np.concatenate(bb_list, axis=0)
         stm = np.concatenate(stm_list, axis=0)
@@ -234,6 +263,25 @@ class ChessDataset(Dataset):
         surprise = np.concatenate(surprise_list, axis=0) if has_surprise else None
         has_use_policy = len(use_policy_list) == n_files
         use_policy = np.concatenate(use_policy_list, axis=0) if has_use_policy else None
+        has_v2_eval = (
+            len(best_eval_list) == n_files
+            and len(played_eval_list) == n_files
+            and len(raw_nn_eval_list) == n_files
+        )
+        best_eval = np.concatenate(best_eval_list, axis=0) if has_v2_eval else None
+        played_eval = np.concatenate(played_eval_list, axis=0) if has_v2_eval else None
+        raw_nn_eval = np.concatenate(raw_nn_eval_list, axis=0) if has_v2_eval else None
+        has_adjudicated = len(adjudicated_list) == n_files
+        adjudicated = np.concatenate(adjudicated_list, axis=0) if has_adjudicated else None
+
+        # Apply the value_blend at load time if the shard carries the v2
+        # decomposed signals. Otherwise `values` stays as whatever the shard
+        # wrote (legacy v1 q-blend or raw z_wdl).
+        if value_blend is not None and has_v2_eval:
+            from training.train import blend_value_target
+            values = blend_value_target(
+                value_blend, values, best_eval, played_eval, raw_nn_eval,
+            ).astype(np.float32)
 
         if mirror:
             m_bb = mirror_bitboards(bitboards)
@@ -253,6 +301,14 @@ class ChessDataset(Dataset):
                 surprise = np.concatenate([surprise, surprise], axis=0)
             if use_policy is not None:
                 use_policy = np.concatenate([use_policy, use_policy], axis=0)
+            if best_eval is not None:
+                best_eval = np.concatenate([best_eval, best_eval], axis=0)
+            if played_eval is not None:
+                played_eval = np.concatenate([played_eval, played_eval], axis=0)
+            if raw_nn_eval is not None:
+                raw_nn_eval = np.concatenate([raw_nn_eval, raw_nn_eval], axis=0)
+            if adjudicated is not None:
+                adjudicated = np.concatenate([adjudicated, adjudicated], axis=0)
 
         # Store packed, per-position metadata as numpy arrays (cheap); expand to
         # full (112,8,8) tensors lazily in __getitem__ to keep RAM low.
@@ -266,6 +322,20 @@ class ChessDataset(Dataset):
         self.moves_left = torch.from_numpy(np.ascontiguousarray(moves_left)) if moves_left is not None else None
         self.surprise_weights = torch.from_numpy(np.ascontiguousarray(surprise)).float() if surprise is not None else None
         self.use_policy = torch.from_numpy(np.ascontiguousarray(use_policy)) if use_policy is not None else None
+        self.adjudicated = adjudicated
+
+        # Adjudicated-row downweighting: fold it into surprise_weights so the
+        # existing WeightedRandomSampler picks up the effect for free. If the
+        # shard has no surprise array, synthesize a uniform one first so the
+        # multiplier has something to scale.
+        if adjudicated is not None and adjudicated_weight != 1.0:
+            if self.surprise_weights is None:
+                self.surprise_weights = torch.ones(len(adjudicated), dtype=torch.float32)
+            factor = torch.tensor(
+                np.where(adjudicated, adjudicated_weight, 1.0),
+                dtype=torch.float32,
+            )
+            self.surprise_weights = self.surprise_weights * factor
 
     def __len__(self) -> int:
         return len(self.bitboards)
