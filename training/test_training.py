@@ -2308,95 +2308,42 @@ class TestTRTEngineBuilder:
         assert 'policy' in io_names
         assert 'value' in io_names
 
-    def test_refit_engine_swaps_weights_without_rebuild(self, tmp_path):
-        """Refit must accept new weights for a same-architecture ONNX and
-        reload them — verified by different outputs before/after refit.
+    def test_timing_cache_is_created_and_reused(self, tmp_path):
+        """Lc0-style: no refit. `timing_cache_path` persists kernel-selection
+        decisions across rebuilds and is reused on subsequent builds.
         """
-        trt = pytest.importorskip("tensorrt")
-        import time
-        import numpy as np
-        import torch
-        from training.config import NetworkConfig
-        from training.model import ChessNetwork
-        from training.export import export_onnx
-        from training.build_trt_engine import build_engine, refit_engine
-
-        cfg = NetworkConfig(num_blocks=2, num_filters=16)
-        # Build from model v1
-        model = ChessNetwork(cfg).eval()
-        onnx_v1 = tmp_path / "v1.onnx"
-        trt_path = tmp_path / "engine.trt"
-        export_onnx(model, str(onnx_v1))
-        build_engine(
-            str(onnx_v1), str(trt_path),
-            fp16=True, min_batch=1, opt_batch=2, max_batch=2,
-            workspace_mb=512, refittable=True,
-        )
-        size_after_build = trt_path.stat().st_size
-
-        # Perturb weights, export new ONNX, refit — topology unchanged.
-        with torch.no_grad():
-            for p in model.parameters():
-                p.add_(torch.randn_like(p) * 0.1)
-        onnx_v2 = tmp_path / "v2.onnx"
-        export_onnx(model, str(onnx_v2))
-
-        t0 = time.time()
-        refit_engine(str(onnx_v2), str(trt_path))
-        refit_elapsed = time.time() - t0
-
-        # Engine file should still exist and be loadable.
-        logger = trt.Logger(trt.Logger.WARNING)
-        runtime = trt.Runtime(logger)
-        with open(trt_path, 'rb') as f:
-            engine = runtime.deserialize_cuda_engine(f.read())
-        assert engine is not None
-        # Refit should be materially faster than a full build on any platform;
-        # a generous upper bound catches regressions without being flaky.
-        assert refit_elapsed < 60.0
-
-    def test_refit_fails_gracefully_on_non_refittable_engine(self, tmp_path):
-        """Engines built with refittable=False must reject a refit attempt."""
         pytest.importorskip("tensorrt")
         from training.config import NetworkConfig
         from training.model import ChessNetwork
         from training.export import export_onnx
-        from training.build_trt_engine import build_engine, refit_engine
+        from training.build_trt_engine import build_engine
 
         cfg = NetworkConfig(num_blocks=2, num_filters=16)
         model = ChessNetwork(cfg).eval()
         onnx_path = tmp_path / "m.onnx"
         trt_path = tmp_path / "m.trt"
+        cache_path = tmp_path / "trt_timing.cache"
         export_onnx(model, str(onnx_path))
+
+        # First build: cache file does not exist yet → builder creates it.
+        assert not cache_path.exists()
         build_engine(
             str(onnx_path), str(trt_path),
             fp16=True, min_batch=1, opt_batch=2, max_batch=2,
-            workspace_mb=512, refittable=False,
+            workspace_mb=512, timing_cache_path=str(cache_path),
         )
-        with pytest.raises(RuntimeError):
-            refit_engine(str(onnx_path), str(trt_path))
+        assert cache_path.exists(), "timing cache should be written after first build"
+        assert cache_path.stat().st_size > 0
+        first_size = cache_path.stat().st_size
 
-    def test_build_or_refit_falls_back_when_engine_missing(self, tmp_path):
-        """Even with can_refit=True, absent engine triggers a full build."""
-        pytest.importorskip("tensorrt")
-        from training.config import NetworkConfig
-        from training.model import ChessNetwork
-        from training.export import export_onnx
-        from training.build_trt_engine import build_or_refit_engine
-
-        cfg = NetworkConfig(num_blocks=2, num_filters=16)
-        model = ChessNetwork(cfg).eval()
-        onnx_path = tmp_path / "m.onnx"
-        trt_path = tmp_path / "m.trt"
-        export_onnx(model, str(onnx_path))
-
-        path, refitted = build_or_refit_engine(
-            str(onnx_path), str(trt_path), can_refit=True,
-            fp16=True, min_batch=1, opt_batch=2, max_batch=2, workspace_mb=512,
+        # Second build: cache is loaded, possibly enriched, re-written. Must
+        # succeed and the cache must still be non-empty (may grow or stay equal).
+        build_engine(
+            str(onnx_path), str(trt_path),
+            fp16=True, min_batch=1, opt_batch=2, max_batch=2,
+            workspace_mb=512, timing_cache_path=str(cache_path),
         )
-        assert path == str(trt_path)
-        assert refitted is False  # No existing engine → must build
-        assert trt_path.exists()
+        assert cache_path.stat().st_size >= first_size
 
 
 class TestTieredNetworkSchedule:
