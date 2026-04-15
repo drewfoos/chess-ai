@@ -30,7 +30,6 @@ from training.encoder import POLICY_SIZE, encode_board, mirror_move, move_to_ind
 from training.pretrain_dataset import (
     ShardBuffer,
     headers_pass_filters,
-    iter_pgn_games,
     open_pgn_stream,
 )
 
@@ -258,19 +257,32 @@ def label_pgn(
     max_games: int | None = None,
     skip_opening_plies: int = 10,
     start_shard: int = 0,
-    skip_games: int = 0,
+    stride: int = 1,
+    offset: int = 0,
+    skip_matched_games: int = 0,
     max_games_abs: int | None = None,
 ) -> None:
     """Walk `pgn_path`; for each qualifying game, sample positions and label
     them with Stockfish multipv. Writes shards under `out_dir`.
+
+    Round-robin partitioning: with stride=N, offset=i, this worker only
+    considers games where (game_index % N) == i. Non-matching games are
+    fast-skipped via `chess.pgn.skip_game`, which doesn't parse the move
+    list — at ~100k games/s even worker N-1 in a 16-way split pays only
+    ~seconds of skip overhead, not hours.
+
+    `skip_matched_games` advances past the first K matched games before
+    labeling, for resume-after-crash scenarios.
     """
+    assert 0 <= offset < stride, f"offset {offset} must be in [0, {stride})"
     out_dir.mkdir(parents=True, exist_ok=True)
     buf = ShardBuffer(out_dir=out_dir, shard_idx=start_shard, max_positions=shard_size)
     sf = StockfishMultiPV(stockfish_binary, threads=threads, hash_mb=hash_mb, multipv=multipv)
 
     allowed_results = {'1-0', '0-1', '1/2-1/2'}
-    games_read = 0
-    games_kept = 0
+    games_read = 0          # absolute index into PGN
+    matched_games = 0       # games where idx % stride == offset
+    games_kept = 0          # matched games that passed filters + yielded positions
     positions_total = 0
     t0 = time.time()
 
@@ -278,25 +290,29 @@ def label_pgn(
 
     try:
         with open_pgn_stream(pgn_path) as stream:
-            # Fast-forward past games already processed in a previous run.
-            # Header-only parse is fast (~100k games/s), so even a 10M-game
-            # skip adds only ~100s before labeling resumes. Used for resume
-            # after ctrl-c and for game-range partitioning in parallel
-            # orchestration (scripts/phase_b_parallel.py).
-            if skip_games > 0:
-                skipped = 0
-                t_skip = time.time()
-                for _ in iter_pgn_games(stream):
-                    skipped += 1
-                    if skipped >= skip_games:
-                        break
-                print(f"  skipped {skipped:,} games in {time.time() - t_skip:.1f}s")
-                games_read = skipped
-
-            for game in iter_pgn_games(stream):
-                games_read += 1
-                if max_games_abs is not None and games_read > max_games_abs:
+            while True:
+                if max_games_abs is not None and games_read >= max_games_abs:
                     break
+
+                if games_read % stride != offset:
+                    # Fast body-skip without parsing moves. Much cheaper than
+                    # chess.pgn.read_game(); this is what makes round-robin
+                    # partitioning feasible.
+                    ok = chess.pgn.skip_game(stream)
+                    if not ok:
+                        break
+                    games_read += 1
+                    continue
+
+                game = chess.pgn.read_game(stream)
+                if game is None:
+                    break
+                games_read += 1
+                matched_games += 1
+
+                if matched_games <= skip_matched_games:
+                    continue
+
                 if not headers_pass_filters(game.headers, min_elo, min_base_s, allowed_results):
                     continue
 
@@ -386,12 +402,19 @@ def main():
     parser.add_argument('--max-games', type=int, default=None)
     parser.add_argument('--skip-opening-plies', type=int, default=10)
     parser.add_argument('--start-shard', type=int, default=0)
-    parser.add_argument('--skip-games', type=int, default=0,
-                        help='Skip the first N games in the PGN before labeling. '
-                             'Used for resume-after-crash and parallel partitioning.')
+    parser.add_argument('--stride', type=int, default=1,
+                        help='Round-robin partitioning: process only games where '
+                             '(game_index %% stride) == offset. stride=1 means every '
+                             'game. Used by scripts/phase_b_parallel.py for N-way '
+                             'parallel labeling without expensive skip offsets.')
+    parser.add_argument('--offset', type=int, default=0,
+                        help='Worker offset within stride. 0 <= offset < stride.')
+    parser.add_argument('--skip-matched-games', type=int, default=0,
+                        help='Skip the first K games that match (stride, offset) '
+                             'before labeling. Used for resume-after-crash so a '
+                             'worker does not re-label games it already processed.')
     parser.add_argument('--max-games-abs', type=int, default=None,
-                        help='Stop after the absolute game index reaches this value. '
-                             'With --skip-games, forms a half-open [skip, max) game window.')
+                        help='Absolute upper bound on games_read (safety cap).')
     args = parser.parse_args()
 
     label_pgn(
@@ -411,7 +434,9 @@ def main():
         max_games=args.max_games,
         skip_opening_plies=args.skip_opening_plies,
         start_shard=args.start_shard,
-        skip_games=args.skip_games,
+        stride=args.stride,
+        offset=args.offset,
+        skip_matched_games=args.skip_matched_games,
         max_games_abs=args.max_games_abs,
     )
 

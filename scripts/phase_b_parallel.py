@@ -1,23 +1,25 @@
 """Parallel orchestrator for Phase B Stockfish distillation.
 
 Launches N `training.stockfish_label` subprocesses in parallel, each assigned
-a disjoint slice of the PGN game stream. Each worker writes to its own
-`part_{i}` subdirectory so shard filenames never collide, and progress is
-resumable — on ctrl-c, re-running with the same args picks up where each
-worker left off by counting its existing shards.
+a stride/offset partition of the PGN game stream (worker i handles games
+where `idx % N == i`). Each worker writes to its own `part_{i}` subdirectory
+so shard filenames never collide, and progress is resumable — on ctrl-c,
+re-running picks up where each worker left off by counting existing shards.
 
-Why a partitioned game range instead of a shared queue: a queue adds IPC
-overhead and a single point of failure; pre-partitioning is trivial, only
-costs each worker a one-time header-only skip (~100k games/s), and lets
-each worker be restarted independently.
+Why round-robin instead of contiguous game ranges: contiguous ranges force
+worker N-1 to skip past `(N-1) * games_per_worker` games before it can start
+labeling. With `chess.pgn.read_game` parsing every game body, that skip costs
+hours for large N. Round-robin lets each worker fast-skip non-matching games
+via `chess.pgn.skip_game` (~100k games/s, body-only), so no worker pays a
+serial skip overhead.
 
 Example:
     python scripts/phase_b_parallel.py \\
         --pgn lichess_db_standard_rated_2026-03.pgn \\
         --out-dir pretrain_data/phase_b \\
         --stockfish engines/stockfish/stockfish-windows-x86-64-avx2.exe \\
-        --workers 16 --threads 1 --depth 13 --multipv 10 \\
-        --positions-per-worker 125000 --games-per-worker 50000
+        --workers 16 --threads 1 --depth 12 --multipv 10 \\
+        --min-elo 1800 --positions-per-worker 62500
 """
 
 from __future__ import annotations
@@ -59,8 +61,9 @@ def build_worker_cmd(
     positions_per_game: int,
     skip_opening_plies: int,
     hash_mb: int,
-    skip_games: int,
-    max_games_abs: int,
+    stride: int,
+    offset: int,
+    skip_matched_games: int,
     max_positions: int,
     start_shard: int,
 ) -> list[str]:
@@ -81,8 +84,9 @@ def build_worker_cmd(
         '--positions-per-game', str(positions_per_game),
         '--skip-opening-plies', str(skip_opening_plies),
         '--hash-mb', str(hash_mb),
-        '--skip-games', str(skip_games),
-        '--max-games-abs', str(max_games_abs),
+        '--stride', str(stride),
+        '--offset', str(offset),
+        '--skip-matched-games', str(skip_matched_games),
         '--max-positions', str(max_positions),
         '--start-shard', str(start_shard),
     ]
@@ -108,11 +112,8 @@ def main() -> int:
     ap.add_argument('--positions-per-game', type=int, default=3)
     ap.add_argument('--skip-opening-plies', type=int, default=10)
     ap.add_argument('--hash-mb', type=int, default=256)
-    ap.add_argument('--games-per-worker', type=int, default=200_000,
-                    help='PGN game range each worker covers. Worker i handles games '
-                         '[i*range, (i+1)*range). Only a fraction pass filters.')
     ap.add_argument('--positions-per-worker', type=int, default=125_000,
-                    help='Per-worker position cap (2M total / 16 workers default).')
+                    help='Per-worker position cap (e.g. 2M total / 16 workers default).')
     args = ap.parse_args()
 
     if not os.path.isfile(args.stockfish):
@@ -121,8 +122,9 @@ def main() -> int:
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Launch all N workers in parallel with disjoint [skip_games, max_games_abs)
-    # windows and separate output subdirs.
+    # Round-robin partitioning: each worker opens its own PGN reader and
+    # filters games by `idx % stride == offset`, fast-skipping non-matching
+    # games via `chess.pgn.skip_game`. No worker pays a large skip offset.
     procs: list[subprocess.Popen] = []
     for i in range(args.workers):
         part_dir = args.out_dir / f'part_{i:02d}'
@@ -133,14 +135,11 @@ def main() -> int:
             procs.append(None)  # type: ignore[arg-type]
             continue
 
-        # Position-count resume. Game-level resume is approximated by
-        # advancing the skip_games offset proportionally to the fraction of
-        # the worker's position budget that's already done. Worst case: the
-        # seam re-labels at most one shard's worth of positions.
-        worker_game_base = i * args.games_per_worker
-        done_fraction = already_done / max(args.positions_per_worker, 1)
-        worker_skip = worker_game_base + int(done_fraction * args.games_per_worker)
-        worker_max_games = worker_game_base + args.games_per_worker
+        # Resume: skip past the matched games already labeled in a prior run.
+        # Approximated by positions / positions_per_game; worst case re-labels
+        # at most one shard's worth at the seam (acceptable, see docstring
+        # in count_positions_in_dir).
+        skip_matched = already_done // max(args.positions_per_game, 1)
         remaining_positions = args.positions_per_worker - already_done
 
         cmd = build_worker_cmd(
@@ -157,8 +156,9 @@ def main() -> int:
             positions_per_game=args.positions_per_game,
             skip_opening_plies=args.skip_opening_plies,
             hash_mb=args.hash_mb,
-            skip_games=worker_skip,
-            max_games_abs=worker_max_games,
+            stride=args.workers,
+            offset=i,
+            skip_matched_games=skip_matched,
             max_positions=remaining_positions,
             start_shard=existing_shards,
         )
@@ -172,9 +172,9 @@ def main() -> int:
             cmd, stdout=log_fh, stderr=subprocess.STDOUT,
         )
         procs.append(proc)
-        print(f"[worker {i:02d}] games [{worker_skip:,}..{worker_max_games:,}) "
-              f"resume_from_shard={existing_shards} "
-              f"remaining={remaining_positions:,} pos → {log_path.name}")
+        print(f"[worker {i:02d}] stride={args.workers} offset={i} "
+              f"resume_from_shard={existing_shards} skip_matched={skip_matched:,} "
+              f"remaining={remaining_positions:,} pos -> {log_path.name}")
 
     if not any(p for p in procs):
         print("All workers already complete — nothing to do.")
