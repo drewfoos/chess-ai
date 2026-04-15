@@ -2898,3 +2898,194 @@ def test_gameloopmanager_assigns_playthroughs():
     cfg_zero = SelfPlayConfig(num_games=50, resign_playthrough_fraction=0.0)
     loop0 = GameLoopManager(FakeGM(50), cfg_zero, rng_seed=42)
     assert all(not r.was_playthrough for r in loop0._records)
+
+
+# ---------------------------------------------------------------------------
+# GamePoolManager.run_pool — TDD failing tests (Task 3)
+# ---------------------------------------------------------------------------
+
+def _make_respawn_fake_gm(num_games, moves_per_game=2):
+    """Fake GameManager that forces each slot's game to terminate after
+    `moves_per_game` applied moves. Tracks every init_game_from_fen call
+    so tests can assert respawn was invoked the right number of times.
+    """
+    class FakeStats:
+        def __init__(self, terminal):
+            self.terminal_status = terminal  # 0=ongoing, 2=draw
+            self.n_legal = 4
+            self.visits = [10, 8, 6, 4]
+            self.q_per_child = [0.1, 0.0, -0.1, 0.0]
+            self.best_child_idx = 0
+            self.root_wdl = (0.4, 0.3, 0.3)
+            self.raw_nn_policy = [0.0] * 1858
+            self.raw_nn_value = (0.4, 0.3, 0.3)
+            self.raw_nn_mlh = 20.0
+            self.legal_moves_uci = ["e2e4", "d2d4", "g1f3", "c2c4"]
+            self.sims_done = 64
+
+    class FakeGM:
+        def __init__(self, n):
+            self.n = n
+            self.plies = [0] * n
+            self.applied_moves = [0] * n
+            self.init_game_calls = []
+
+        def step_stats(self, targets):
+            out = []
+            for i in range(self.n):
+                if targets[i] == 0:
+                    out.append(FakeStats(terminal=0))
+                    continue
+                is_terminal = self.applied_moves[i] >= moves_per_game
+                out.append(FakeStats(terminal=2 if is_terminal else 0))
+            return out
+
+        def apply_move(self, idx, m):
+            self.plies[idx] += 1
+            self.applied_moves[idx] += 1
+
+        def get_fen(self, idx):
+            return "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
+
+        def get_ply(self, idx):
+            return self.plies[idx]
+
+        def num_games(self):
+            return self.n
+
+        def init_game_from_fen(self, idx, fen, move_history, num_sims):
+            self.plies[idx] = 0
+            self.applied_moves[idx] = 0
+            self.init_game_calls.append((idx, fen, list(move_history), num_sims))
+
+    return FakeGM(num_games)
+
+
+def test_pool_respawn_basic():
+    """Pool of 4 slots hits target 10 — should see 10 records + 6 respawns."""
+    from training.selfplay_loop import GamePoolManager
+    from training.config import SelfPlayConfig
+
+    cfg = SelfPlayConfig(
+        num_games=4, full_sims=64, quick_sims=16,
+        playout_cap_p=0.0, max_moves=10, max_ply=20,
+    )
+    fake_gm = _make_respawn_fake_gm(num_games=4, moves_per_game=2)
+    pool = GamePoolManager(fake_gm, cfg, discard_pool=None, rng_seed=0)
+
+    completed = pool.run_pool(target_games=10)
+
+    assert len(completed) == 10, f"expected 10 records, got {len(completed)}"
+    # 4 slots initially launched (not via respawn), then 6 respawns to reach 10
+    assert len(fake_gm.init_game_calls) == 6, (
+        f"expected 6 respawn calls, got {len(fake_gm.init_game_calls)}"
+    )
+    # Respawned slot indices should all be in [0, 4)
+    for idx, _, _, _ in fake_gm.init_game_calls:
+        assert 0 <= idx < 4
+
+
+def test_pool_respawn_no_overshoot():
+    """Target 5 with pool of 8 — should not overshoot even though all 8 can finish simultaneously."""
+    from training.selfplay_loop import GamePoolManager
+    from training.config import SelfPlayConfig
+
+    cfg = SelfPlayConfig(
+        num_games=8, full_sims=64, quick_sims=16,
+        playout_cap_p=0.0, max_moves=10, max_ply=20,
+    )
+    # moves_per_game=1 means EVERY slot finishes its first game on step 1
+    fake_gm = _make_respawn_fake_gm(num_games=8, moves_per_game=1)
+    pool = GamePoolManager(fake_gm, cfg, discard_pool=None, rng_seed=0)
+
+    completed = pool.run_pool(target_games=5)
+
+    assert len(completed) == 5, f"expected exactly 5 records, got {len(completed)}"
+    # Zero respawns needed — all 8 slots went terminal on step 1, but we stop at 5.
+    assert len(fake_gm.init_game_calls) == 0
+
+
+def test_pool_preserves_per_slot_state():
+    """Respawn must reset per-slot fields: _target_sims, _last_kld, _completed, records."""
+    from training.selfplay_loop import GamePoolManager
+    from training.config import SelfPlayConfig
+
+    cfg = SelfPlayConfig(
+        num_games=2, full_sims=100, quick_sims=20, min_sims=10,
+        playout_cap_p=0.0, kld_threshold=0.05, use_kld_adaptive=True,
+        max_moves=10, max_ply=20,
+    )
+    fake_gm = _make_respawn_fake_gm(num_games=2, moves_per_game=2)
+    pool = GamePoolManager(fake_gm, cfg, discard_pool=None, rng_seed=0)
+
+    # Manually poison per-slot state, then run to force at least one respawn.
+    pool._last_kld[0] = 999.0
+    pool._target_sims[0] = 1  # non-default sentinel
+
+    completed = pool.run_pool(target_games=3)
+
+    assert len(completed) == 3
+    # After the slot(s) that respawned, state must be reset.
+    assert pool._last_kld[0] == 0.0, (
+        f"_last_kld[0] not reset after respawn (got {pool._last_kld[0]})"
+    )
+    assert pool._target_sims[0] == cfg.full_sims, (
+        f"_target_sims[0] not reset to full_sims (got {pool._target_sims[0]})"
+    )
+    # _completed[0] may be True if the final assignment to slot 0 reached the
+    # cap and got marked inactive — in either case, the _records[0] reference
+    # should be a fresh GameRecord (not still holding the previous game's rows).
+    assert pool._records[0] is not None
+
+
+def test_pool_stagnation_safety():
+    """If step_stats never terminates and never advances, run_pool must still exit."""
+    from training.selfplay_loop import GamePoolManager
+    from training.config import SelfPlayConfig
+
+    cfg = SelfPlayConfig(
+        num_games=2, full_sims=64, quick_sims=16,
+        playout_cap_p=0.0, max_moves=1, max_ply=1,
+    )
+    # moves_per_game high + low max_ply: ply-cap adjudication will fire and
+    # finalize each game — this stress-tests the "adjudicate to avoid hang"
+    # path rather than a true stuck-forever loop.
+    fake_gm = _make_respawn_fake_gm(num_games=2, moves_per_game=100)
+    pool = GamePoolManager(fake_gm, cfg, discard_pool=None, rng_seed=0)
+
+    import time
+    t0 = time.time()
+    completed = pool.run_pool(target_games=4)
+    elapsed = time.time() - t0
+
+    assert len(completed) == 4
+    assert elapsed < 5.0, f"run_pool took {elapsed:.1f}s — likely infinite-looping"
+
+
+def test_pool_inactive_slot_target_zero():
+    """Once launched == target, finished slots stay inactive — step_stats sees target_sims=0 for them."""
+    from training.selfplay_loop import GamePoolManager
+    from training.config import SelfPlayConfig
+
+    cfg = SelfPlayConfig(
+        num_games=4, full_sims=64, quick_sims=16,
+        playout_cap_p=0.0, max_moves=10, max_ply=20,
+    )
+    fake_gm = _make_respawn_fake_gm(num_games=4, moves_per_game=1)
+
+    # Wrap step_stats to capture the targets list passed on each call.
+    targets_seen = []
+    orig_step = fake_gm.step_stats
+    def spying_step(targets):
+        targets_seen.append(list(targets))
+        return orig_step(targets)
+    fake_gm.step_stats = spying_step
+
+    pool = GamePoolManager(fake_gm, cfg, discard_pool=None, rng_seed=0)
+    completed = pool.run_pool(target_games=3)
+
+    assert len(completed) == 3
+    # Some call to step_stats must have included at least one 0 (the 4th slot
+    # became inactive once launched==3 was reached and one slot was extra).
+    had_zero_target = any(0 in t for t in targets_seen)
+    assert had_zero_target, f"no step_stats call ever saw target_sims=0: {targets_seen}"
