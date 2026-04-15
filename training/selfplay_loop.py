@@ -277,7 +277,21 @@ class GamePoolManager:
             self._last_kld[i] = _kld(s.raw_nn_policy[: s.n_legal], s.visits)
 
         # Apply move.
-        self.gm.apply_move(i, chosen)
+        try:
+            self.gm.apply_move(i, chosen)
+        except RuntimeError as e:
+            raise RuntimeError(
+                f"apply_move failed on slot {i}: chosen={chosen}, "
+                f"best_child_idx={s.best_child_idx}, n_legal={s.n_legal}, "
+                f"visits_len={len(s.visits)}, terminal_status={s.terminal_status}, "
+                f"ply={ply}, tau={tau:.3f}, full_sims={cfg.full_sims}, "
+                f"target_sims[i]={self._target_sims[i]}, "
+                f"sims_done={getattr(s, 'sims_done', '?')}, "
+                f"visits_sum={sum(s.visits) if s.visits else 0}, "
+                f"visits_head={list(s.visits)[:5]}, "
+                f"legal_head={list(getattr(s, 'legal_moves_uci', []))[:5]}, "
+                f"fen={self.gm.get_fen(i)!r}"
+            ) from e
 
         # WDL-aware resign. Stage 4: uses s.root_wdl from the pre-apply stats
         # (the eval that informed the just-played move), gated by
