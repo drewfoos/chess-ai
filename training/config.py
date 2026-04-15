@@ -71,3 +71,11 @@ class SelfPlayConfig:
     temp_decay_plies: int = 30
     use_kld_adaptive: bool = True
     max_ply: int = 450
+
+    # --- Stage 4 (Lc0-parity): WDL-aware resign + ply-cap adjudication ---
+    # All three thresholds expressed in side-to-move POV. Lc0 defaults.
+    resign_w: float = 0.02            # resign if own W drops below
+    resign_d: float = 0.98            # resign if draw-prob exceeds (both sides agree on draw)
+    resign_l: float = 0.98            # resign if own L exceeds
+    resign_earliest_ply: int = 30     # no resign before this ply (avoids openings)
+    adjudicated_weight: float = 0.5   # trainer down-weights adjudicated-draw rows

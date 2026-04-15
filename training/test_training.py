@@ -2601,3 +2601,67 @@ def test_value_blend_weights_must_sum_to_one():
     bad = {"game_result": 0.5, "best_eval": 0.5, "played_eval": 0.5, "raw_nn_eval": 0.0}
     with pytest.raises(AssertionError):
         blend_value_target(bad, np.zeros(3), np.zeros(3), np.zeros(3), np.zeros(3))
+
+
+# ---------------------------------------------------------------------------
+# Stage 4: ply-cap adjudication + WDL-aware resign
+# ---------------------------------------------------------------------------
+
+def test_ply_cap_adjudicates_at_450():
+    from training.selfplay_loop import GameLoopManager
+    from training.config import SelfPlayConfig
+    cfg = SelfPlayConfig(
+        num_games=1, full_sims=4, quick_sims=4, max_ply=10,
+        playout_cap_p=0.0, opening_temp_plies=0, opening_temp=0.01,
+        temp_floor=0.01, temp_decay_plies=1,
+        # Keep the fake's root_wdl from tripping resign.
+        resign_w=0.0, resign_d=1.0, resign_l=1.0, resign_earliest_ply=9999,
+    )
+    fake = _make_fake_game_manager(num_games=1)
+    loop = GameLoopManager(fake, cfg, rng_seed=0)
+    games = loop.run_until_all_complete()
+    rec = games[0]
+    assert rec.adjudicated is True
+    assert all(r.adjudicated for r in rec.rows)
+    assert len(rec.rows) <= cfg.max_ply
+
+
+class _ResignCfg:
+    """Minimal duck-typed config for _resign_check tests."""
+    def __init__(self, **kw):
+        self.resign_w = kw.get("resign_w", 0.02)
+        self.resign_d = kw.get("resign_d", 0.98)
+        self.resign_l = kw.get("resign_l", 0.98)
+        self.resign_earliest_ply = kw.get("resign_earliest_ply", 30)
+
+
+def _make_cfg(**kw):
+    return _ResignCfg(**kw)
+
+
+def test_wdl_resign_high_d_triggers():
+    from training.selfplay_loop import _resign_check
+    cfg = _make_cfg(resign_d=0.95, resign_w=0.02, resign_l=0.95, resign_earliest_ply=5)
+    triggered, outcome = _resign_check(
+        cfg, root_wdl=(0.02, 0.97, 0.01), ply=10, is_playthrough=False,
+    )
+    assert triggered is True
+    assert outcome == "draw"
+
+
+def test_wdl_resign_not_before_earliest_ply():
+    from training.selfplay_loop import _resign_check
+    cfg = _make_cfg(resign_d=0.95, resign_w=0.02, resign_l=0.95, resign_earliest_ply=30)
+    triggered, _ = _resign_check(
+        cfg, root_wdl=(0.01, 0.98, 0.01), ply=10, is_playthrough=False,
+    )
+    assert triggered is False
+
+
+def test_wdl_resign_suppressed_on_playthrough():
+    from training.selfplay_loop import _resign_check
+    cfg = _make_cfg(resign_d=0.95, resign_w=0.02, resign_l=0.95, resign_earliest_ply=5)
+    triggered, _ = _resign_check(
+        cfg, root_wdl=(0.01, 0.98, 0.01), ply=10, is_playthrough=True,
+    )
+    assert triggered is False

@@ -65,6 +65,28 @@ def _temperature_sample(visits, tau, rng):
     return len(weights) - 1
 
 
+def _resign_check(cfg, root_wdl, ply, is_playthrough):
+    """Decide whether to resign based on root WDL.
+
+    Playthrough games (set per-game) suppress resign entirely, so the resulting
+    shards let the calibrator measure how often we *would* have resigned on a
+    win/draw. We also gate resign until `resign_earliest_ply` to avoid firing
+    on noisy opening evals.
+
+    Returns (triggered, outcome) where outcome is "loss_for_stm" | "draw" | None.
+    """
+    if is_playthrough or ply < cfg.resign_earliest_ply:
+        return False, None
+    w, d, l = root_wdl
+    if w < cfg.resign_w:
+        return True, "loss_for_stm"
+    if d > cfg.resign_d:
+        return True, "draw"
+    if l > cfg.resign_l:
+        return True, "loss_for_stm"
+    return False, None
+
+
 def _kld(raw_policy_indices, visit_dist):
     """KL(raw || visits) over the legal moves only."""
     eps = 1e-8
@@ -177,7 +199,18 @@ class GameLoopManager:
         # Apply move.
         self.gm.apply_move(i, chosen)
 
-        # Ply-cap (Stage 4 will refine with adjudication semantics).
+        # WDL-aware resign. Stage 4: uses s.root_wdl from the pre-apply stats
+        # (the eval that informed the just-played move), gated by
+        # resign_earliest_ply and suppressed for playthrough games.
+        triggered, outcome = _resign_check(
+            cfg, tuple(s.root_wdl), ply, rec.was_playthrough,
+        )
+        if triggered:
+            ts = 2 if outcome == "draw" else -1
+            self._finalize_game(i, terminal_status=ts, adjudicated=False)
+            return
+
+        # Ply-cap adjudication.
         if self.gm.get_ply(i) >= cfg.max_ply:
             self._finalize_game(i, terminal_status=2, adjudicated=True)
             return
@@ -189,15 +222,32 @@ class GameLoopManager:
         rec = self._records[i]
         rec.adjudicated = adjudicated
         rec.terminal_status = terminal_status
-        # Map terminal_status to WDL (side-to-move perspective at the terminal
-        # position). Stage 3 will plumb through a more principled result.
-        # 1=win-for-side-to-move-at-terminal, -1=loss, 2=draw.
-        if terminal_status == 2:
-            rec.final_wdl = (0.0, 1.0, 0.0)
-        elif terminal_status == 1:
-            rec.final_wdl = (1.0, 0.0, 0.0)
+        if adjudicated:
+            # Ply-cap adjudication: stamp every row so the trainer can
+            # downweight them via adjudicated_weight. Decide outcome from the
+            # last raw_nn_eval — if confidently one-sided, call it; otherwise
+            # treat as a draw.
+            for row in rec.rows:
+                row.adjudicated = True
+            last_wdl = rec.rows[-1].raw_nn_eval if rec.rows else (0.0, 1.0, 0.0)
+            if max(last_wdl) > 0.6:
+                winner = max(range(3), key=lambda k: last_wdl[k])
+                if winner == 0:
+                    rec.final_wdl = (1.0, 0.0, 0.0)
+                elif winner == 1:
+                    rec.final_wdl = (0.0, 1.0, 0.0)
+                else:
+                    rec.final_wdl = (0.0, 0.0, 1.0)
+            else:
+                rec.final_wdl = (0.0, 1.0, 0.0)
         else:
-            rec.final_wdl = (0.0, 0.0, 1.0)
+            # Real terminal (STM perspective at the terminal position).
+            if terminal_status == 2:
+                rec.final_wdl = (0.0, 1.0, 0.0)
+            elif terminal_status == 1:
+                rec.final_wdl = (1.0, 0.0, 0.0)
+            else:
+                rec.final_wdl = (0.0, 0.0, 1.0)
         self._completed[i] = True
 
     def run_until_all_complete(self):
