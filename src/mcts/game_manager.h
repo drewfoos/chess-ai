@@ -59,13 +59,9 @@ public:
                              const std::vector<std::vector<std::string>>& move_histories,
                              int num_sims);
 
-    // Run one step of cross-game batching. Returns number of newly completed games.
-    int step();
-
-    // New API (Stage 1, Lc0-parity self-play refactor): run MCTS until each game
-    // reaches target_sims[i] (or becomes terminal), then return per-game RootStats
-    // *without* committing a move. Caller (Python orchestrator) chooses the move
-    // via apply_move(). Does not alter step()'s behavior — runs alongside it.
+    // Run MCTS until each game reaches target_sims[i] (or becomes terminal), then
+    // return per-game RootStats *without* committing a move. Caller (Python
+    // orchestrator) chooses the move via apply_move().
     std::vector<RootStats> step_stats(const std::vector<int>& target_sims);
 
     // Commit the move at legal-move index `move_idx` for game `game_idx`:
@@ -128,7 +124,7 @@ private:
     NodePool pool_;
     std::vector<GameState> games_;
 
-    // Pre-allocated buffers (reused across step() calls)
+    // Pre-allocated buffers (reused across step_stats() calls)
     std::vector<float> flat_encode_buffer_;
     std::vector<std::vector<Move>> legal_moves_vec_;
     std::vector<int> num_legal_moves_vec_;
@@ -164,9 +160,8 @@ private:
     // Build the public RootStats snapshot for a single game.
     RootStats build_root_stats(int idx) const;
 
-    // Shared batched-evaluate-then-backprop used by both step() and step_stats().
-    // Expands each pending leaf with the returned (policy,value,mlh), caches the
-    // entry, then reverts virtual loss + backpropagates.
+    // Batched-evaluate-then-backprop: expands each pending leaf with the returned
+    // (policy,value,mlh), caches the entry, then reverts virtual loss + backpropagates.
     void evaluate_and_backprop_batch(std::vector<PendingLeaf>& batch);
 
     float dynamic_cpuct(int parent_visits) const;

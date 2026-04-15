@@ -206,10 +206,6 @@ public:
         manager_->init_games_from_fen(fens, move_histories, num_sims);
     }
 
-    int step() {
-        return manager_->step();
-    }
-
     bool all_complete() const {
         return manager_->all_complete();
     }
@@ -394,8 +390,6 @@ PYBIND11_MODULE(_core, m) {
              py::arg("move_histories"),
              py::arg("num_sims"),
              "Initialize games from FEN strings and UCI move histories")
-        .def("step", &PyGameManager::step,
-             "Run one step of cross-game batched search. Returns number of newly completed games.")
         .def("all_complete", &PyGameManager::all_complete,
              "Check if all games have completed their search")
         .def("is_complete", &PyGameManager::is_complete,

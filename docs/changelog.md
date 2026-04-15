@@ -8,6 +8,16 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 
 ## [Unreleased]
 
+### Changed — Lc0-Parity Self-Play Refactor (v0.7.0)
+- New architecture: Python `GameLoopManager` (`training/selfplay_loop.py`) owns per-step orchestration (temperature, playout-cap randomization, KLD-adaptive target sims, ply-cap adjudication, resign logic); C++ `GameManager` becomes a pure search engine exposing `step_stats(target_sims)` + `apply_move(game_idx, move_idx)` + `get_fen` / `get_ply` / `RootStats`
+- **Removed** legacy `GameManager::step()` (C++) and its pybind11 wrapper — the Stage-1 `step_stats` / `apply_move` API is now the only driver. Kills ~100 lines of duplicated gather / batch / backprop logic that was dead code on the self-play path
+- Training shard format bumped to v2 with decomposed eval signals (`best_eval`, `played_eval`, `raw_nn_eval`), `was_playthrough` flags, and `game_lengths` for per-game grouping; `_derive_playthrough_min_evals()` and `_derive_adjudication_rate()` parse v2 shards for resign calibration + adjudication metrics
+- New `training/resign_calibrator.py`: EMA-updated p95 resign threshold with warmup and false-positive-rate tracking, seeded from `resign_playthrough_fraction` (default 0.10) playthrough games per gen
+- New DiscardPool + `_choose_starting_fen` helper seeds self-play games from rejected starting positions (discard_pool → opening_book → standard); adds a min-visit floor so tiny/terminal trees don't poison the position cache
+- `SearchParams::two_fold_draw` default flipped `true → false` for Lc0 parity (only 3-fold repetitions count as draws during search); exposed via pybind11 config + UCI option
+- Dashboard (`visualization/static/index.html`): four new stat boxes — resign_w, resign_fp_rate, discard_pool_size, adjudication_rate — wired through `MetricsLogger.save_generation(...)` as optional kwargs (pre-Stage-10 callers keep the old JSON shape)
+- Dropped badgame-split (temperature-blunder replay) — regression-prone and not part of the Lc0-parity path
+
 ### Added — Supervised Pretraining Pipeline (Phase A + Phase B)
 - `training/pretrain_dataset.py`: streams a Lichess `.pgn` / `.pgn.zst` dump, filters by Elo + time control + game result, and writes format-v2 `.npz` shards with one-hot policy targets + WDL values (phase A). `ShardBuffer` packs dense planes to 104×uint64 bitboards so shards stay compatible with `ChessDataset` and the RL path.
 - `training/pretrain.py`: streaming supervised trainer. `StreamingShardDataset` (IterableDataset) feeds one persistent DataLoader for the whole run to dodge a Windows kernel shared-memory leak (OSError 1450, "no system resources") that surfaced after ~50 shard-group iterations with `num_workers>0`. Honors `--resume-from` so phase B continues from phase A weights and auto-rebuilds the model if the saved `NetworkConfig` differs from the CLI args. `--soft-policy-weight` routes phase-B soft-policy loss through `training.train.compute_loss`.
@@ -43,13 +53,13 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 - Sims and max-moves unchanged (quality ceilings, not throughput dials); only the games-per-gen curve moves
 - Slower hardware can still override via `--games-per-gen` or by passing an explicit `AdaptiveConfig`
 
-### Changed — TensorRT Engine Refit
-- `training/build_trt_engine.py::build_engine()` now sets `BuilderFlag.REFIT` by default so engines can be refit with new weights without rebuilding the plan
-- New `refit_engine(onnx_path, engine_path)` uses `trt.Refitter` + `trt.OnnxParserRefitter.refit_from_file()` to swap weights into an existing engine (~5-10s vs 30-90s plan compile) and re-serializes it to disk so the C++ `TRTEvaluator` picks up the refit on its next reload
-- New `build_or_refit_engine(onnx_path, output_path, can_refit, **build_kwargs) -> (path, refitted)` tries refit when the caller asserts the architecture is unchanged, and falls back to a full build on any refit failure (stale engine, missing REFIT flag, topology drift)
-- `training/selfplay.py::training_loop()` tracks `trt_engine_arch` and only requests refit when the current `(blocks, filters)` matches the engine on disk; on tier transition the engine is rebuilt from scratch
-- Prints `[trt] refit ... in X.Ys` vs `[trt] built ... in X.Ys` so the speedup is visible in the log
-- Tests: `test_refit_engine_swaps_weights_without_rebuild`, `test_refit_fails_gracefully_on_non_refittable_engine`, `test_build_or_refit_falls_back_when_engine_missing`
+### Removed — TensorRT Engine Refit (replaced with Lc0-style build+timing-cache)
+- Ripped out `refit_engine()`, `build_or_refit_engine()`, `BuilderFlag.REFIT`, and the `trt_engine_arch` / `can_refit` tracking in `training_loop()`. Every generation now builds a fresh engine.
+- Why: `torch.onnx.export(..., do_constant_folding=True)` folds BN-fused conv weights into anonymous constants. Those have no named initializer, so TRT's refitter has no handle to them — `refitter.get_missing_weights()` doesn't flag them because TRT never knew they were refittable. Refit silently preserved build-time weights for folded paths while updating the rest, producing an engine that ran but played catastrophically (50x slower, instant blunders). Observed as "gen 2 broken" after Phase B resume.
+- Following Leela Chess Zero's pattern (`src/neural/backends/onnx/network_onnx.cc:675-742`): Lc0 never refits either. They rely on ORT's TRT EP cache keyed on a hash of the ONNX bytes — any weight change forces a fresh build.
+- `training/build_trt_engine.py::build_engine()` gains a `timing_cache_path` argument. TRT's timing cache survives weight-set changes as long as topology is identical, turning a ~60s cold build into ~10s warm. Same amortization mechanism Lc0 gets from `trt_timing_cache_enable=1`.
+- `training/selfplay.py::_build_trt_engine_for_self_play()` writes/reuses `<checkpoint_dir>/trt_timing.cache` across generations.
+- Tests: removed `test_refit_*` and `test_build_or_refit_*`; added `test_timing_cache_is_created_and_reused`.
 
 ### Fixed — Tiered Network Schedule Persistence
 - `training_loop()` now persists `network_schedule` in each checkpoint dict; on resume (including auto-resume) the schedule is restored from the checkpoint if the caller didn't pass one — prevents silently dropping the scale-up plan on restart

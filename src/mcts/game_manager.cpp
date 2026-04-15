@@ -746,106 +746,6 @@ void GameManager::add_shaped_dirichlet_noise(Node* root) {
     }
 }
 
-int GameManager::step() {
-    int newly_completed = 0;
-
-    // Expand roots that haven't been expanded yet
-    for (auto& game : games_) {
-        if (!game.root_expanded && !game.search_complete) {
-            expand_root(game);
-        }
-    }
-
-    // Count active games
-    int num_active = 0;
-    for (const auto& game : games_) {
-        if (!game.search_complete) num_active++;
-    }
-    if (num_active == 0) return 0;
-
-    // Determine how many leaves to gather per game
-    int total_batch = std::max(1, params_.batch_size);
-    int per_game = std::max(1, total_batch / std::max(1, num_active));
-
-    // Gather phase: collect leaves from all active games
-    std::vector<PendingLeaf> batch;
-    batch.reserve(total_batch);
-
-    for (int g = 0; g < static_cast<int>(games_.size()); g++) {
-        auto& game = games_[g];
-        if (game.search_complete) continue;
-
-        // Check smart pruning
-        if (should_prune(game)) {
-            game.search_complete = true;
-            newly_completed++;
-            continue;
-        }
-
-        // Check if root is resolved
-        if (game.root->terminal_status() != 0) {
-            game.search_complete = true;
-            newly_completed++;
-            continue;
-        }
-
-        int leaves_this_game = std::min(per_game, game.target_sims - game.sims_done);
-        int sims_accumulated = 0;
-        for (int i = 0; i < leaves_this_game; i++) {
-            // Each descent contributes >=1 sim (1 for early-exit, M for multivisit)
-            int contrib = gather_leaf_from_game(g, batch);
-            sims_accumulated += std::max(1, contrib);
-            // Stop early if multivisit collapse has already covered the target
-            if (game.sims_done + sims_accumulated >= game.target_sims) break;
-        }
-
-        game.sims_done += sims_accumulated;
-
-        // Check completion
-        if (game.sims_done >= game.target_sims) {
-            game.search_complete = true;
-            newly_completed++;
-        }
-    }
-
-    // Top-up pass: fill the batch if cache hits / terminals / repetitions in the
-    // proportional pass left it short. Without this, a step where many games hit
-    // the NN cache sends a half-empty batch to the GPU and wastes throughput.
-    int safety_iterations = total_batch * 2;
-    while (static_cast<int>(batch.size()) < total_batch && safety_iterations-- > 0) {
-        bool made_progress = false;
-        for (int g = 0; g < static_cast<int>(games_.size()); g++) {
-            if (static_cast<int>(batch.size()) >= total_batch) break;
-            auto& game = games_[g];
-            if (game.search_complete) continue;
-            if (game.sims_done >= game.target_sims) {
-                game.search_complete = true;
-                newly_completed++;
-                continue;
-            }
-            if (game.root->terminal_status() != 0) {
-                game.search_complete = true;
-                newly_completed++;
-                continue;
-            }
-            int contrib = gather_leaf_from_game(g, batch);
-            game.sims_done += std::max(1, contrib);
-            made_progress = true;
-            if (game.sims_done >= game.target_sims) {
-                game.search_complete = true;
-                newly_completed++;
-            }
-        }
-        if (!made_progress) break;
-    }
-
-    // Batch evaluate all pending leaves — shared with step_stats() so both
-    // driver loops stay in lockstep on expand/cache/backprop semantics.
-    evaluate_and_backprop_batch(batch);
-
-    return newly_completed;
-}
-
 bool GameManager::all_complete() const {
     for (const auto& game : games_) {
         if (!game.search_complete) return false;
@@ -914,9 +814,7 @@ SearchResult GameManager::build_result(const GameState& game) const {
     return result;
 }
 
-// --- Stage 1 (Lc0-parity self-play refactor) -------------------------------
-// New API: step_stats / apply_move / get_fen / get_ply / RootStats.
-// Runs alongside the existing step(); both share evaluate_and_backprop_batch.
+// Public API: step_stats / apply_move / get_fen / get_ply / RootStats.
 
 void GameManager::evaluate_and_backprop_batch(std::vector<PendingLeaf>& batch) {
     if (batch.empty()) return;
@@ -990,7 +888,7 @@ std::vector<RootStats> GameManager::step_stats(const std::vector<int>& target_si
         }
     }
 
-    // Expand roots that haven't been expanded yet (same as step()).
+    // Expand roots that haven't been expanded yet.
     for (auto& game : games_) {
         if (!game.root_expanded && !game.search_complete) {
             expand_root(game);

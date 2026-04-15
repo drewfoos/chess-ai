@@ -2086,64 +2086,6 @@ class TestCppMCTS:
         assert len(record.planes) == record.num_moves
         assert len(record.policies) == record.num_moves
 
-    def test_game_manager_parallel_games(self, tmp_path):
-        """Test GameManager runs multiple games with cross-game batching."""
-        import chess_mcts
-
-        model_path = self._get_model_path(tmp_path)
-        manager = chess_mcts.GameManager(model_path, "cpu", {"num_iterations": 50, "batch_size": 8})
-        manager.init_games(4, 50)
-
-        assert manager.num_games() == 4
-        assert not manager.all_complete()
-
-        # Run until all complete
-        max_steps = 200  # safety limit
-        steps = 0
-        while not manager.all_complete() and steps < max_steps:
-            manager.step()
-            steps += 1
-
-        assert manager.all_complete()
-
-        for i in range(4):
-            assert manager.is_complete(i)
-            result = manager.get_result(i)
-            assert result.best_move  # non-empty string
-            assert result.total_nodes > 0
-
-    def test_game_manager_from_fen(self, tmp_path):
-        """Test GameManager initialized from FEN strings and move histories."""
-        import chess_mcts
-
-        model_path = self._get_model_path(tmp_path)
-        manager = chess_mcts.GameManager(model_path, "cpu", {"num_iterations": 30, "batch_size": 4})
-
-        fens = [
-            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
-            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
-        ]
-        move_histories = [
-            [],           # starting position, no moves
-            ["e2e4"],     # replay e4 from starting position for history
-        ]
-        manager.init_games_from_fen(fens, move_histories, 30)
-
-        assert manager.num_games() == 2
-
-        max_steps = 200
-        steps = 0
-        while not manager.all_complete() and steps < max_steps:
-            manager.step()
-            steps += 1
-
-        assert manager.all_complete()
-        for i in range(2):
-            result = manager.get_result(i)
-            assert result.best_move
-            assert result.total_nodes > 0
-
-
 # ── Adaptive Early-Gen Settings ────────────────────────────────────────────
 
 class TestAdaptiveConfig:
