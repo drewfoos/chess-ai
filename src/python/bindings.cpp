@@ -206,6 +206,27 @@ public:
         manager_->init_games_from_fen(fens, move_histories, num_sims);
     }
 
+    // Per-slot re-init (continuous-flow self-play). Unlike init_games_from_fen
+    // this does NOT reset the shared NodePool — only the one slot's root Node
+    // is re-allocated. Used by Python's GamePoolManager.run_pool() to respawn
+    // a fresh game into a slot whose prior game just terminated.
+    void init_game_from_fen(int idx,
+                            const std::string& fen,
+                            const std::vector<std::string>& move_history,
+                            int num_sims) {
+        Position pos;
+        pos.set_fen(fen);
+        neural::PositionHistory history;
+        history.reset(pos);
+        for (const auto& uci_str : move_history) {
+            Move m = parse_uci_move(pos, uci_str);
+            UndoInfo undo;
+            pos.make_move(m, undo);
+            history.push(pos);
+        }
+        manager_->init_game(idx, history, num_sims);
+    }
+
     bool all_complete() const {
         return manager_->all_complete();
     }
@@ -390,6 +411,12 @@ PYBIND11_MODULE(_core, m) {
              py::arg("move_histories"),
              py::arg("num_sims"),
              "Initialize games from FEN strings and UCI move histories")
+        .def("init_game_from_fen", &PyGameManager::init_game_from_fen,
+             py::arg("idx"),
+             py::arg("fen"),
+             py::arg("move_history") = std::vector<std::string>{},
+             py::arg("num_sims"),
+             "Re-init a single slot with a fresh game. Does NOT reset the NodePool.")
         .def("all_complete", &PyGameManager::all_complete,
              "Check if all games have completed their search")
         .def("is_complete", &PyGameManager::is_complete,
