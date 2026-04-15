@@ -2895,6 +2895,46 @@ def test_resign_calibrator_empty_samples():
     assert cal.false_positive_rate([]) == 0.0
 
 
+def test_metrics_includes_lc0_parity_fields(tmp_path):
+    from training.metrics import MetricsLogger, TrainingMetrics
+    ml = MetricsLogger(str(tmp_path))
+    training = TrainingMetrics(
+        total_loss=1.5, policy_loss=1.0, value_loss=0.5,
+        num_batches=10, learning_rate=1e-3,
+    )
+    ml.save_generation(
+        generation=5, num_positions=3000, training=training, duration_s=60.0,
+        resign_w=0.018, resign_fp_rate=0.06,
+        discard_pool_size=2300, adjudication_rate=0.04,
+    )
+    import json as _json
+    data = _json.loads((tmp_path / "gen_005.json").read_text())
+    assert data["resign_w"] == 0.018
+    assert data["resign_fp_rate"] == 0.06
+    assert data["discard_pool_size"] == 2300
+    assert data["adjudication_rate"] == 0.04
+    summary = _json.loads((tmp_path / "summary.json").read_text())
+    last = summary["generations"][-1]
+    assert last["resign_w"] == 0.018
+    assert last["adjudication_rate"] == 0.04
+
+
+def test_metrics_skips_lc0_fields_when_omitted(tmp_path):
+    from training.metrics import MetricsLogger, TrainingMetrics
+    ml = MetricsLogger(str(tmp_path))
+    training = TrainingMetrics(
+        total_loss=1.5, policy_loss=1.0, value_loss=0.5,
+        num_batches=10, learning_rate=1e-3,
+    )
+    ml.save_generation(
+        generation=1, num_positions=100, training=training, duration_s=10.0,
+    )
+    import json as _json
+    data = _json.loads((tmp_path / "gen_001.json").read_text())
+    for k in ("resign_w", "resign_fp_rate", "discard_pool_size", "adjudication_rate"):
+        assert k not in data
+
+
 def test_gameloopmanager_assigns_playthroughs():
     """GameLoopManager samples resign_playthrough_fraction when constructing
     per-game records. With a large game count the observed rate should be

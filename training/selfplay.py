@@ -1324,6 +1324,34 @@ def _train_one_cycle(model, optimizer, dataloader, device, train_epochs, schedul
     return total_loss_sum, policy_loss_sum, value_loss_sum, soft_policy_loss_sum, num_batches
 
 
+def _derive_adjudication_rate(shard_path: str) -> float:
+    """Fraction of games in an aggregate v2 shard that were adjudicated.
+
+    Uses `game_lengths` to isolate the first row of each game (stamped rows
+    share the same `adjudicated` value). Returns 0.0 for pre-v2 shards.
+    """
+    try:
+        data = np.load(shard_path, allow_pickle=False)
+    except Exception:
+        return 0.0
+    if "game_lengths" not in data.files or "adjudicated" not in data.files:
+        return 0.0
+    lengths = data["game_lengths"]
+    adj = data["adjudicated"]
+    if len(lengths) == 0:
+        return 0.0
+    adjud = 0
+    cursor = 0
+    for gl in lengths:
+        gl = int(gl)
+        if gl <= 0:
+            continue
+        if bool(adj[cursor]):
+            adjud += 1
+        cursor += gl
+    return adjud / float(len(lengths))
+
+
 def _derive_playthrough_min_evals(shard_path: str) -> list[float]:
     """Scan an aggregate v2 shard and return per-playthrough-game min-W of
     the eventual winner (row-by-row, STM-POV flipped if needed).
@@ -1792,6 +1820,16 @@ def training_loop(
             learning_rate=optimizer.param_groups[0]['lr'],
             soft_policy_loss=avg_soft,
         )
+        # Stage 10: operational metrics for the dashboard. Pool size reads 0
+        # until a training_loop-owned DiscardPool is wired (future work);
+        # FP-rate and adjudication-rate come from this gen's shard.
+        adjud_rate = _derive_adjudication_rate(data_path)
+        fp_rate = (
+            resign_calibrator.last_fp_rate
+            if resign_calibrator.last_fp_rate is not None
+            else 0.0
+        )
+        pool_size = 0  # placeholder until training_loop owns a DiscardPool
         metrics_logger.save_generation(
             generation=gen,
             num_positions=num_positions,
@@ -1799,6 +1837,10 @@ def training_loop(
             duration_s=gen_time,
             network={'blocks': config.num_blocks, 'filters': config.num_filters},
             resumed=(gen == first_gen_after_resume),
+            resign_w=float(resign_calibrator.current),
+            resign_fp_rate=float(fp_rate),
+            discard_pool_size=int(pool_size),
+            adjudication_rate=float(adjud_rate),
         )
 
     # Export final TorchScript model

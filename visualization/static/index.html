@@ -333,6 +333,22 @@
                     <div class="label">Network</div>
                     <div class="value" id="stat-network">-</div>
                 </div>
+                <div class="stat-box">
+                    <div class="label">Resign W</div>
+                    <div class="value" id="stat-resign-w">-</div>
+                </div>
+                <div class="stat-box">
+                    <div class="label">Resign FP</div>
+                    <div class="value" id="stat-resign-fp">-</div>
+                </div>
+                <div class="stat-box">
+                    <div class="label">Adjud. Rate</div>
+                    <div class="value" id="stat-adjud">-</div>
+                </div>
+                <div class="stat-box">
+                    <div class="label">Pool Size</div>
+                    <div class="value" id="stat-pool">-</div>
+                </div>
             </div>
 
             <div class="card">
@@ -751,6 +767,17 @@ function updateDashboard(data) {
                 netEl.textContent = '-';
             }
         }
+
+        // Stage 10: Lc0-parity operational metrics. Omitted fields render '-'.
+        function setOp(id, val, fmt) {
+            var el = document.getElementById(id);
+            if (!el) return;
+            el.textContent = (val === undefined || val === null) ? '-' : fmt(val);
+        }
+        setOp('stat-resign-w', latest.resign_w, function(v) { return v.toFixed(3); });
+        setOp('stat-resign-fp', latest.resign_fp_rate, function(v) { return (v * 100).toFixed(1) + '%'; });
+        setOp('stat-adjud', latest.adjudication_rate, function(v) { return (v * 100).toFixed(1) + '%'; });
+        setOp('stat-pool', latest.discard_pool_size, function(v) { return v.toLocaleString(); });
     }
 
     // Loss chart

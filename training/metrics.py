@@ -56,11 +56,21 @@ class MetricsLogger:
         duration_s: float,
         network: dict | None = None,
         resumed: bool = False,
+        resign_w: float | None = None,
+        resign_fp_rate: float | None = None,
+        discard_pool_size: int | None = None,
+        adjudication_rate: float | None = None,
     ):
         """Save generation metrics to JSON and update summary.
 
         `resumed` marks the first generation after a training restart so the
         dashboard can annotate the loss chart with a vertical line.
+
+        Stage 10 (Lc0-parity) adds four optional operational metrics:
+        current resign threshold, its false-positive rate measured on the
+        most recent playthrough games, current DiscardPool size, and the
+        fraction of games adjudicated by the ply cap. Omitted fields are
+        skipped so pre-Stage-10 callers keep the old JSON shape.
         """
         gen_data = {
             'generation': generation,
@@ -74,6 +84,14 @@ class MetricsLogger:
             gen_data['network'] = network
         if resumed:
             gen_data['resumed'] = True
+        if resign_w is not None:
+            gen_data['resign_w'] = resign_w
+        if resign_fp_rate is not None:
+            gen_data['resign_fp_rate'] = resign_fp_rate
+        if discard_pool_size is not None:
+            gen_data['discard_pool_size'] = discard_pool_size
+        if adjudication_rate is not None:
+            gen_data['adjudication_rate'] = adjudication_rate
 
         gen_path = os.path.join(self.metrics_dir, f'gen_{generation:03d}.json')
         with open(gen_path, 'w') as f:
@@ -108,6 +126,9 @@ class MetricsLogger:
                 '1/2-1/2': sum(1 for g in gen_data['games'] if g['result'] == '1/2-1/2'),
             },
         }
+        for key in ('resign_w', 'resign_fp_rate', 'discard_pool_size', 'adjudication_rate'):
+            if key in gen_data:
+                gen_summary[key] = gen_data[key]
 
         summary['generations'].append(gen_summary)
 
