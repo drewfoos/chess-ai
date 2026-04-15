@@ -2810,3 +2810,43 @@ def test_min_visit_floor_bounded_retries():
     finally:
         selfplay_loop._temperature_sample = orig_sample
     assert loop.gm.applied == [0]   # fell back to argmax
+
+
+# ---------------------------------------------------------------------------
+# Stage 6: discarded-start seeding
+# ---------------------------------------------------------------------------
+
+def test_discarded_start_seeds_from_pool(tmp_path):
+    import random as _random
+    from training.discard_pool import DiscardPool
+    from training.selfplay import _choose_starting_fen
+    from training.config import SelfPlayConfig
+
+    cfg = SelfPlayConfig(
+        num_games=1, discarded_start_chance=1.0, discarded_min_pieces=16,
+    )
+    pool = DiscardPool(cap=10, persist_path=tmp_path / "pool.json")
+    # 31-piece position (one pawn pushed, rest of startpos intact).
+    pool.push("rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq - 0 1")
+    rng = _random.Random(0)
+    fen, src = _choose_starting_fen(
+        cfg, opening_book_fens=["startpos_fen"], pool=pool, rng=rng,
+    )
+    assert src == "discard_pool"
+    assert "P3/8/PPPP" in fen
+
+
+def test_discarded_start_falls_back_when_pool_empty(tmp_path):
+    import random as _random
+    from training.discard_pool import DiscardPool
+    from training.selfplay import _choose_starting_fen
+    from training.config import SelfPlayConfig
+
+    cfg = SelfPlayConfig(num_games=1, discarded_start_chance=1.0)
+    pool = DiscardPool(cap=10, persist_path=tmp_path / "pool.json")
+    rng = _random.Random(0)
+    fen, src = _choose_starting_fen(
+        cfg, opening_book_fens=["BOOKFEN"], pool=pool, rng=rng,
+    )
+    assert src == "opening_book"
+    assert fen == "BOOKFEN"

@@ -224,6 +224,30 @@ def _sample_opening_fen(config: SelfPlayConfig) -> str | None:
     return random.choice(fens)
 
 
+def _choose_starting_fen(cfg, opening_book_fens, pool, rng):
+    """Decide a new game's starting FEN + seed_source label.
+
+    Priority: DiscardPool (with probability cfg.discarded_start_chance, filtered
+    to ≥ cfg.discarded_min_pieces) → opening book (if provided) → startpos.
+    Pops from the pool up to 3 times to skip under-pieced entries; if nothing
+    qualifies, falls back without consuming further pool entries.
+
+    Returns (fen, seed_source) where seed_source ∈ {"discard_pool",
+    "opening_book", "standard"}.
+    """
+    if pool is not None and rng.random() < cfg.discarded_start_chance:
+        for _ in range(3):
+            fen = pool.pop()
+            if fen is None:
+                break
+            piece_count = sum(1 for ch in fen.split()[0] if ch.isalpha())
+            if piece_count >= cfg.discarded_min_pieces:
+                return fen, "discard_pool"
+    if opening_book_fens:
+        return rng.choice(opening_book_fens), "opening_book"
+    return chess.STARTING_FEN, "standard"
+
+
 def _try_load_syzygy(path: str | None):
     """Try to load Syzygy tablebases. Returns tablebase object or None."""
     if path is None:
@@ -491,6 +515,7 @@ def play_games_batched(
     on_game_done=None,
     use_trt: bool = False,
     trt_engine_path: str = "",
+    discard_pool=None,
 ) -> list[GameRecord]:
     """Play num_games concurrently using chess_mcts.GameManager + GameLoopManager.
 
@@ -587,7 +612,7 @@ def play_games_batched(
 
         # Rebind the loop cfg to match the actual game count in this batch.
         batch_cfg = _replace_selfplay_cfg(loop_cfg, num_games=batch)
-        loop = GameLoopManager(manager, batch_cfg, discard_pool=None, rng_seed=None)
+        loop = GameLoopManager(manager, batch_cfg, discard_pool=discard_pool, rng_seed=None)
         start_times = [time.time()] * batch
         loop_records: list[LoopGameRecord] = loop.run_until_all_complete()
 
@@ -948,6 +973,7 @@ def generate_games(
     parallel_games: int = 16,
     use_trt: bool = False,
     trt_engine_path: str = "",
+    discard_pool=None,
 ) -> int:
     """Generate self-play games and save as .npz file.
 
@@ -1025,6 +1051,7 @@ def generate_games(
             on_game_done=_on_done,
             use_trt=use_trt,
             trt_engine_path=trt_engine_path,
+            discard_pool=discard_pool,
         )
     else:
         mcts = MCTS(model, mcts_config, device=device)

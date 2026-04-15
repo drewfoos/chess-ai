@@ -85,3 +85,10 @@ class SelfPlayConfig:
     # visit count. Moves with fewer visits get rejected and resampled (up to 3
     # retries) before falling back to argmax.
     min_visits_floor: int | None = None
+
+    # --- Stage 6 (Lc0-parity): discarded-start seeding ---
+    # Probability that a new game starts from a FEN popped off the DiscardPool
+    # instead of the opening book / startpos. Filter keeps only positions with
+    # ≥ discarded_min_pieces total pieces, so we don't seed endgame fragments.
+    discarded_start_chance: float = 0.15
+    discarded_min_pieces: int = 16
