@@ -43,6 +43,7 @@ class MCTSConfig:
     uncertainty_weight: float = 0.15  # exploration bonus from value variance (0 = disabled)
     variance_scaling: bool = True     # scale c_puct by parent value variance
     contempt: float = 0.0        # draw aversion: positive = prefer wins over draws
+    sibling_blending: bool = True # use visited siblings' Q as FPU for unvisited children (Ceres)
     max_collapse_visits: int = 8 # C++ multivisit cap: collapse repeated same-child PUCT selections into N visits per descent (1 disables)
     # Asymmetric root FPU (Lc0 FpuStrategyAtRoot=absolute): at the root, treat unvisited
     # children as having a fixed pessimistic value instead of (parent_mean - reduction).

@@ -213,7 +213,7 @@ python train.py
 python -m training loop `
   --resume-from checkpoints\phase_b.pt `
   --generations 100 --games-per-gen 512 --simulations 400 `
-  --parallel-games 128 --mcts-batch-size 512 --batch-size 2048
+  --parallel-games 128 --mcts-batch-size 256 --batch-size 2048
 ```
 
 ### Play

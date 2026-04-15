@@ -40,6 +40,22 @@ def _build_policy_mirror_table() -> np.ndarray:
 
 _POLICY_MIRROR = _build_policy_mirror_table()
 
+# Cached gather indices for vectorized policy mirroring. `_POLICY_MIRROR_SRC`
+# holds the source positions whose mirror move exists in the encoding;
+# `_POLICY_MIRROR_DST` holds where each one writes to in the mirrored array.
+# A batched mirror is then `out[:, dst] = policies[:, src]` — eliminates the
+# 1858-iter Python loop that dominated dataset construction time.
+_POLICY_MIRROR_SRC = np.where(_POLICY_MIRROR >= 0)[0].astype(np.int64)
+_POLICY_MIRROR_DST = _POLICY_MIRROR[_POLICY_MIRROR_SRC].astype(np.int64)
+
+
+def mirror_policies_batched(policies: np.ndarray) -> np.ndarray:
+    """Vectorized mirror of a (N, 1858) policy batch. Equivalent to
+    `np.stack([mirror_policy(p) for p in policies])` but ~100× faster."""
+    out = np.zeros_like(policies)
+    out[:, _POLICY_MIRROR_DST] = policies[:, _POLICY_MIRROR_SRC]
+    return out
+
 
 def _build_byte_bitreverse_table() -> np.ndarray:
     """Per-byte bit-reverse lookup (reverses bit order within each byte)."""
@@ -286,7 +302,7 @@ class ChessDataset(Dataset):
         if mirror:
             m_bb = mirror_bitboards(bitboards)
             m_castling = mirror_castling(castling)
-            m_policies = np.stack([mirror_policy(p) for p in policies])
+            m_policies = mirror_policies_batched(policies)
 
             bitboards = np.concatenate([bitboards, m_bb], axis=0)
             stm = np.concatenate([stm, stm], axis=0)
