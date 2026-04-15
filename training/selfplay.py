@@ -516,6 +516,7 @@ def play_games_batched(
     use_trt: bool = False,
     trt_engine_path: str = "",
     discard_pool=None,
+    continuous_flow: bool = False,
 ) -> list[GameRecord]:
     """Play num_games concurrently using chess_mcts.GameManager + GameLoopManager.
 
@@ -588,31 +589,58 @@ def play_games_batched(
 
     parallel_games = max(1, min(parallel_games, num_games))
     completed: list[GameRecord] = []
-    remaining = num_games
 
-    # We run in rounds of `parallel_games` games at a time. Each round builds a
-    # fresh GameManager and runs the loop to completion. This is simpler than
-    # the legacy dynamic-backfill slot scheme and is sufficient for Stage 2 —
-    # dynamic backfill is tracked for a later optimization pass.
-    while remaining > 0:
-        batch = min(parallel_games, remaining)
+    if continuous_flow:
+        # Continuous-flow mode: one manager, one pool, slots respawn as games
+        # finish. Eliminates the batch-boundary tail-latency cost.
+        from training.selfplay_loop import GamePoolManager
         manager = _make_manager()
-        manager.init_games(batch, full_sims)
+        manager.init_games(parallel_games, full_sims)
+        pool_cfg = _replace_selfplay_cfg(loop_cfg, num_games=parallel_games)
+        pool = GamePoolManager(
+            manager, pool_cfg, discard_pool=discard_pool, rng_seed=None,
+        )
+        pool_start = time.time()
 
-        # Rebind the loop cfg to match the actual game count in this batch.
-        batch_cfg = _replace_selfplay_cfg(loop_cfg, num_games=batch)
-        loop = GameLoopManager(manager, batch_cfg, discard_pool=discard_pool, rng_seed=None)
-        start_times = [time.time()] * batch
-        loop_records: list[LoopGameRecord] = loop.run_until_all_complete()
-
-        for j, lrec in enumerate(loop_records):
+        def _on_pool_done(lrec, completion_idx):
             record = _loop_record_to_legacy(lrec, selfplay_config)
-            duration = time.time() - start_times[j]
+            # Per-game duration is not cleanly attributable under continuous
+            # flow (slots are reused). Report cumulative elapsed / games-done
+            # so the external on_game_done callback still gets a monotonic
+            # signal for progress logging.
+            duration = (time.time() - pool_start) / max(1, completion_idx)
             completed.append(record)
             if on_game_done is not None:
                 on_game_done(record, duration, len(completed))
 
-        remaining -= batch
+        pool.run_pool(num_games, on_game_done=_on_pool_done)
+    else:
+        # Legacy batch-boundary mode: kept so `--continuous-flow` can be
+        # turned off for side-by-side comparison. Remove once flow mode has
+        # been stable for several generations.
+        remaining = num_games
+
+        # We run in rounds of `parallel_games` games at a time. Each round builds
+        # a fresh GameManager and runs the loop to completion.
+        while remaining > 0:
+            batch = min(parallel_games, remaining)
+            manager = _make_manager()
+            manager.init_games(batch, full_sims)
+
+            # Rebind the loop cfg to match the actual game count in this batch.
+            batch_cfg = _replace_selfplay_cfg(loop_cfg, num_games=batch)
+            loop = GameLoopManager(manager, batch_cfg, discard_pool=discard_pool, rng_seed=None)
+            start_times = [time.time()] * batch
+            loop_records: list[LoopGameRecord] = loop.run_until_all_complete()
+
+            for j, lrec in enumerate(loop_records):
+                record = _loop_record_to_legacy(lrec, selfplay_config)
+                duration = time.time() - start_times[j]
+                completed.append(record)
+                if on_game_done is not None:
+                    on_game_done(record, duration, len(completed))
+
+            remaining -= batch
 
     return completed
 
@@ -797,6 +825,7 @@ def generate_games(
     use_trt: bool = False,
     trt_engine_path: str = "",
     discard_pool=None,
+    continuous_flow: bool = False,
 ) -> int:
     """Generate self-play games and save as .npz file.
 
@@ -879,6 +908,7 @@ def generate_games(
             use_trt=use_trt,
             trt_engine_path=trt_engine_path,
             discard_pool=discard_pool,
+            continuous_flow=continuous_flow,
         )
     else:
         mcts = MCTS(model, mcts_config, device=device)
@@ -963,8 +993,9 @@ def generate_games(
         game_lengths=np.asarray(all_game_lengths, dtype=np.int32),
     )
 
-    print(f"Generated {num_games} games, {total_positions} positions in {elapsed:.1f}s")
-    print(f"Saved to {output_path}")
+    print(f"Generated {num_games} games, {total_positions} positions in {elapsed:.1f}s",
+          flush=True)
+    print(f"Saved to {output_path}", flush=True)
     return total_positions
 
 
@@ -1039,7 +1070,9 @@ def _build_trt_engine_for_self_play(
 
     Returns the .trt path. Uses env TENSORRT_PATH for DLL discovery.
     """
+    import gc as _gc
     import time as _time
+    import torch as _torch
     from training.export import export_onnx
     from training.build_trt_engine import build_engine
 
@@ -1049,17 +1082,37 @@ def _build_trt_engine_for_self_play(
         os.path.dirname(os.path.abspath(trt_path)) or '.', 'trt_timing.cache',
     )
     export_onnx(model, onnx_path)
+    # TRT builder kernel autotune probes many candidate allocations; on a 10GB
+    # GPU with training artifacts (optimizer states, SWA, cuDNN autotune cache)
+    # still resident, those probes OOM. Free as much as we can first. Moving
+    # the model to CPU during the build adds ~100MB of headroom; we restore
+    # it below (caller still holds the same Module reference).
+    orig_device = next(model.parameters()).device
+    moved = False
+    if _torch.cuda.is_available():
+        if orig_device.type == 'cuda':
+            model.to('cpu')
+            moved = True
+        _gc.collect()
+        _torch.cuda.empty_cache()
     t0 = _time.time()
     # TRT max_batch must be >= the MCTS gather batch. opt_batch is set to half of
     # max so both small and large batches get decent kernels in one profile.
     opt_batch = max(128, max_batch // 2)
+    # workspace_mb=1024 (down from 2048): on a 10GB GPU with training artifacts
+    # (optimizer states, SWA copy, cuDNN autotune cache) resident at gen boundary,
+    # a 2GB TRT workspace plus kernel-probe allocations OOMs. 1GB is ample for
+    # a 20b×256f network and leaves headroom for the probing phase.
     build_engine(
         onnx_path, trt_path,
         opt_batch=opt_batch, max_batch=max_batch,
+        workspace_mb=1024,
         timing_cache_path=timing_cache_path,
     )
     elapsed = _time.time() - t0
     print(f"  [trt] build took {elapsed:.1f}s")
+    if moved:
+        model.to(orig_device)
     return trt_path
 
 
@@ -1085,12 +1138,24 @@ def _build_window_dataloader(
     if not npz_paths:
         return None, None
     dataset = ChessDataset(npz_paths, mirror=True)
+    # CPU-side bitboard unpack + plane assembly is the self-play loop's main
+    # data-prep cost. With num_workers=0 the GPU sat idle between batches
+    # (CPU at ~6% on a 16-thread box). 4 workers parallelize unpacking,
+    # persistent_workers=True amortizes spawn cost across train_epochs,
+    # pin_memory speeds the host→device copy.
+    _common = dict(
+        batch_size=batch_size,
+        drop_last=True,
+        num_workers=4,
+        pin_memory=True,
+        persistent_workers=True,
+    )
     if dataset.surprise_weights is not None:
         weights = dataset.surprise_weights + 1e-6
         sampler = WeightedRandomSampler(weights, len(dataset), replacement=True)
-        loader = DataLoader(dataset, batch_size=batch_size, sampler=sampler, drop_last=True)
+        loader = DataLoader(dataset, sampler=sampler, **_common)
     else:
-        loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=True)
+        loader = DataLoader(dataset, shuffle=True, **_common)
     return dataset, loader
 
 
@@ -1113,21 +1178,23 @@ def _train_one_cycle(model, optimizer, dataloader, device, train_epochs, schedul
     use_amp = (device == 'cuda')
     scaler = torch.amp.GradScaler(enabled=use_amp)
 
+    nb = (device == 'cuda')  # non_blocking only meaningful when pin_memory=True
+
     for _ in range(train_epochs):
         for batch in dataloader:
-            planes = batch[0].to(device)
-            policy_target = batch[1].to(device)
-            value_target = batch[2].to(device)
+            planes = batch[0].to(device, non_blocking=nb)
+            policy_target = batch[1].to(device, non_blocking=nb)
+            value_target = batch[2].to(device, non_blocking=nb)
             mlh_target = None
             policy_mask = None
             bi = 3
             if bi < len(batch) and batch[bi].dtype in (torch.float32, torch.float64):
-                mlh_target = batch[bi].to(device)
+                mlh_target = batch[bi].to(device, non_blocking=nb)
                 bi += 1
             if bi < len(batch) and batch[bi].dtype == torch.bool:
-                policy_mask = batch[bi].to(device)
+                policy_mask = batch[bi].to(device, non_blocking=nb)
 
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast(device_type=device, enabled=use_amp):
                 policy_logits, value_logits, mlh_pred = model(planes)
                 total_loss, policy_loss, value_loss, soft_policy_loss = compute_loss(
@@ -1243,7 +1310,7 @@ def _derive_playthrough_min_evals(shard_path: str) -> list[float]:
 def training_loop(
     generations: int = 10,
     games_per_gen: int = 400,
-    train_epochs: int = 5,
+    train_epochs: int = 2,
     batch_size: int = 2048,
     lr: float = 1e-3,
     weight_decay: float = 1e-4,
@@ -1268,6 +1335,7 @@ def training_loop(
     lr_milestones: list[int] | None = None,
     lr_gamma: float = 0.1,
     mcts_batch_size: int | None = None,
+    continuous_flow: bool = False,
 ):
     """Full reinforcement learning training loop.
 
@@ -1317,6 +1385,15 @@ def training_loop(
 
     if device == 'auto':
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+    # cuDNN autotune: lets the first batch of each shape probe convolution
+    # algorithms and cache the fastest. Our tensor shapes are stable across
+    # batches (only batch dim varies, and it's pinned by drop_last=True), so
+    # the autotune cost amortizes across all subsequent forwards.
+    # TF32 matmuls are a free ~2× on Ampere for the FC layers in the heads.
+    if device == 'cuda':
+        torch.backends.cudnn.benchmark = True
+        torch.set_float32_matmul_precision('high')
 
     data_dir = os.path.join(output_dir, 'data')
     checkpoint_dir = os.path.join(output_dir, 'checkpoints')
@@ -1473,6 +1550,26 @@ def training_loop(
         opening_book_fraction=opening_book_fraction,
     )
 
+    # Initialize the C++ Syzygy tablebase wrapper so MCTS leaves with
+    # piece_count <= TB_LARGEST resolve exactly via Fathom and bypass the NN.
+    # Without this call, only the post-game Python rescore runs — MCTS still
+    # spends GPU time on endgame leaves the tablebase could answer for free.
+    if syzygy_path:
+        try:
+            import chess_mcts
+            n = chess_mcts.syzygy_init(syzygy_path)
+            print(f"[syzygy] in-search probing enabled (max-pieces={n})")
+        except Exception as e:
+            print(f"[syzygy] in-search init failed ({e}); using Python rescore only")
+
+    # Opening book is plumbed through SelfPlayConfig but `play_games_batched`
+    # explicitly drops it on the C++ self-play path (Stage 6 hasn't restored it
+    # to GameLoopManager yet). Warn loudly so a `--opening-book` user knows the
+    # flag is currently a no-op rather than silently doing nothing.
+    if opening_book_path:
+        print(f"[warn] --opening-book {opening_book_path} is currently a no-op on the "
+              "C++ self-play path (pending Stage-6 restore in selfplay_loop.py).")
+
     # Default adaptive config if not provided
     if adaptive is None:
         adaptive = AdaptiveConfig(enabled=False, full_sims=num_simulations,
@@ -1581,6 +1678,7 @@ def training_loop(
             parallel_games=parallel_games,
             use_trt=use_trt,
             trt_engine_path=trt_engine_path,
+            continuous_flow=continuous_flow,
         )
 
         # Stage 7: EMA-update resign_w from this generation's playthrough
@@ -1596,6 +1694,8 @@ def training_loop(
         dataset, dataloader = _build_window_dataloader(
             data_dir, window_start, gen, batch_size,
         )
+        print(f"Training on {len(dataset)} samples "
+              f"(window {window_start}-{gen}, {train_epochs} epoch(s))...", flush=True)
 
         # 3. Train for train_epochs epochs (with mixed precision on CUDA)
         (total_loss_sum, policy_loss_sum, value_loss_sum,
@@ -1706,8 +1806,8 @@ def main():
     # Loop subcommand
     loop_parser = subparsers.add_parser('loop', help='Run full RL training loop')
     loop_parser.add_argument('--generations', type=int, default=10)
-    loop_parser.add_argument('--games-per-gen', type=int, default=400)
-    loop_parser.add_argument('--train-epochs', type=int, default=5)
+    loop_parser.add_argument('--games-per-gen', type=int, default=512)
+    loop_parser.add_argument('--train-epochs', type=int, default=2)
     loop_parser.add_argument('--batch-size', type=int, default=2048)
     loop_parser.add_argument('--lr', type=float, default=1e-3)
     loop_parser.add_argument('--simulations', type=int, default=400)
@@ -1727,9 +1827,17 @@ def main():
     loop_parser.add_argument('--early-games', type=int, default=200, help='Games per early generation')
     loop_parser.add_argument('--resume-from', type=str, default=None, help='Resume from a checkpoint file (e.g. selfplay_output/checkpoints/model_gen_5.pt)')
     loop_parser.add_argument('--parallel-games', type=int, default=128, help='Concurrent self-play games (C++ GameManager cross-game batching)')
-    loop_parser.add_argument('--mcts-batch-size', type=int, default=None,
+    loop_parser.add_argument('--mcts-batch-size', type=int, default=256,
                              help='MCTS leaves gathered per GPU forward pass during self-play. '
-                                  'Defaults to max(256, existing floor). TRT engine max_batch auto-scales to match.')
+                                  '256 is tuned for 128 parallel games (~2 leaves/game/pass). '
+                                  'TRT engine max_batch auto-scales to match.')
+    loop_parser.add_argument(
+        '--continuous-flow', dest='continuous_flow', action='store_true',
+        default=False,
+        help='Enable continuous-flow self-play: slots respawn as games '
+             'finish, eliminating batch-boundary tail latency. Default off '
+             'for initial rollout; flip to default once stable.',
+    )
     loop_parser.add_argument('--use-trt', dest='use_trt', action='store_true', default=argparse.SUPPRESS, help='Export ONNX + build TensorRT engine per generation and run self-play through the TRT backend (default: on)')
     loop_parser.add_argument('--no-use-trt', dest='use_trt', action='store_false', default=argparse.SUPPRESS, help='Disable TensorRT backend (use LibTorch only)')
     loop_parser.add_argument('--network-schedule', type=str, default=None,
@@ -1830,6 +1938,7 @@ def main():
             lr_milestones=lr_milestones,
             lr_gamma=getattr(args, 'lr_gamma', 0.1),
             mcts_batch_size=getattr(args, 'mcts_batch_size', None),
+            continuous_flow=getattr(args, 'continuous_flow', False),
         )
 
 
