@@ -1374,12 +1374,12 @@ def training_loop(
     swa_model = None
     if use_swa:
         from torch.optim.swa_utils import AveragedModel
-        # use_buffers=True averages BN running mean/var alongside parameters.
-        # Without it, BN buffers stay frozen at construction time, so the SWA
-        # model's BN stats never track the averaged weights' actual activation
-        # distribution. update_bn() after training gives the fully correct
-        # stats; use_buffers=True is the cheap fallback before that runs.
-        swa_model = AveragedModel(model, use_buffers=True)
+        # Match Lc0's approach: average parameters only. BN running stats come
+        # from the current model (or a post-training update_bn() pass).
+        # use_buffers=True pulls in int64 num_batches_tracked, which trips
+        # PyTorch 2.9's SWA multi_avg_fn on CUDA (_foreach_addcdiv_ integer
+        # path is disallowed).
+        swa_model = AveragedModel(model)
         # Restore SWA EMA state if resuming, so n_averaged and the running
         # averaged weights survive across restarts. Without this, every resume
         # would silently reset the average to "just the current model".
@@ -1445,7 +1445,7 @@ def training_loop(
             scheduler = _build_warmup_scheduler(optimizer, milestones=lr_milestones, gamma=lr_gamma)
             if use_swa:
                 from torch.optim.swa_utils import AveragedModel
-                swa_model = AveragedModel(model, use_buffers=True)
+                swa_model = AveragedModel(model)
             blocks, filters = target_blocks, target_filters
 
             # Warm-up: train the new (random) net on prior-gen data before
@@ -1523,11 +1523,7 @@ def training_loop(
             model, optimizer, dataloader, device, train_epochs, scheduler,
         )
 
-        # Update SWA model after training. use_buffers=True (set at SWA
-        # construction) means BN running stats are EMA-averaged alongside
-        # parameters, which keeps them in sync with the averaged weights
-        # without the instability of the full update_bn reset-and-recompute
-        # at low n_averaged (which produced NaN-adjacent BN stats early on).
+        # Update SWA model after training (parameters only, Lc0-style).
         if swa_model is not None:
             swa_model.update_parameters(model)
 
