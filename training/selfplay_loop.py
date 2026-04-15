@@ -65,6 +65,24 @@ def _temperature_sample(visits, tau, rng):
     return len(weights) - 1
 
 
+def _apply_uci_to_fen(fen, uci_move):
+    """Return the FEN that results from playing `uci_move` in `fen`, or None.
+
+    Tolerant of malformed inputs — returns None rather than raising so the
+    discard-pool push is best-effort and never breaks the self-play loop.
+    """
+    try:
+        import chess  # lazy to keep module import cheap for unit tests
+    except Exception:
+        return None
+    try:
+        b = chess.Board(fen)
+        b.push_uci(uci_move)
+        return b.fen()
+    except Exception:
+        return None
+
+
 def _resign_check(cfg, root_wdl, ply, is_playthrough):
     """Decide whether to resign based on root WDL.
 
@@ -128,6 +146,17 @@ class GameLoopManager:
             return int(cfg.min_sims + ratio * (cfg.full_sims - cfg.min_sims))
         return cfg.full_sims
 
+    def _min_visit_floor(self, i):
+        """Resolve the visit-count floor for game `i`.
+
+        None (the default) means auto-scale to max(5, 1% of target_sims), which
+        matches Lc0's heuristic. A concrete int is an absolute threshold.
+        """
+        explicit = getattr(self.cfg, "min_visits_floor", None)
+        if explicit is not None:
+            return int(explicit)
+        return max(5, int(self._target_sims[i] * 0.01))
+
     def _temperature(self, ply):
         cfg = self.cfg
         if ply < cfg.opening_temp_plies:
@@ -163,8 +192,32 @@ class GameLoopManager:
         ply = self.gm.get_ply(i)
         tau = self._temperature(ply)
         was_full_search = (self._target_sims[i] >= cfg.full_sims)
-        # Move selection (Stage 5 will add min-visit floor).
+        # Move selection with min-visit floor. Positions the temperature
+        # sampler picks but that didn't receive enough search are likely to
+        # be policy outliers — reject them, push the would-be resulting
+        # position to the discard pool for later use as a starting FEN, and
+        # resample. Fall back to argmax after 3 retries.
         chosen = _temperature_sample(s.visits, tau, self.rng)
+        floor = self._min_visit_floor(i)
+        if floor > 0 and self.discard_pool is not None:
+            visits_work = list(s.visits)
+            legal = list(getattr(s, "legal_moves_uci", []) or [])
+            retries = 0
+            while (chosen != s.best_child_idx
+                   and 0 <= chosen < len(visits_work)
+                   and visits_work[chosen] < floor
+                   and retries < 3):
+                if 0 <= chosen < len(legal):
+                    cand_fen = _apply_uci_to_fen(self.gm.get_fen(i), legal[chosen])
+                    if cand_fen is not None:
+                        self.discard_pool.push(cand_fen)
+                visits_work[chosen] = 0
+                chosen = _temperature_sample(visits_work, tau, self.rng)
+                retries += 1
+            if (0 <= chosen < len(visits_work)
+                    and visits_work[chosen] < floor
+                    and chosen != s.best_child_idx):
+                chosen = s.best_child_idx
 
         # Build rows (Stage 3 will swap to v2 schema).
         played_q = s.q_per_child[chosen] if 0 <= chosen < len(s.q_per_child) else 0.0

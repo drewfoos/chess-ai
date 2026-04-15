@@ -2665,3 +2665,148 @@ def test_wdl_resign_suppressed_on_playthrough():
         cfg, root_wdl=(0.01, 0.98, 0.01), ply=10, is_playthrough=True,
     )
     assert triggered is False
+
+
+# ---------------------------------------------------------------------------
+# Stage 5: DiscardPool + min-visit floor
+# ---------------------------------------------------------------------------
+
+def test_discard_pool_bounded(tmp_path):
+    from training.discard_pool import DiscardPool
+    pool = DiscardPool(cap=3, persist_path=tmp_path / "pool.json")
+    for i in range(5):
+        pool.push(f"fen_{i}")
+    assert pool.size() == 3
+    snap = pool.snapshot()
+    assert "fen_0" not in snap
+    assert "fen_4" in snap
+
+
+def test_discard_pool_persistence(tmp_path):
+    from training.discard_pool import DiscardPool
+    p = tmp_path / "pool.json"
+    pool = DiscardPool(cap=10, persist_path=p)
+    pool.push("a"); pool.push("b")
+    pool.save()
+
+    pool2 = DiscardPool(cap=10, persist_path=p)
+    pool2.load()
+    assert pool2.snapshot() == ["a", "b"]
+
+
+def test_min_visit_floor_rejects_and_pushes_to_pool(tmp_path):
+    from training.selfplay_loop import GameLoopManager
+    from training import selfplay_loop
+    from training.discard_pool import DiscardPool
+    from training.config import SelfPlayConfig
+
+    cfg = SelfPlayConfig(
+        num_games=1, full_sims=100, quick_sims=100,
+        playout_cap_p=0.0, max_ply=2, opening_temp=1.0,
+        opening_temp_plies=10, min_visits_floor=10,
+        resign_w=0.0, resign_d=1.0, resign_l=1.0, resign_earliest_ply=9999,
+    )
+    pool = DiscardPool(cap=100, persist_path=tmp_path / "pool.json")
+
+    class LowVisitGM:
+        def __init__(self):
+            self.applied = []
+            self.plies = [0]
+
+        def num_games(self):
+            return 1
+
+        def step_stats(self, t):
+            class S:
+                terminal_status = 0
+                n_legal = 4
+                visits = [80, 1, 1, 1]
+                q_per_child = [0.5, 0.0, 0.0, 0.0]
+                best_child_idx = 0
+                root_wdl = (0.5, 0.4, 0.1)
+                raw_nn_policy = [0.0] * 1858
+                raw_nn_value = (0.5, 0.4, 0.1)
+                raw_nn_mlh = 20.0
+                legal_moves_uci = ["e2e4", "d2d4", "g1f3", "c2c4"]
+                sims_done = 100
+            return [S()]
+
+        def apply_move(self, i, m):
+            self.applied.append(m)
+            self.plies[i] += 1
+
+        def get_fen(self, i):
+            return "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
+
+        def get_ply(self, i):
+            return self.plies[i]
+
+    loop = GameLoopManager(LowVisitGM(), cfg, discard_pool=pool, rng_seed=0)
+    # Force first pick to a low-visit idx, then the argmax on retry.
+    calls = [1, 0]
+    orig_sample = selfplay_loop._temperature_sample
+    selfplay_loop._temperature_sample = lambda v, t, r: calls.pop(0) if calls else 0
+    try:
+        loop.step_once()
+    finally:
+        selfplay_loop._temperature_sample = orig_sample
+    assert pool.size() == 1           # the rejected candidate FEN pushed
+    assert loop.gm.applied == [0]     # argmax ultimately played
+
+
+def test_min_visit_floor_bounded_retries():
+    """If 3 consecutive samples fail the floor, fall back to argmax."""
+    from training.selfplay_loop import GameLoopManager
+    from training import selfplay_loop
+    from training.discard_pool import DiscardPool
+    from training.config import SelfPlayConfig
+
+    cfg = SelfPlayConfig(
+        num_games=1, full_sims=100, quick_sims=100,
+        playout_cap_p=0.0, max_ply=2, opening_temp=1.0,
+        opening_temp_plies=10, min_visits_floor=50,
+        resign_w=0.0, resign_d=1.0, resign_l=1.0, resign_earliest_ply=9999,
+    )
+    pool = DiscardPool(cap=100)
+
+    class GM:
+        def __init__(self):
+            self.applied = []
+            self.plies = [0]
+
+        def num_games(self):
+            return 1
+
+        def step_stats(self, t):
+            class S:
+                terminal_status = 0
+                n_legal = 4
+                visits = [80, 1, 1, 1]
+                q_per_child = [0.0, 0.0, 0.0, 0.0]
+                best_child_idx = 0
+                root_wdl = (0.4, 0.3, 0.3)
+                raw_nn_policy = [0.0] * 1858
+                raw_nn_value = (0.4, 0.3, 0.3)
+                raw_nn_mlh = 20
+                legal_moves_uci = ["a2a3", "b2b3", "c2c3", "d2d3"]
+                sims_done = 100
+            return [S()]
+
+        def apply_move(self, i, m):
+            self.applied.append(m)
+            self.plies[i] += 1
+
+        def get_fen(self, i):
+            return "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
+
+        def get_ply(self, i):
+            return self.plies[i]
+
+    orig_sample = selfplay_loop._temperature_sample
+    selfplay_loop._temperature_sample = lambda v, t, r: 1  # always idx 1 (1 visit)
+    try:
+        loop = GameLoopManager(GM(), cfg, discard_pool=pool, rng_seed=0)
+        loop.step_once()
+    finally:
+        selfplay_loop._temperature_sample = orig_sample
+    assert loop.gm.applied == [0]   # fell back to argmax

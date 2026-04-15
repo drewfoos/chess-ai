@@ -79,3 +79,9 @@ class SelfPlayConfig:
     resign_l: float = 0.98            # resign if own L exceeds
     resign_earliest_ply: int = 30     # no resign before this ply (avoids openings)
     adjudicated_weight: float = 0.5   # trainer down-weights adjudicated-draw rows
+
+    # --- Stage 5 (Lc0-parity): min-visit floor on temperature-sampled moves ---
+    # None = auto-scale as max(5, 1% of target_sims). Otherwise an absolute
+    # visit count. Moves with fewer visits get rejected and resampled (up to 3
+    # retries) before falling back to argmax.
+    min_visits_floor: int | None = None
