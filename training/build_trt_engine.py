@@ -3,6 +3,20 @@
 The engine is built for FP16 with a batch-dim optimization profile so a single
 engine covers batch=1 (UCI root expand) through the max self-play batch size.
 
+We follow Lc0's pattern (src/neural/backends/onnx/network_onnx.cc:675-742):
+build fresh per weight-set, use a persistent **timing cache** to amortize
+kernel-selection across rebuilds. A warm timing cache turns a 60s rebuild into
+~10s for our 20b×256f network on RTX 3080.
+
+We deliberately do NOT use TRT's native refit (`BuilderFlag.REFIT` +
+`OnnxParserRefitter`). `torch.onnx.export` with `do_constant_folding=True`
+folds BN-fused conv weights into anonymous constants; those are no longer
+refittable, but `refitter.get_missing_weights()` doesn't flag them because
+TRT never knew they were initializers. Refit silently preserved build-time
+weights for folded paths while updating the rest — producing an engine that
+ran, but played catastrophically (50x slower, instant blunders). Lc0
+sidesteps this by rebuilding on every weight-set change.
+
 Usage:
     python -m training.build_trt_engine --onnx model.onnx --output model.trt
 """
@@ -46,18 +60,20 @@ def build_engine(
     output_path: str,
     fp16: bool = True,
     min_batch: int = 1,
-    opt_batch: int = 128,
-    max_batch: int = 256,
+    opt_batch: int = 256,
+    max_batch: int = 512,
     workspace_mb: int = 2048,
     input_name: str = 'input',
     verbose: bool = False,
-    refittable: bool = True,
+    timing_cache_path: str | None = None,
 ) -> str:
     """Build a serialized TRT engine and write it to `output_path`.
 
-    When `refittable=True` the engine includes refit data so subsequent
-    generations can swap in new weights via `refit_engine()` without
-    re-running the 30-90s plan-compilation step.
+    When `timing_cache_path` is set, the builder loads that cache (if present)
+    before building and writes the updated cache back after. The cache holds
+    per-kernel timing decisions and survives across weight-set changes as long
+    as the network topology is the same, so subsequent builds with different
+    weights but identical architecture are ~5x faster.
 
     Returns the output path. Raises RuntimeError on build failure.
     """
@@ -72,17 +88,27 @@ def build_engine(
             errors = '\n'.join(str(parser.get_error(i)) for i in range(parser.num_errors))
             raise RuntimeError(f"ONNX parse failed:\n{errors}")
 
-    # Optimization profile: batch axis only. Spatial dims + channels are fixed.
     config = builder.create_builder_config()
     config.set_memory_pool_limit(
         trt.MemoryPoolType.WORKSPACE, workspace_mb * (1 << 20)
     )
     if fp16 and builder.platform_has_fast_fp16:
         config.set_flag(trt.BuilderFlag.FP16)
-    if refittable:
-        # REFIT lets subsequent generations reuse this engine with new weights
-        # via OnnxParserRefitter, skipping plan compilation (~5-10s vs 60-90s).
-        config.set_flag(trt.BuilderFlag.REFIT)
+
+    # Timing cache: replay kernel-selection decisions from prior builds so a
+    # cold build (~60s) becomes a warm rebuild (~10s). Lc0 achieves the same
+    # via ORT's trt_timing_cache_enable setting.
+    timing_cache = None
+    if timing_cache_path is not None:
+        if os.path.exists(timing_cache_path):
+            with open(timing_cache_path, 'rb') as f:
+                cache_bytes = f.read()
+            timing_cache = config.create_timing_cache(cache_bytes)
+        else:
+            timing_cache = config.create_timing_cache(b'')
+        # ignore_mismatch=False: if the cache came from a different GPU/driver,
+        # TRT discards incompatible entries rather than failing the build.
+        config.set_timing_cache(timing_cache, ignore_mismatch=False)
 
     # Determine the (C, H, W) part of the input shape from the network input.
     in_tensor = None
@@ -109,98 +135,20 @@ def build_engine(
     if serialized is None:
         raise RuntimeError("TensorRT engine build returned None")
 
+    # Persist the (possibly enriched) timing cache for the next build.
+    if timing_cache_path is not None and timing_cache is not None:
+        cache_out = timing_cache.serialize()
+        os.makedirs(
+            os.path.dirname(os.path.abspath(timing_cache_path)) or '.',
+            exist_ok=True,
+        )
+        with open(timing_cache_path, 'wb') as f:
+            f.write(bytes(cache_out))
+
     os.makedirs(os.path.dirname(os.path.abspath(output_path)) or '.', exist_ok=True)
     with open(output_path, 'wb') as f:
         f.write(bytes(serialized))
     return output_path
-
-
-def refit_engine(
-    onnx_path: str,
-    engine_path: str,
-    verbose: bool = False,
-) -> str:
-    """Refit an existing refittable engine with weights from a new ONNX file.
-
-    The ONNX must have the same graph topology as the one the engine was
-    built from (identical layer shapes and initializer names). Typically
-    5-10s vs 30-90s for a full `build_engine()` on RTX-class hardware.
-
-    Raises RuntimeError if the existing engine wasn't built with REFIT, if
-    topology differs, or if the refit itself fails. Callers should catch
-    and fall back to `build_engine()` on any failure.
-    """
-    if not os.path.exists(engine_path):
-        raise RuntimeError(f"Engine not found for refit: {engine_path}")
-
-    severity = trt.Logger.INFO if verbose else trt.Logger.WARNING
-    logger = trt.Logger(severity)
-    runtime = trt.Runtime(logger)
-    with open(engine_path, 'rb') as f:
-        engine = runtime.deserialize_cuda_engine(f.read())
-    if engine is None:
-        raise RuntimeError(f"Failed to deserialize engine at {engine_path}")
-
-    try:
-        refitter = trt.Refitter(engine, logger)
-    except TypeError as e:
-        # TensorRT's Refitter constructor returns nullptr for engines built
-        # without REFIT, which pybind11 surfaces as TypeError. Normalize to
-        # RuntimeError so callers only need to catch one type.
-        raise RuntimeError(
-            f"Engine at {engine_path} is not refittable "
-            f"(built without REFIT flag?): {e}"
-        )
-    onnx_refitter = trt.OnnxParserRefitter(refitter, logger)
-    if not onnx_refitter.refit_from_file(onnx_path):
-        errs = '\n'.join(
-            str(onnx_refitter.get_error(i)) for i in range(onnx_refitter.num_errors)
-        )
-        raise RuntimeError(f"OnnxParserRefitter failed:\n{errs}")
-
-    missing = refitter.get_missing_weights()
-    if missing:
-        raise RuntimeError(
-            f"Refit incomplete — {len(missing)} weights unset "
-            f"(first: {missing[0] if missing else 'n/a'})"
-        )
-
-    if not refitter.refit_cuda_engine():
-        raise RuntimeError("refit_cuda_engine() returned False")
-
-    # Re-serialize so the on-disk engine reflects the refit weights. C++
-    # TRTEvaluator reloads from disk each generation, so the updated plan
-    # is picked up next time the engine path is consumed.
-    serialized = engine.serialize()
-    if serialized is None:
-        raise RuntimeError("engine.serialize() returned None after refit")
-    with open(engine_path, 'wb') as f:
-        f.write(bytes(serialized))
-    return engine_path
-
-
-def build_or_refit_engine(
-    onnx_path: str,
-    output_path: str,
-    can_refit: bool,
-    **build_kwargs,
-) -> tuple[str, bool]:
-    """Refit an existing engine if possible, otherwise build from scratch.
-
-    `can_refit` is the caller's assertion that the existing engine at
-    `output_path` has the same architecture as the new ONNX. Even with
-    `can_refit=True`, refit failures (stale engine, missing REFIT flag,
-    topology drift) fall back to a full build.
-
-    Returns (engine_path, refitted_flag) so callers can report timing.
-    """
-    if can_refit and os.path.exists(output_path):
-        try:
-            refit_engine(onnx_path, output_path)
-            return output_path, True
-        except Exception as e:
-            print(f"  [trt] refit failed ({e}) — falling back to full build")
-    return build_engine(onnx_path, output_path, **build_kwargs), False
 
 
 def main():
@@ -212,6 +160,9 @@ def main():
     parser.add_argument('--opt-batch', type=int, default=128)
     parser.add_argument('--max-batch', type=int, default=256)
     parser.add_argument('--workspace-mb', type=int, default=2048)
+    parser.add_argument('--timing-cache', type=str, default=None,
+                        help='Path to persistent timing cache file. Warm cache '
+                             'cuts rebuild time ~6x (60s → 10s on RTX 3080).')
     parser.add_argument('--verbose', action='store_true')
     args = parser.parse_args()
 
@@ -220,6 +171,7 @@ def main():
         fp16=not args.no_fp16,
         min_batch=args.min_batch, opt_batch=args.opt_batch, max_batch=args.max_batch,
         workspace_mb=args.workspace_mb,
+        timing_cache_path=args.timing_cache,
         verbose=args.verbose,
     )
     print(f"Wrote engine: {out} ({os.path.getsize(out):,} bytes)")

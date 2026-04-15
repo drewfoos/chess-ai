@@ -114,12 +114,17 @@ void GameManager::expand_root(GameState& game) {
     int num_moves = generate_legal_moves(root_pos, moves);
 
     if (num_moves == 0) {
-        // Terminal root
+        // Terminal root: checkmate (in check, STM loses → -1) or stalemate (draw → 2).
+        // Stamp terminal_status on the root so build_root_stats surfaces it and the
+        // Python driver routes the game through the terminal branch instead of
+        // trying to pick a move from an empty edge list.
         game.search_complete = true;
         if (root_pos.in_check()) {
             game.raw_value = -1.0f;
+            game.root->set_terminal_status(-1);
         } else {
             game.raw_value = 0.0f;
+            game.root->set_terminal_status(2);
         }
         game.root_expanded = true;
         return;

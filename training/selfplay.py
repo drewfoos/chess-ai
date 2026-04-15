@@ -811,7 +811,7 @@ def generate_games(
         # Preserve all other mcts_config fields (FPU, MLH, contempt, etc.) — earlier
         # code built a fresh MCTSConfig that silently dropped them.
         from dataclasses import replace
-        cpp_config = replace(mcts_config, batch_size=max(mcts_config.batch_size, 128))
+        cpp_config = replace(mcts_config, batch_size=max(mcts_config.batch_size, 256))
         print(f"  Using C++ GameManager ({device}, parallel_games={parallel_games}, "
               f"batch_size={cpp_config.batch_size})")
     else:
@@ -1025,7 +1025,9 @@ def _trt_available() -> bool:
         return False
 
 
-def _build_trt_engine_for_self_play(model, cpp_model_path: str) -> str:
+def _build_trt_engine_for_self_play(
+    model, cpp_model_path: str, max_batch: int = 512,
+) -> str:
     """Export ONNX from `model` and build a fresh TensorRT engine.
 
     Follows Lc0's pattern: rebuild per weight-set, amortize via a persistent
@@ -1048,7 +1050,14 @@ def _build_trt_engine_for_self_play(model, cpp_model_path: str) -> str:
     )
     export_onnx(model, onnx_path)
     t0 = _time.time()
-    build_engine(onnx_path, trt_path, timing_cache_path=timing_cache_path)
+    # TRT max_batch must be >= the MCTS gather batch. opt_batch is set to half of
+    # max so both small and large batches get decent kernels in one profile.
+    opt_batch = max(128, max_batch // 2)
+    build_engine(
+        onnx_path, trt_path,
+        opt_batch=opt_batch, max_batch=max_batch,
+        timing_cache_path=timing_cache_path,
+    )
     elapsed = _time.time() - t0
     print(f"  [trt] build took {elapsed:.1f}s")
     return trt_path
@@ -1258,6 +1267,7 @@ def training_loop(
     restore_from_checkpoint: list[str] | None = None,
     lr_milestones: list[int] | None = None,
     lr_gamma: float = 0.1,
+    mcts_batch_size: int | None = None,
 ):
     """Full reinforcement learning training loop.
 
@@ -1444,7 +1454,7 @@ def training_loop(
     #   encouraging broader early root exploration.
     # - MLH PUCT bonus: in winning/losing positions, prefer children that shorten/lengthen
     #   the game. Disabled until MLH outputs diverge (which requires training signal).
-    mcts_config = MCTSConfig(
+    _mcts_kwargs = dict(
         num_simulations=num_simulations,
         fpu_absolute_root=True,
         fpu_absolute_root_value=1.0,
@@ -1452,6 +1462,9 @@ def training_loop(
         mlh_cap=8.0,
         mlh_q_threshold=0.6,
     )
+    if mcts_batch_size is not None:
+        _mcts_kwargs['batch_size'] = mcts_batch_size
+    mcts_config = MCTSConfig(**_mcts_kwargs)
     selfplay_config = SelfPlayConfig(
         max_moves=max_moves,
         resign_threshold=resign_threshold,
@@ -1547,12 +1560,16 @@ def training_loop(
             model.load_state_dict(swa_state)
             export_torchscript(model, cpp_model_path, device=device)
             if use_trt:
-                trt_engine_path = _build_trt_engine_for_self_play(model, cpp_model_path)
+                trt_engine_path = _build_trt_engine_for_self_play(
+                    model, cpp_model_path, max_batch=max(512, mcts_config.batch_size),
+                )
             model.load_state_dict(orig_state)
         else:
             export_torchscript(model, cpp_model_path, device=device)
             if use_trt:
-                trt_engine_path = _build_trt_engine_for_self_play(model, cpp_model_path)
+                trt_engine_path = _build_trt_engine_for_self_play(
+                    model, cpp_model_path, max_batch=max(512, mcts_config.batch_size),
+                )
 
         num_positions = generate_games(
             play_model, gen_games, data_path,
@@ -1710,6 +1727,9 @@ def main():
     loop_parser.add_argument('--early-games', type=int, default=200, help='Games per early generation')
     loop_parser.add_argument('--resume-from', type=str, default=None, help='Resume from a checkpoint file (e.g. selfplay_output/checkpoints/model_gen_5.pt)')
     loop_parser.add_argument('--parallel-games', type=int, default=128, help='Concurrent self-play games (C++ GameManager cross-game batching)')
+    loop_parser.add_argument('--mcts-batch-size', type=int, default=None,
+                             help='MCTS leaves gathered per GPU forward pass during self-play. '
+                                  'Defaults to max(256, existing floor). TRT engine max_batch auto-scales to match.')
     loop_parser.add_argument('--use-trt', dest='use_trt', action='store_true', default=argparse.SUPPRESS, help='Export ONNX + build TensorRT engine per generation and run self-play through the TRT backend (default: on)')
     loop_parser.add_argument('--no-use-trt', dest='use_trt', action='store_false', default=argparse.SUPPRESS, help='Disable TensorRT backend (use LibTorch only)')
     loop_parser.add_argument('--network-schedule', type=str, default=None,
@@ -1809,6 +1829,7 @@ def main():
             restore_from_checkpoint=restore,
             lr_milestones=lr_milestones,
             lr_gamma=getattr(args, 'lr_gamma', 0.1),
+            mcts_batch_size=getattr(args, 'mcts_batch_size', None),
         )
 
 

@@ -8,6 +8,13 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 
 ## [Unreleased]
 
+### Fixed — Terminal Root Crash in `expand_root`
+- `GameManager::expand_root` now stamps `terminal_status` on the root when a position has zero legal moves (checkmate → -1, stalemate → 2). Previously the branch set `search_complete=true` but left `terminal_status=0`, so the Python driver skipped its terminal short-circuit, called `_temperature_sample` on an empty visit array, and invoked `apply_move(game_idx, -1)` — which threw `RuntimeError: invalid move index`. Surfaced on the first 3-gen self-play smoke test after the Stage-11 refactor whenever a game reached mate/stalemate mid-play.
+
+### Changed — MCTS Gather Batch Scaled Up for Consumer GPUs
+- MCTS gather-batch floor raised 128 → 256 for the self-play path; new `--mcts-batch-size N` CLI flag on `python -m training loop` sets it explicitly. TRT engine `max_batch` now auto-scales to `max(512, mcts_config.batch_size)` so the engine profile always covers the gather size, and the `build_trt_engine.py` defaults bumped to `opt_batch=256` / `max_batch=512`. Motivation: with 128 parallel games and a 128-leaf gather, `per_game = 1` — meaning ~400 GPU forward passes per move across the batch. At 512 leaves / 128 games that collapses to ~4 passes with full tensor-core occupancy; measured ~3-4× self-play throughput on RTX 3080.
+- Phase-C README example updated to `--games-per-gen 512 --parallel-games 128 --mcts-batch-size 512` so gather rounds tile cleanly (4 × 128).
+
 ### Changed — Lc0-Parity Self-Play Refactor (v0.7.0)
 - New architecture: Python `GameLoopManager` (`training/selfplay_loop.py`) owns per-step orchestration (temperature, playout-cap randomization, KLD-adaptive target sims, ply-cap adjudication, resign logic); C++ `GameManager` becomes a pure search engine exposing `step_stats(target_sims)` + `apply_move(game_idx, move_idx)` + `get_fen` / `get_ply` / `RootStats`
 - **Removed** legacy `GameManager::step()` (C++) and its pybind11 wrapper — the Stage-1 `step_stats` / `apply_move` API is now the only driver. Kills ~100 lines of duplicated gather / batch / backprop logic that was dead code on the self-play path

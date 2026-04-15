@@ -86,7 +86,7 @@ Goal: **1800–2000+ Elo** on consumer hardware.
 
 **Network** — SE-ResNet at 20 blocks × 256 filters (~25M params) for the active run; architecture is configurable down to 10b×128f or lower for smaller hardware. Squeeze-and-excitation blocks, Mish activation, attention-based policy head over 64 square tokens producing 1858 move logits, WDL value head, auxiliary moves-left Huber head. Optional tiered schedule can start at 6b×64f and scale up at a configured generation.
 
-**Inference** — `RawBatchEvaluator` is an abstract interface with two implementations: `TRTEvaluator` (default) using `enqueueV3` against a TRT engine built with dynamic batch profile `(1, 128, 256)`, and `NeuralEvaluator` using LibTorch FP16 as a fallback. Both use pinned host memory and async non-blocking DMA. The engine is rebuilt (or weight-refit) each generation; `BuilderFlag.REFIT` lets weight swaps finish in 5–10s vs a 30–90s full rebuild.
+**Inference** — `RawBatchEvaluator` is an abstract interface with two implementations: `TRTEvaluator` (default) using `enqueueV3` against a TRT engine built with dynamic batch profile `(1, 256, 512)` (auto-scaled to the configured MCTS gather batch), and `NeuralEvaluator` using LibTorch FP16 as a fallback. Both use pinned host memory and async non-blocking DMA. The engine is rebuilt from scratch each generation (Lc0-style); a persistent TRT timing cache at `<checkpoint_dir>/trt_timing.cache` amortizes kernel-selection across rebuilds so a warm rebuild is ~10s vs ~60s cold.
 
 **Tablebase** — optional in-search Syzygy probing via vendored Fathom; MCTS leaves with `piece_count ≤ TB_LARGEST` resolve exactly from WDL and skip NN evaluation entirely.
 
@@ -212,8 +212,8 @@ python train.py
 # or non-interactively:
 python -m training loop `
   --resume-from checkpoints\phase_b.pt `
-  --generations 100 --games-per-gen 400 --simulations 400 `
-  --parallel-games 128 --batch-size 2048
+  --generations 100 --games-per-gen 512 --simulations 400 `
+  --parallel-games 128 --mcts-batch-size 512 --batch-size 2048
 ```
 
 ### Play
