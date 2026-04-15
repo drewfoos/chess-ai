@@ -76,7 +76,7 @@ struct SearchParams {
     int batch_size = 128;
     bool smart_pruning = true;
     float smart_pruning_factor = 1.33f;
-    bool two_fold_draw = true;
+    bool two_fold_draw = false;   // Lc0 parity: only 3-fold draws in search.
     bool shaped_dirichlet = true;
     float uncertainty_weight = 0.15f;
     bool variance_scaling = true;
