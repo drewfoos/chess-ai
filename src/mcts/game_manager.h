@@ -91,6 +91,14 @@ public:
     // Get number of games
     int num_games() const { return static_cast<int>(games_.size()); }
 
+    // Test-only: access the raw root Node for a game. Used by q-flip POV tests
+    // to compare RootStats.q_per_child against the child's stored mean_value.
+    // Not part of the stable public API — may change without notice.
+    Node* test_root(int idx) const {
+        if (idx < 0 || idx >= static_cast<int>(games_.size())) return nullptr;
+        return games_[idx].root;
+    }
+
 private:
     struct GameState {
         neural::PositionHistory history;
@@ -158,8 +166,7 @@ private:
 
     // Shared batched-evaluate-then-backprop used by both step() and step_stats().
     // Expands each pending leaf with the returned (policy,value,mlh), caches the
-    // entry, then reverts virtual loss + backpropagates. Leaves step()'s own
-    // inline version untouched — only step_stats() uses this helper.
+    // entry, then reverts virtual loss + backpropagates.
     void evaluate_and_backprop_batch(std::vector<PendingLeaf>& batch);
 
     float dynamic_cpuct(int parent_visits) const;

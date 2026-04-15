@@ -839,68 +839,9 @@ int GameManager::step() {
         if (!made_progress) break;
     }
 
-    // Batch evaluate all pending leaves
-    if (!batch.empty()) {
-        int batch_size = static_cast<int>(batch.size());
-
-        // Encode all positions — use pre-allocated buffers (no per-step allocation)
-        for (int b = 0; b < batch_size; b++) {
-            neural::encode_position(batch[b].position,
-                flat_encode_buffer_.data() + b * neural::TENSOR_SIZE);
-            Move moves[MAX_MOVES];
-            int nm = generate_legal_moves(batch[b].position, moves);
-            legal_moves_vec_[b].assign(moves, moves + nm);
-            num_legal_moves_vec_[b] = nm;
-        }
-
-        // Build batch requests
-        std::vector<neural::BatchRequest> requests(batch_size);
-        for (int b = 0; b < batch_size; b++) {
-            requests[b].encoded_planes = flat_encode_buffer_.data() + b * neural::TENSOR_SIZE;
-            requests[b].legal_moves = legal_moves_vec_[b].data();
-            requests[b].num_legal_moves = num_legal_moves_vec_[b];
-        }
-
-        // Run batch inference
-        auto results = evaluator_.evaluate_batch_raw(requests);
-
-        // Scatter results back
-        for (int b = 0; b < batch_size; b++) {
-            auto& pl = batch[b];
-
-            EvalResult eval_result;
-            eval_result.policy = results[b].policy;
-            eval_result.value = results[b].value;
-            eval_result.mlh = results[b].mlh;
-
-            // Expand the leaf
-            expand_node(pl.leaf, pl.position, eval_result);
-
-            if (pl.leaf->is_leaf()) {
-                // Terminal after expansion
-                float value = 0.0f;
-                if (pl.leaf->terminal_status() == 1) value = 1.0f;
-                else if (pl.leaf->terminal_status() == -1) value = -1.0f;
-                revert_virtual_loss_path(pl.path_nodes, pl.multivisit);
-                backpropagate(pl.leaf, -value, pl.multivisit);
-                propagate_terminal(pl.leaf);
-            } else {
-                revert_virtual_loss_path(pl.path_nodes, pl.multivisit);
-                backpropagate(pl.leaf, -eval_result.value, pl.multivisit);
-
-                // Cache
-                uint64_t pos_hash = neural::PositionHistory::compute_hash(pl.position);
-                CacheEntry entry;
-                entry.policy = eval_result.policy;
-                entry.value = eval_result.value;
-                entry.num_moves = num_legal_moves_vec_[b];
-                entry.mlh = eval_result.mlh;
-                cache_.put(pos_hash, std::move(entry));
-
-                propagate_terminal(pl.leaf);
-            }
-        }
-    }
+    // Batch evaluate all pending leaves — shared with step_stats() so both
+    // driver loops stay in lockstep on expand/cache/backprop semantics.
+    evaluate_and_backprop_batch(batch);
 
     return newly_completed;
 }
@@ -975,7 +916,7 @@ SearchResult GameManager::build_result(const GameState& game) const {
 
 // --- Stage 1 (Lc0-parity self-play refactor) -------------------------------
 // New API: step_stats / apply_move / get_fen / get_ply / RootStats.
-// Runs alongside the existing step() — step() is NOT modified.
+// Runs alongside the existing step(); both share evaluate_and_backprop_batch.
 
 void GameManager::evaluate_and_backprop_batch(std::vector<PendingLeaf>& batch) {
     if (batch.empty()) return;

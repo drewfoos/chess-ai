@@ -106,4 +106,41 @@ TEST_F(GameManagerRootStats, ApplyMoveAdvancesGame) {
     EXPECT_GT(stats2[0].n_legal, 0);
 }
 
+TEST_F(GameManagerRootStats, QPerChildIsParentPOV) {
+    // Verify RootStats.q_per_child[i] is parent-POV — i.e., the negation of
+    // the child's stored mean_value (which is from the child side-to-move's
+    // perspective). Backprop alternates signs up the tree, so the child's
+    // mean_value is in the child's POV; build_root_stats flips it before
+    // publishing.
+    SearchParams params;
+    params.batch_size = 16;
+    params.add_noise = false;
+    params.use_syzygy = false;
+    StubBatchEvaluator eval;
+    GameManager gm(eval, params);
+    gm.init_games(/*num_games=*/1, /*num_sims=*/64);
+
+    auto stats = gm.step_stats({64});
+    ASSERT_EQ(stats.size(), 1u);
+    const auto& s = stats[0];
+    ASSERT_GT(s.n_legal, 0);
+
+    Node* root = gm.test_root(0);
+    ASSERT_NE(root, nullptr);
+
+    // Find at least one visited child and check the sign-flip relationship.
+    bool checked_at_least_one = false;
+    for (int ci = 0; ci < s.n_legal; ++ci) {
+        Node* child = root->child_node(ci);
+        if (!child || child->visit_count() == 0) continue;
+        // RootStats.q_per_child is parent-POV; child->mean_value() is child-POV.
+        float child_q = child->mean_value();
+        float parent_q = s.q_per_child[ci];
+        EXPECT_NEAR(parent_q, -child_q, 1e-5f)
+            << "q_per_child[" << ci << "] should be -child->mean_value() (parent POV)";
+        checked_at_least_one = true;
+    }
+    EXPECT_TRUE(checked_at_least_one) << "No visited children found; test did no work";
+}
+
 #endif  // HAS_LIBTORCH
