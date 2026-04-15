@@ -380,6 +380,17 @@ class GamePoolManager:
         """
         if target_games <= 0:
             return []
+        # Cap launched at target_games. __init__ set _launched = self.n
+        # because init_games() kicks off one game per slot — but if the pool
+        # is wider than the target (n > target_games), the extras are surplus
+        # and should be inactive from step 1 so step_stats doesn't burn GPU
+        # cycles on them. Production usage (play_games_batched) caps
+        # parallel_games at num_games before constructing the pool, so this
+        # branch is defensive; unit tests exercise it directly.
+        if self._launched > target_games:
+            for i in range(target_games, self._launched):
+                self._completed[i] = True
+            self._launched = target_games
         max_steps = target_games * max(1, self.cfg.max_ply) + self.n
         step_count = 0
         while len(self._completed_games) < target_games:

@@ -3110,7 +3110,8 @@ def test_pool_integration_smoke(tmp_path):
         pytest.skip("no TorchScript model available for integration test")
 
     from training.selfplay_loop import GamePoolManager
-    from training.config import SelfPlayConfig, MCTSConfig
+    from training.config import SelfPlayConfig
+    from training.mcts import MCTSConfig
     from training.selfplay import _CppMCTSConfig
 
     mcts_cfg = _CppMCTSConfig(MCTSConfig(num_simulations=10, batch_size=8))
