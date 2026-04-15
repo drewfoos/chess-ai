@@ -3089,3 +3089,43 @@ def test_pool_inactive_slot_target_zero():
     # became inactive once launched==3 was reached and one slot was extra).
     had_zero_target = any(0 in t for t in targets_seen)
     assert had_zero_target, f"no step_stats call ever saw target_sims=0: {targets_seen}"
+
+
+@pytest.mark.slow
+def test_pool_integration_smoke(tmp_path):
+    """End-to-end run_pool against real chess_mcts.GameManager — no crash, correct game count."""
+    try:
+        import chess_mcts
+    except ImportError:
+        pytest.skip("chess_mcts not built")
+
+    import os
+    candidates = [
+        'models/current_run/checkpoints/selfplay_model.pt',
+        'checkpoints/phase_a.pt',
+        'checkpoints/phase_b.pt',
+    ]
+    model_path = next((p for p in candidates if os.path.exists(p)), None)
+    if model_path is None:
+        pytest.skip("no TorchScript model available for integration test")
+
+    from training.selfplay_loop import GamePoolManager
+    from training.config import SelfPlayConfig, MCTSConfig
+    from training.selfplay import _CppMCTSConfig
+
+    mcts_cfg = _CppMCTSConfig(MCTSConfig(num_simulations=10, batch_size=8))
+    gm = chess_mcts.GameManager(model_path, 'cpu', mcts_cfg._to_dict())
+    gm.init_games(2, 10)
+
+    cfg = SelfPlayConfig(
+        num_games=2, full_sims=10, quick_sims=5, min_sims=5,
+        playout_cap_p=0.0, opening_temp=0.01,
+        opening_temp_plies=1, temp_floor=0.01, temp_decay_plies=1,
+        max_moves=5, max_ply=10,
+    )
+    pool = GamePoolManager(gm, cfg, discard_pool=None, rng_seed=0)
+    completed = pool.run_pool(target_games=4)
+
+    assert len(completed) == 4
+    for rec in completed:
+        assert len(rec.rows) >= 1

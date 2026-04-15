@@ -33,3 +33,8 @@ cmake.args = ["-DBUILD_PYTHON=ON", "-DENABLE_NEURAL=ON", "-DENABLE_TENSORRT=ON"]
 build-dir = "build/{wheel_tag}"
 wheel.packages = ["src/python/chess_mcts"]
 install.components = ["python"]
+
+[tool.pytest.ini_options]
+markers = [
+    "slow: slow integration tests (skip with '-m \"not slow\"')",
+]
