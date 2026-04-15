@@ -206,10 +206,8 @@ public:
         manager_->init_games_from_fen(fens, move_histories, num_sims);
     }
 
-    // Per-slot re-init (continuous-flow self-play). Unlike init_games_from_fen
-    // this does NOT reset the shared NodePool — only the one slot's root Node
-    // is re-allocated. Used by Python's GamePoolManager.run_pool() to respawn
-    // a fresh game into a slot whose prior game just terminated.
+    // Per-slot re-init: only this slot's root Node is re-allocated; the shared
+    // NodePool is preserved (critical for continuous-flow self-play).
     void init_game_from_fen(int idx,
                             const std::string& fen,
                             const std::vector<std::string>& move_history,
