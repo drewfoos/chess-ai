@@ -14,8 +14,35 @@
 #include <vector>
 #include <memory>
 #include <string>
+#include <array>
 
 namespace mcts {
+
+// Per-root search statistics returned by GameManager::step_stats() after a batch
+// of MCTS iterations. Lets Python orchestrate move selection, recording, and
+// adjudication without committing a move in C++.
+//
+// Conventions:
+//  - q_per_child[i] is parent-POV (already flipped from the child's stored Q,
+//    which is from the child side-to-move's perspective).
+//  - root_wdl is parent-POV and derived from the root node's mean_value() (a
+//    placeholder until WDL flows through RawBatchEvaluator end-to-end).
+//  - terminal_status: 0=ongoing, 1=win-for-side-to-move, -1=loss-for-stm, 2=draw.
+struct RootStats {
+    int game_idx = 0;
+    bool game_complete = false;
+    int terminal_status = 0;
+    int n_legal = 0;
+    std::vector<Move> legal_moves;      // size n_legal
+    std::vector<int> visits;            // size n_legal
+    std::vector<float> q_per_child;     // size n_legal, parent-POV (already flipped)
+    int best_child_idx = -1;            // argmax(visits); -1 if root has no edges
+    std::array<float, 3> root_wdl{0.0f, 0.0f, 0.0f};
+    std::vector<float> raw_nn_policy;   // size POLICY_SIZE (1858)
+    std::array<float, 3> raw_nn_value{0.0f, 0.0f, 0.0f};
+    float raw_nn_mlh = 0.0f;
+    int sims_done = 0;
+};
 
 class GameManager {
 public:
@@ -35,6 +62,23 @@ public:
     // Run one step of cross-game batching. Returns number of newly completed games.
     int step();
 
+    // New API (Stage 1, Lc0-parity self-play refactor): run MCTS until each game
+    // reaches target_sims[i] (or becomes terminal), then return per-game RootStats
+    // *without* committing a move. Caller (Python orchestrator) chooses the move
+    // via apply_move(). Does not alter step()'s behavior — runs alongside it.
+    std::vector<RootStats> step_stats(const std::vector<int>& target_sims);
+
+    // Commit the move at legal-move index `move_idx` for game `game_idx`:
+    // pushes the move onto history, resets the search tree (no subtree reuse,
+    // matching Lc0 self-play default), and clears per-step flags.
+    void apply_move(int game_idx, int move_idx);
+
+    // Current FEN of a game.
+    std::string get_fen(int game_idx) const;
+
+    // Current ply count of a game (number of moves played since init).
+    int get_ply(int game_idx) const;
+
     // Check if all games are done
     bool all_complete() const;
 
@@ -53,8 +97,10 @@ private:
         Node* root = nullptr;  // Pool-managed
         int sims_done = 0;
         int target_sims = 400;
+        int ply = 0;           // Number of moves played since init (for get_ply / Python orchestration)
         bool search_complete = false;
         float raw_value = 0.0f;
+        float raw_mlh = 0.0f;  // Root NN moves-left estimate (pre-search) — surfaced in RootStats
         std::array<float, neural::POLICY_SIZE> raw_policy = {};
         bool root_expanded = false;
     };
@@ -106,6 +152,15 @@ private:
 
     // Build result from completed game
     SearchResult build_result(const GameState& game) const;
+
+    // Build the public RootStats snapshot for a single game.
+    RootStats build_root_stats(int idx) const;
+
+    // Shared batched-evaluate-then-backprop used by both step() and step_stats().
+    // Expands each pending leaf with the returned (policy,value,mlh), caches the
+    // entry, then reverts virtual loss + backpropagates. Leaves step()'s own
+    // inline version untouched — only step_stats() uses this helper.
+    void evaluate_and_backprop_batch(std::vector<PendingLeaf>& batch);
 
     float dynamic_cpuct(int parent_visits) const;
 

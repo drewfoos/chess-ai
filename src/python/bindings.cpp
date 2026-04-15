@@ -240,6 +240,24 @@ public:
         return manager_->num_games();
     }
 
+    // New API (Stage 1): step_stats / apply_move / get_fen / get_ply.
+    // Returns a vector of RootStats (one per game). Python owns move selection.
+    std::vector<mcts::RootStats> step_stats(const std::vector<int>& target_sims) {
+        return manager_->step_stats(target_sims);
+    }
+
+    void apply_move(int game_idx, int move_idx) {
+        manager_->apply_move(game_idx, move_idx);
+    }
+
+    std::string get_fen(int game_idx) const {
+        return manager_->get_fen(game_idx);
+    }
+
+    int get_ply(int game_idx) const {
+        return manager_->get_ply(game_idx);
+    }
+
 private:
     mcts::SearchParams params_;
     std::unique_ptr<neural::NeuralEvaluator> evaluator_;
@@ -336,6 +354,28 @@ PYBIND11_MODULE(_core, m) {
         "Encode position + 8-step history into bitpacked planes. "
         "Returns (bitboards[104] uint64, stm bool, castling int, rule50 int, fullmove int).");
 
+    // Expose RootStats (Stage 1: Lc0-parity self-play refactor). Returned by
+    // GameManager.step_stats(). All fields are read-only.
+    py::class_<mcts::RootStats>(m, "RootStats")
+        .def_readonly("game_idx", &mcts::RootStats::game_idx)
+        .def_readonly("game_complete", &mcts::RootStats::game_complete)
+        .def_readonly("terminal_status", &mcts::RootStats::terminal_status)
+        .def_readonly("n_legal", &mcts::RootStats::n_legal)
+        .def_readonly("visits", &mcts::RootStats::visits)
+        .def_readonly("q_per_child", &mcts::RootStats::q_per_child)
+        .def_readonly("best_child_idx", &mcts::RootStats::best_child_idx)
+        .def_readonly("root_wdl", &mcts::RootStats::root_wdl)
+        .def_readonly("raw_nn_policy", &mcts::RootStats::raw_nn_policy)
+        .def_readonly("raw_nn_value", &mcts::RootStats::raw_nn_value)
+        .def_readonly("raw_nn_mlh", &mcts::RootStats::raw_nn_mlh)
+        .def_readonly("sims_done", &mcts::RootStats::sims_done)
+        .def_property_readonly("legal_moves_uci", [](const mcts::RootStats& s) {
+            std::vector<std::string> out;
+            out.reserve(s.legal_moves.size());
+            for (auto m : s.legal_moves) out.push_back(m.to_uci());
+            return out;
+        });
+
     // Expose GameManager for cross-game batched search
     py::class_<PyGameManager>(m, "GameManager")
         .def(py::init<const std::string&, const std::string&, py::dict, bool, bool, const std::string&>(),
@@ -365,5 +405,18 @@ PYBIND11_MODULE(_core, m) {
              py::arg("idx"),
              "Get the search result for a completed game")
         .def("num_games", &PyGameManager::num_games,
-             "Get the number of games");
+             "Get the number of games")
+        .def("step_stats", &PyGameManager::step_stats,
+             py::arg("target_sims"),
+             "Run MCTS until each game reaches target_sims[i] (or terminal); "
+             "return per-game RootStats without committing a move.")
+        .def("apply_move", &PyGameManager::apply_move,
+             py::arg("game_idx"), py::arg("move_idx"),
+             "Commit the legal-move at index move_idx for game game_idx.")
+        .def("get_fen", &PyGameManager::get_fen,
+             py::arg("game_idx"),
+             "Current FEN of the given game.")
+        .def("get_ply", &PyGameManager::get_ply,
+             py::arg("game_idx"),
+             "Number of moves played since init for the given game.");
 }

@@ -40,8 +40,10 @@ void GameManager::init_game(int idx, const neural::PositionHistory& history, int
     game.root->set_pool_managed(true);
     game.sims_done = 0;
     game.target_sims = num_sims;
+    game.ply = 0;
     game.search_complete = false;
     game.raw_value = 0.0f;
+    game.raw_mlh = 0.0f;
     game.raw_policy.fill(0.0f);
     game.root_expanded = false;
 }
@@ -60,8 +62,10 @@ void GameManager::init_games(int num_games, int num_sims) {
         games_[i].root->set_pool_managed(true);
         games_[i].sims_done = 0;
         games_[i].target_sims = num_sims;
+        games_[i].ply = 0;
         games_[i].search_complete = false;
         games_[i].raw_value = 0.0f;
+        games_[i].raw_mlh = 0.0f;
         games_[i].raw_policy.fill(0.0f);
         games_[i].root_expanded = false;
     }
@@ -95,8 +99,10 @@ void GameManager::init_games_from_fen(const std::vector<std::string>& fens,
         games_[i].root->set_pool_managed(true);
         games_[i].sims_done = 0;
         games_[i].target_sims = num_sims;
+        games_[i].ply = 0;
         games_[i].search_complete = false;
         games_[i].raw_value = 0.0f;
+        games_[i].raw_mlh = 0.0f;
         games_[i].raw_policy.fill(0.0f);
         games_[i].root_expanded = false;
     }
@@ -132,6 +138,7 @@ void GameManager::expand_root(GameState& game) {
     const auto& br = results[0];
 
     game.raw_value = br.value;
+    game.raw_mlh = br.mlh;
 
     // Build raw_policy in 1858-dim space
     Color stm = root_pos.side_to_move();
@@ -964,6 +971,298 @@ SearchResult GameManager::build_result(const GameState& game) const {
     result.total_nodes = root->visit_count();
 
     return result;
+}
+
+// --- Stage 1 (Lc0-parity self-play refactor) -------------------------------
+// New API: step_stats / apply_move / get_fen / get_ply / RootStats.
+// Runs alongside the existing step() — step() is NOT modified.
+
+void GameManager::evaluate_and_backprop_batch(std::vector<PendingLeaf>& batch) {
+    if (batch.empty()) return;
+
+    int batch_size = static_cast<int>(batch.size());
+
+    // Encode all positions into the pre-allocated flat buffer.
+    for (int b = 0; b < batch_size; b++) {
+        neural::encode_position(batch[b].position,
+            flat_encode_buffer_.data() + b * neural::TENSOR_SIZE);
+        Move moves[MAX_MOVES];
+        int nm = generate_legal_moves(batch[b].position, moves);
+        legal_moves_vec_[b].assign(moves, moves + nm);
+        num_legal_moves_vec_[b] = nm;
+    }
+
+    std::vector<neural::BatchRequest> requests(batch_size);
+    for (int b = 0; b < batch_size; b++) {
+        requests[b].encoded_planes = flat_encode_buffer_.data() + b * neural::TENSOR_SIZE;
+        requests[b].legal_moves = legal_moves_vec_[b].data();
+        requests[b].num_legal_moves = num_legal_moves_vec_[b];
+    }
+
+    auto results = evaluator_.evaluate_batch_raw(requests);
+
+    for (int b = 0; b < batch_size; b++) {
+        auto& pl = batch[b];
+
+        EvalResult eval_result;
+        eval_result.policy = results[b].policy;
+        eval_result.value = results[b].value;
+        eval_result.mlh = results[b].mlh;
+
+        expand_node(pl.leaf, pl.position, eval_result);
+
+        if (pl.leaf->is_leaf()) {
+            float value = 0.0f;
+            if (pl.leaf->terminal_status() == 1) value = 1.0f;
+            else if (pl.leaf->terminal_status() == -1) value = -1.0f;
+            revert_virtual_loss_path(pl.path_nodes, pl.multivisit);
+            backpropagate(pl.leaf, -value, pl.multivisit);
+            propagate_terminal(pl.leaf);
+        } else {
+            revert_virtual_loss_path(pl.path_nodes, pl.multivisit);
+            backpropagate(pl.leaf, -eval_result.value, pl.multivisit);
+
+            uint64_t pos_hash = neural::PositionHistory::compute_hash(pl.position);
+            CacheEntry entry;
+            entry.policy = eval_result.policy;
+            entry.value = eval_result.value;
+            entry.num_moves = num_legal_moves_vec_[b];
+            entry.mlh = eval_result.mlh;
+            cache_.put(pos_hash, std::move(entry));
+
+            propagate_terminal(pl.leaf);
+        }
+    }
+}
+
+std::vector<RootStats> GameManager::step_stats(const std::vector<int>& target_sims) {
+    // Override per-game targets for this step. Games not covered by target_sims
+    // keep their previous target (from init_games / previous step_stats call).
+    for (size_t i = 0; i < games_.size(); ++i) {
+        if (i < target_sims.size()) {
+            games_[i].target_sims = target_sims[i];
+        }
+        // Clear search_complete so a prior apply_move or a raised target can
+        // resume searching. Terminal-at-root games will re-flag themselves below.
+        if (games_[i].sims_done < games_[i].target_sims) {
+            games_[i].search_complete = false;
+        }
+    }
+
+    // Expand roots that haven't been expanded yet (same as step()).
+    for (auto& game : games_) {
+        if (!game.root_expanded && !game.search_complete) {
+            expand_root(game);
+        }
+    }
+
+    int total_batch = std::max(1, params_.batch_size);
+
+    // Loop until every game has reached its target or gone terminal.
+    int safety_outer = total_batch * 64 + 1024;  // upper bound to guarantee termination
+    while (safety_outer-- > 0) {
+        // Collect games that still need work.
+        int num_active = 0;
+        for (auto& game : games_) {
+            if (game.search_complete) continue;
+            if (game.root->terminal_status() != 0) {
+                game.search_complete = true;
+                continue;
+            }
+            if (game.sims_done >= game.target_sims) {
+                game.search_complete = true;
+                continue;
+            }
+            num_active++;
+        }
+        if (num_active == 0) break;
+
+        int per_game = std::max(1, total_batch / std::max(1, num_active));
+
+        std::vector<PendingLeaf> batch;
+        batch.reserve(total_batch);
+
+        for (int g = 0; g < static_cast<int>(games_.size()); g++) {
+            auto& game = games_[g];
+            if (game.search_complete) continue;
+
+            if (should_prune(game)) {
+                game.search_complete = true;
+                continue;
+            }
+            if (game.root->terminal_status() != 0) {
+                game.search_complete = true;
+                continue;
+            }
+
+            int leaves_this_game = std::min(per_game, game.target_sims - game.sims_done);
+            int sims_accumulated = 0;
+            for (int i = 0; i < leaves_this_game; i++) {
+                int contrib = gather_leaf_from_game(g, batch);
+                sims_accumulated += std::max(1, contrib);
+                if (game.sims_done + sims_accumulated >= game.target_sims) break;
+                if (static_cast<int>(batch.size()) >= total_batch) break;
+            }
+
+            game.sims_done += sims_accumulated;
+
+            if (game.sims_done >= game.target_sims) {
+                game.search_complete = true;
+            }
+        }
+
+        // Top-up pass: fill the batch if cache hits / terminals left it short.
+        int safety_inner = total_batch * 2;
+        while (static_cast<int>(batch.size()) < total_batch && safety_inner-- > 0) {
+            bool made_progress = false;
+            for (int g = 0; g < static_cast<int>(games_.size()); g++) {
+                if (static_cast<int>(batch.size()) >= total_batch) break;
+                auto& game = games_[g];
+                if (game.search_complete) continue;
+                if (game.sims_done >= game.target_sims) {
+                    game.search_complete = true;
+                    continue;
+                }
+                if (game.root->terminal_status() != 0) {
+                    game.search_complete = true;
+                    continue;
+                }
+                int contrib = gather_leaf_from_game(g, batch);
+                game.sims_done += std::max(1, contrib);
+                made_progress = true;
+                if (game.sims_done >= game.target_sims) {
+                    game.search_complete = true;
+                }
+            }
+            if (!made_progress) break;
+        }
+
+        evaluate_and_backprop_batch(batch);
+
+        // If batch was empty (everything hit cache/terminal on the descent), we
+        // still made progress via sims_done increments; loop will terminate.
+    }
+
+    std::vector<RootStats> out;
+    out.reserve(games_.size());
+    for (int i = 0; i < static_cast<int>(games_.size()); i++) {
+        out.push_back(build_root_stats(i));
+    }
+    return out;
+}
+
+RootStats GameManager::build_root_stats(int idx) const {
+    RootStats s;
+    s.game_idx = idx;
+    if (idx < 0 || idx >= static_cast<int>(games_.size())) return s;
+
+    const auto& g = games_[idx];
+    s.sims_done = g.sims_done;
+    s.raw_nn_policy.assign(g.raw_policy.begin(), g.raw_policy.end());
+    s.raw_nn_mlh = g.raw_mlh;
+
+    // Raw NN root value is scalar in [-1,+1] from current evaluator interface.
+    // Convert to a WDL placeholder with d=0 until the NN backend exposes true
+    // WDL head outputs through RawBatchEvaluator.
+    {
+        float v = g.raw_value;
+        float w = 0.5f * (1.0f + v);
+        float l = 0.5f * (1.0f - v);
+        w = std::max(0.0f, std::min(1.0f, w));
+        l = std::max(0.0f, std::min(1.0f, l));
+        s.raw_nn_value = {w, 0.0f, l};
+    }
+
+    if (!g.root) return s;
+
+    s.terminal_status = g.root->terminal_status();
+    s.game_complete = (s.terminal_status != 0);
+    s.n_legal = g.root->num_edges();
+
+    s.legal_moves.reserve(s.n_legal);
+    s.visits.reserve(s.n_legal);
+    s.q_per_child.reserve(s.n_legal);
+
+    int best_visits = -1;
+    int best_idx = -1;
+    for (int ci = 0; ci < s.n_legal; ++ci) {
+        s.legal_moves.push_back(g.root->edge(ci).move());
+        Node* child = g.root->child_node(ci);
+        int vc = child ? child->visit_count() : 0;
+        s.visits.push_back(vc);
+
+        // Child's mean_value() is from the child side-to-move's POV; flip to
+        // parent POV (same convention as SearchResult / build_result uses
+        // implicitly via backprop signs).
+        float q_parent = (child && vc > 0) ? -child->mean_value() : 0.0f;
+        s.q_per_child.push_back(q_parent);
+
+        if (vc > best_visits) {
+            best_visits = vc;
+            best_idx = ci;
+        }
+    }
+    s.best_child_idx = best_idx;
+
+    // Post-search root WDL placeholder: derive from root mean_value(). Same
+    // d=0 caveat as raw_nn_value above. When WDL head is wired through to
+    // RawBatchEvaluator, aggregate visit-weighted child WDL here instead.
+    {
+        float rq = g.root->mean_value();
+        float w = 0.5f * (1.0f + rq);
+        float l = 0.5f * (1.0f - rq);
+        w = std::max(0.0f, std::min(1.0f, w));
+        l = std::max(0.0f, std::min(1.0f, l));
+        s.root_wdl = {w, 0.0f, l};
+    }
+
+    return s;
+}
+
+void GameManager::apply_move(int game_idx, int move_idx) {
+    if (game_idx < 0 || game_idx >= static_cast<int>(games_.size())) {
+        throw std::runtime_error("GameManager::apply_move: invalid game index");
+    }
+    auto& game = games_[game_idx];
+    if (!game.root || move_idx < 0 || move_idx >= game.root->num_edges()) {
+        throw std::runtime_error("GameManager::apply_move: invalid move index");
+    }
+
+    Move m = game.root->edge(move_idx).move();
+
+    // Advance the position + history.
+    Position next_pos = game.history.current();
+    UndoInfo undo;
+    next_pos.make_move(m, undo);
+    game.history.push(next_pos);
+    game.ply += 1;
+
+    // Reset the search tree — no subtree reuse (matches Lc0 self-play default).
+    // The old tree's pool entries become unreachable but stay allocated until
+    // init_games() calls pool_.reset(). Acceptable for typical self-play game
+    // lengths; revisit with a per-game pool if it becomes a memory issue.
+    game.root = pool_.allocate();
+    game.root->set_pool_managed(true);
+    game.sims_done = 0;
+    game.search_complete = false;
+    game.root_expanded = false;
+    game.raw_value = 0.0f;
+    game.raw_mlh = 0.0f;
+    game.raw_policy.fill(0.0f);
+}
+
+std::string GameManager::get_fen(int game_idx) const {
+    if (game_idx < 0 || game_idx >= static_cast<int>(games_.size())) {
+        throw std::runtime_error("GameManager::get_fen: invalid game index");
+    }
+    return games_[game_idx].history.current().to_fen();
+}
+
+int GameManager::get_ply(int game_idx) const {
+    if (game_idx < 0 || game_idx >= static_cast<int>(games_.size())) {
+        throw std::runtime_error("GameManager::get_ply: invalid game index");
+    }
+    return games_[game_idx].ply;
 }
 
 } // namespace mcts

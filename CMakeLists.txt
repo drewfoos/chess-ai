@@ -69,6 +69,7 @@ if(BUILD_TESTS)
         tests/test_neural.cpp
         tests/test_uci.cpp
         tests/test_syzygy.cpp
+        tests/test_game_manager.cpp
     )
     target_link_libraries(chess_tests PRIVATE chess_core GTest::gtest_main)
     include(GoogleTest)
