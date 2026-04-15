@@ -19,3 +19,55 @@ class NetworkConfig:
     use_attention_policy: bool = True
     policy_embedding_size: int = 64
     policy_d_model: int = 64
+
+
+@dataclass
+class SelfPlayConfig:
+    """Self-play generation config.
+
+    Historical fields (pre Lc0-parity refactor): temperature_moves, max_moves,
+    resign_threshold, consecutive_resign, q_ratio, playout_cap_randomization,
+    playout_cap_fraction, playout_cap_quick_sims, kld_adaptive, kld_min_sims,
+    kld_max_sims, kld_threshold, syzygy_path, random_opening_fraction,
+    random_opening_moves, opening_book_path, opening_book_fraction.
+
+    Stage 2 Lc0-parity fields (consumed by GameLoopManager):
+    num_games, full_sims, quick_sims, min_sims, playout_cap_p,
+    opening_temp, opening_temp_plies, temp_floor, temp_decay_plies,
+    use_kld_adaptive, max_ply.
+    """
+    # --- Legacy fields (still used by training/selfplay.py and tests) ---
+    temperature_moves: int = 30
+    max_moves: int = 512
+    resign_threshold: float = -0.95
+    consecutive_resign: int = 5
+    # Lc0-style Q-value blending into the value target: 0 = pure game result,
+    # 1 = pure search-Q. A moderate blend (~0.25) de-noises terminal-only
+    # training signal, especially in long games where the final result is a
+    # weak label for most positions.
+    q_ratio: float = 0.25
+    playout_cap_randomization: bool = True   # Alternate full/quick search
+    playout_cap_fraction: float = 0.25       # Fraction of moves that get full search
+    playout_cap_quick_sims: int = 100        # Simulations for quick search moves
+    kld_adaptive: bool = True               # Adapt visit count based on KL divergence
+    kld_min_sims: int = 100                 # Minimum simulations (used when KLD is low)
+    kld_max_sims: int = 800                 # Maximum simulations (used when KLD is high)
+    kld_threshold: float = 0.5              # KLD above this gets max sims
+    syzygy_path: str | None = None          # Path to Syzygy tablebase files (None = disabled)
+    random_opening_fraction: float = 0.05   # Fraction of games with random openings
+    random_opening_moves: int = 8           # Max random moves for opening randomization
+    opening_book_path: str | None = None    # File of starting FENs, one per line (None = disabled)
+    opening_book_fraction: float = 0.5      # Fraction of games seeded from book FENs
+
+    # --- Stage 2 (Lc0-parity) fields, consumed by GameLoopManager ---
+    num_games: int = 1
+    full_sims: int = 400
+    quick_sims: int = 100
+    min_sims: int = 80
+    playout_cap_p: float = 0.25              # P(quick search) per move in GameLoopManager
+    opening_temp: float = 1.0
+    opening_temp_plies: int = 30
+    temp_floor: float = 0.4
+    temp_decay_plies: int = 30
+    use_kld_adaptive: bool = True
+    max_ply: int = 450

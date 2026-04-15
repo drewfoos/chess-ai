@@ -15,7 +15,7 @@ import chess
 import numpy as np
 import torch
 
-from training.config import NetworkConfig
+from training.config import NetworkConfig, SelfPlayConfig as _SelfPlayConfigBase
 from training.encoder import encode_board, POLICY_SIZE
 from training.model import ChessNetwork
 from training.mcts import MCTS, MCTSConfig, SearchResult
@@ -122,29 +122,10 @@ class CppMCTS:
         )
 
 
-@dataclass
-class SelfPlayConfig:
-    temperature_moves: int = 30
-    max_moves: int = 512
-    resign_threshold: float = -0.95
-    consecutive_resign: int = 5
-    # Lc0-style Q-value blending into the value target: 0 = pure game result,
-    # 1 = pure search-Q. A moderate blend (~0.25) de-noises terminal-only
-    # training signal, especially in long games where the final result is a
-    # weak label for most positions.
-    q_ratio: float = 0.25
-    playout_cap_randomization: bool = True   # Alternate full/quick search
-    playout_cap_fraction: float = 0.25       # Fraction of moves that get full search
-    playout_cap_quick_sims: int = 100        # Simulations for quick search moves
-    kld_adaptive: bool = True               # Adapt visit count based on KL divergence
-    kld_min_sims: int = 100                 # Minimum simulations (used when KLD is low)
-    kld_max_sims: int = 800                 # Maximum simulations (used when KLD is high)
-    kld_threshold: float = 0.5              # KLD above this gets max sims
-    syzygy_path: str | None = None          # Path to Syzygy tablebase files (None = disabled)
-    random_opening_fraction: float = 0.05   # Fraction of games with random openings
-    random_opening_moves: int = 8           # Max random moves for opening randomization
-    opening_book_path: str | None = None    # File of starting FENs, one per line (None = disabled)
-    opening_book_fraction: float = 0.5      # Fraction of games seeded from book FENs
+# SelfPlayConfig canonically lives in training.config as of the Stage 2
+# Lc0-parity refactor. Re-exported here for backward compat with callers that
+# still do `from training.selfplay import SelfPlayConfig`.
+SelfPlayConfig = _SelfPlayConfigBase
 
 
 @dataclass
@@ -488,33 +469,136 @@ def play_games_batched(
     use_trt: bool = False,
     trt_engine_path: str = "",
 ) -> list[GameRecord]:
-    """Play num_games concurrently using chess_mcts.GameManager.
+    """Play num_games concurrently using chess_mcts.GameManager + GameLoopManager.
 
-    GameManager runs N games' MCTS in lockstep, batching NN evaluations across
-    trees for a single shared GPU forward pass per step. Dynamic backfill keeps
-    `parallel_games` active at all times until num_games is reached.
+    Stage 2 Lc0-parity refactor: Python (GameLoopManager) drives per-step
+    orchestration — temperature, playout-cap randomization, KLD-adaptive
+    target sims, ply-cap adjudication. C++ GameManager is a pure search
+    engine exposing `step_stats` / `apply_move`.
 
-    Per-game playout-cap randomization and KLD-adaptive visits are NOT applied
-    here — all moves use full sims (trade-off for cross-game batching).
+    The on-disk format is preserved (Stage 3 will replace the schema). Some
+    Stage-1-era features (resign, opening book, random-opening seeding,
+    surprise weights) are temporarily simplified — they'll be restored in
+    later stages:
+      - Resign: dropped (Stage 4 will reintroduce with adjudication).
+      - Opening book / random-opening: dropped for the C++ path (Stage 6).
+      - Surprise: stamped as 0.0 (Stage 3 will recompute from soft-policy
+        deltas once the v2 writer lands).
     """
+    from training.selfplay_loop import GameLoopManager, GameRecord as LoopGameRecord
+
     cfg_proxy = _CppMCTSConfig(mcts_config)
     cfg_dict = cfg_proxy._to_dict()
-    if use_trt:
-        try:
-            manager = chess_mcts.GameManager(
-                model_path, device, cfg_dict, use_fp16, True, trt_engine_path,
-            )
-        except TypeError as e:
-            raise RuntimeError(
-                "chess_mcts module lacks use_trt support — rebuild with -DENABLE_TENSORRT=ON"
-            ) from e
-    else:
-        try:
-            manager = chess_mcts.GameManager(model_path, device, cfg_dict, use_fp16)
-        except TypeError:
-            # Older build without use_fp16 kwarg
-            manager = chess_mcts.GameManager(model_path, device, cfg_dict)
 
+    def _make_manager():
+        if use_trt:
+            try:
+                return chess_mcts.GameManager(
+                    model_path, device, cfg_dict, use_fp16, True, trt_engine_path,
+                )
+            except TypeError as e:
+                raise RuntimeError(
+                    "chess_mcts module lacks use_trt support — rebuild with -DENABLE_TENSORRT=ON"
+                ) from e
+        try:
+            return chess_mcts.GameManager(model_path, device, cfg_dict, use_fp16)
+        except TypeError:
+            return chess_mcts.GameManager(model_path, device, cfg_dict)
+
+    # Rebuild a fresh SelfPlayConfig view that wires Stage 2 fields from the
+    # mcts_config / selfplay_config pair. We keep the legacy selfplay_config
+    # object intact for _finalize_record (Syzygy, q_ratio, etc).
+    full_sims = max(1, mcts_config.num_simulations)
+    quick_sims = max(1, min(selfplay_config.playout_cap_quick_sims, full_sims))
+    min_sims = max(1, min(selfplay_config.kld_min_sims, full_sims))
+    # playout_cap_fraction was "fraction of FULL moves"; GameLoopManager uses
+    # playout_cap_p = P(QUICK move). Convert accordingly, but only when the
+    # legacy toggle is on.
+    if selfplay_config.playout_cap_randomization:
+        playout_cap_p = max(0.0, min(1.0, 1.0 - selfplay_config.playout_cap_fraction))
+    else:
+        playout_cap_p = 0.0
+    # Plies per full move ≈ 2 * moves for temperature schedule (temperature_moves
+    # is moves-based; opening_temp_plies is ply-based).
+    opening_temp_plies = max(1, selfplay_config.temperature_moves * 2)
+    loop_cfg = _replace_selfplay_cfg(
+        selfplay_config,
+        num_games=parallel_games,
+        full_sims=full_sims,
+        quick_sims=quick_sims,
+        min_sims=min_sims,
+        playout_cap_p=playout_cap_p,
+        opening_temp=1.0,
+        opening_temp_plies=opening_temp_plies,
+        temp_floor=0.01,            # match legacy late-game quasi-greedy
+        temp_decay_plies=1,         # effectively hard cutoff at opening_temp_plies
+        use_kld_adaptive=selfplay_config.kld_adaptive,
+        kld_threshold=selfplay_config.kld_threshold,
+        # max_ply converts from move-count to ply-count.
+        max_ply=max(1, selfplay_config.max_moves * 2),
+    )
+
+    parallel_games = max(1, min(parallel_games, num_games))
+    completed: list[GameRecord] = []
+    remaining = num_games
+
+    # Probe whether the currently-loaded chess_mcts binding exposes the Stage 1
+    # step_stats / apply_move API. If not (older wheel), fall back to the
+    # legacy slot-based driver — this keeps the branch green pre-rebuild.
+    probe = _make_manager()
+    if not hasattr(probe, "step_stats") or not hasattr(probe, "apply_move"):
+        return _play_games_batched_legacy(
+            probe, num_games, mcts_config, selfplay_config, parallel_games,
+            on_game_done=on_game_done,
+        )
+    del probe  # release the probe manager before we start the real loop
+
+    # We run in rounds of `parallel_games` games at a time. Each round builds a
+    # fresh GameManager and runs the loop to completion. This is simpler than
+    # the legacy dynamic-backfill slot scheme and is sufficient for Stage 2 —
+    # dynamic backfill is tracked for a later optimization pass.
+    while remaining > 0:
+        batch = min(parallel_games, remaining)
+        manager = _make_manager()
+        manager.init_games(batch, full_sims)
+
+        # Rebind the loop cfg to match the actual game count in this batch.
+        batch_cfg = _replace_selfplay_cfg(loop_cfg, num_games=batch)
+        loop = GameLoopManager(manager, batch_cfg, discard_pool=None, rng_seed=None)
+        start_times = [time.time()] * batch
+        loop_records: list[LoopGameRecord] = loop.run_until_all_complete()
+
+        for j, lrec in enumerate(loop_records):
+            record = _loop_record_to_legacy(lrec, selfplay_config)
+            duration = time.time() - start_times[j]
+            completed.append(record)
+            if on_game_done is not None:
+                on_game_done(record, duration, len(completed))
+
+        remaining -= batch
+
+    return completed
+
+
+def _replace_selfplay_cfg(cfg: SelfPlayConfig, **overrides) -> SelfPlayConfig:
+    """Return a copy of cfg with the given Stage 2 / loop fields overridden."""
+    from dataclasses import replace
+    return replace(cfg, **overrides)
+
+
+def _play_games_batched_legacy(
+    manager,
+    num_games: int,
+    mcts_config: MCTSConfig,
+    selfplay_config: SelfPlayConfig,
+    parallel_games: int,
+    on_game_done=None,
+) -> list[GameRecord]:
+    """Legacy slot-based driver used when the installed chess_mcts binding
+    predates the Stage 1 step_stats / apply_move API. Preserves the previous
+    behavior byte-for-byte — will be removed once the rebuilt wheel is the
+    minimum supported version.
+    """
     num_sims = mcts_config.num_simulations
     parallel_games = max(1, min(parallel_games, num_games))
 
@@ -534,8 +618,6 @@ def play_games_batched(
             slot_board[slot] = None
             return False
         next_game_id[0] += 1
-
-        # Opening book seeding (falls back to standard board on invalid FEN)
         book_fen = _sample_opening_fen(selfplay_config)
         if book_fen is not None:
             try:
@@ -546,7 +628,6 @@ def play_games_batched(
         else:
             board = chess.Board()
         record = GameRecord()
-        # Opening randomization (skip if book-seeded)
         if book_fen is None and selfplay_config.random_opening_fraction > 0 and \
                 random.random() < selfplay_config.random_opening_fraction:
             n_random = random.randint(2, selfplay_config.random_opening_moves)
@@ -584,7 +665,6 @@ def play_games_batched(
         if not active:
             break
 
-        # Handle any games that ended before we search this round
         to_search: list[int] = []
         for s in active:
             board = slot_board[s]
@@ -598,7 +678,6 @@ def play_games_batched(
         if not to_search:
             continue
 
-        # Build per-slot FEN + short history (last 8 moves) for repetition detection
         fens: list[str] = []
         histories: list[list[str]] = []
         for s in to_search:
@@ -624,14 +703,12 @@ def play_games_batched(
             vc = result.visit_counts
 
             if not vc:
-                # No legal moves — declare draw and finish
                 record.result = '1/2-1/2'
                 finish_slot(s)
                 if not start_slot(s):
                     slot_board[s] = None
                 continue
 
-            # Temperature-based move selection over visit counts
             temperature = 1.0 if slot_move_num[s] < selfplay_config.temperature_moves else 0.01
             moves_list = list(vc.keys())
             visits = np.array([vc[m] for m in moves_list], dtype=np.float64)
@@ -673,6 +750,111 @@ def play_games_batched(
             slot_move_num[s] += 1
 
     return completed
+
+
+def _loop_record_to_legacy(
+    lrec, selfplay_config: SelfPlayConfig
+) -> GameRecord:
+    """Project a Stage 2 selfplay_loop.GameRecord into the legacy
+    training.selfplay.GameRecord format used by on-disk .npz writers.
+
+    Preserves the existing .npz schema — Stage 3 will replace this with a v2
+    writer that carries best_eval/played_eval/raw_nn_eval directly.
+    """
+    record = GameRecord()
+
+    # Replay the game board-by-board so we can (a) encode planes for each
+    # position, (b) build board_history for Syzygy rescoring, (c) resolve
+    # final result based on board.outcome() + terminal_status, and (d) map
+    # the per-legal-move visit distribution back to 1858-dim indices.
+    positions: list[tuple] = []
+    board_history: list = []
+
+    for row in lrec.rows:
+        try:
+            board = chess.Board(row.fen)
+        except ValueError:
+            continue
+        planes = encode_board(board)
+
+        # Project visits (over row.legal_moves_uci) into 1858-dim policy space.
+        policy_target = np.zeros(POLICY_SIZE, dtype=np.float32)
+        if row.legal_moves_uci and row.visits_policy:
+            for uci, prob in zip(row.legal_moves_uci, row.visits_policy):
+                try:
+                    mv = chess.Move.from_uci(uci)
+                except ValueError:
+                    continue
+                idx = _uci_to_policy_index(mv, board.turn)
+                if idx is not None and 0 <= idx < POLICY_SIZE:
+                    policy_target[idx] += float(prob)
+            s = float(policy_target.sum())
+            if s > 0:
+                policy_target /= s
+
+        # Scalar root Q approximation: played_eval (w,d,l) → w - l. Stage 3
+        # will carry real WDL through.
+        w, _d, l = row.played_eval
+        root_q = float(w - l)
+
+        # Surprise stamped 0.0 for Stage 2; Stage 3 will recompute from
+        # soft-policy deltas.
+        surprise = 0.0
+        is_full = bool(row.is_full_search)
+
+        positions.append((planes, policy_target, board.turn, root_q, surprise, is_full))
+        board_history.append(board.copy())
+        record.moves_uci.append(row.played_uci or "")
+
+    # Determine the final board state for result labeling. Replay moves
+    # forward from startpos? The loop doesn't give us the actual moves
+    # played, only FENs per position. For result determination we rely on
+    # terminal_status from the loop's finalize step:
+    if lrec.terminal_status == 1:
+        # Side-to-move at terminal won; last recorded row's stm (if any)
+        # determines color perspective. But when adjudicated as draw, that's
+        # handled below. Map terminal_status=+1 to the color that moved last.
+        # Without move info, we derive from the last position's board.turn
+        # (which is the side to move at the terminal position).
+        last_stm_white = (positions[-1][2] == chess.WHITE) if positions else True
+        record.result = '1-0' if last_stm_white else '0-1'
+    elif lrec.terminal_status == -1:
+        last_stm_white = (positions[-1][2] == chess.WHITE) if positions else True
+        record.result = '0-1' if last_stm_white else '1-0'
+    else:
+        record.result = '1/2-1/2'
+
+    # Build a synthetic final board for _finalize_record's tablebase rescoring.
+    # We use the last row's FEN (or startpos fallback).
+    if lrec.rows:
+        try:
+            final_board = chess.Board(lrec.rows[-1].fen)
+        except ValueError:
+            final_board = chess.Board()
+    else:
+        final_board = chess.Board()
+
+    _finalize_record(record, final_board, positions, board_history, selfplay_config)
+    return record
+
+
+def _uci_to_policy_index(move: chess.Move, turn) -> int | None:
+    """Map a chess.Move to the 1858-dim policy index from side-to-move POV.
+
+    For black-to-move, the encoder flips the board via `square_mirror`, so
+    we flip from/to squares before calling move_to_index.
+    """
+    from training.encoder import move_to_index
+    fr = move.from_square
+    to = move.to_square
+    if turn == chess.BLACK:
+        fr = chess.square_mirror(fr)
+        to = chess.square_mirror(to)
+    promo = None
+    if move.promotion is not None and move.promotion != chess.QUEEN:
+        promo_map = {chess.KNIGHT: 'n', chess.BISHOP: 'b', chess.ROOK: 'r'}
+        promo = promo_map.get(move.promotion)
+    return move_to_index(fr, to, promo)
 
 
 def generate_games(
@@ -880,29 +1062,32 @@ def _trt_available() -> bool:
         return False
 
 
-def _build_trt_engine_for_self_play(
-    model, cpp_model_path: str, can_refit: bool = False,
-) -> str:
-    """Export ONNX from `model` and build or refit the TensorRT engine.
+def _build_trt_engine_for_self_play(model, cpp_model_path: str) -> str:
+    """Export ONNX from `model` and build a fresh TensorRT engine.
 
-    `can_refit=True` tells the builder the existing .trt on disk has the
-    same architecture as `model` (same block/filter count), so it can
-    skip plan compilation and just swap in new weights (~10× faster).
-    Pass False at tier transitions / first run.
+    Follows Lc0's pattern: rebuild per weight-set, amortize via a persistent
+    timing cache next to the engine file. Previously we refit in place; that
+    path silently corrupted the engine because `torch.onnx.export` with
+    `do_constant_folding=True` folds BN-fused conv weights into anonymous
+    constants that are no longer refittable. See `build_trt_engine.py`
+    module docstring.
 
     Returns the .trt path. Uses env TENSORRT_PATH for DLL discovery.
     """
     import time as _time
     from training.export import export_onnx
-    from training.build_trt_engine import build_or_refit_engine
+    from training.build_trt_engine import build_engine
 
     onnx_path = cpp_model_path.replace('.pt', '.onnx')
     trt_path = cpp_model_path.replace('.pt', '.trt')
+    timing_cache_path = os.path.join(
+        os.path.dirname(os.path.abspath(trt_path)) or '.', 'trt_timing.cache',
+    )
     export_onnx(model, onnx_path)
     t0 = _time.time()
-    _, refitted = build_or_refit_engine(onnx_path, trt_path, can_refit=can_refit)
+    build_engine(onnx_path, trt_path, timing_cache_path=timing_cache_path)
     elapsed = _time.time() - t0
-    print(f"  [trt] {'refit' if refitted else 'build'} took {elapsed:.1f}s")
+    print(f"  [trt] build took {elapsed:.1f}s")
     return trt_path
 
 
@@ -980,9 +1165,14 @@ def _train_one_cycle(model, optimizer, dataloader, device, train_epochs, schedul
             scaler.scale(total_loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
+            # AMP scaler may skip optimizer.step() on inf/nan gradients
+            # (common with FP16 on the first few batches). When skipped, the
+            # scaler reduces its scale by backoff_factor, so a drop in scale
+            # is the canonical signal that the step did NOT happen.
+            prev_scale = scaler.get_scale()
             scaler.step(optimizer)
             scaler.update()
-            if scheduler is not None:
+            if scheduler is not None and scaler.get_scale() >= prev_scale:
                 scheduler.step()
 
             total_loss_sum += total_loss.item()
@@ -1126,6 +1316,15 @@ def training_loop(
         # checkpoint). Reversing the order causes lr to explode by ~1e6×
         # after the first training step (lr=1e-3 → ~4 → ~1000).
         scheduler = _build_warmup_scheduler(optimizer, milestones=lr_milestones, gamma=lr_gamma)
+        # Restore scheduler state if present, so warmup + milestones don't
+        # restart from step 0 on every resume (which would re-apply the linear
+        # warmup and silently shift milestone steps relative to absolute step).
+        sched_state = checkpoint.get('scheduler_state_dict')
+        if sched_state is not None:
+            try:
+                scheduler.load_state_dict(sched_state)
+            except (ValueError, KeyError) as e:
+                print(f"  Scheduler state could not be restored ({e}); fresh schedule.")
         # Restore tier schedule from checkpoint if caller didn't override it.
         # Lets auto-resume preserve the original run's scale-up plan instead
         # of silently dropping it (which would pin the net at the small tier).
@@ -1175,7 +1374,23 @@ def training_loop(
     swa_model = None
     if use_swa:
         from torch.optim.swa_utils import AveragedModel
-        swa_model = AveragedModel(model)
+        # use_buffers=True averages BN running mean/var alongside parameters.
+        # Without it, BN buffers stay frozen at construction time, so the SWA
+        # model's BN stats never track the averaged weights' actual activation
+        # distribution. update_bn() after training gives the fully correct
+        # stats; use_buffers=True is the cheap fallback before that runs.
+        swa_model = AveragedModel(model, use_buffers=True)
+        # Restore SWA EMA state if resuming, so n_averaged and the running
+        # averaged weights survive across restarts. Without this, every resume
+        # would silently reset the average to "just the current model".
+        if resume_from:
+            swa_state = checkpoint.get('swa_state_dict')
+            if swa_state is not None:
+                try:
+                    swa_model.load_state_dict(swa_state)
+                    print(f"  Restored SWA state (n_averaged={int(swa_model.n_averaged.item())})")
+                except (ValueError, KeyError, RuntimeError) as e:
+                    print(f"  SWA state could not be restored ({e}); fresh SWA.")
 
     # Enable Lc0-style search features for the training loop:
     # - Absolute root FPU: unvisited root children treated as value=1.0 (pessimistic),
@@ -1213,12 +1428,6 @@ def training_loop(
     # Used to mark the first gen after a resume on the dashboard's loss chart.
     first_gen_after_resume = start_gen if resume_from else None
 
-    # Tracks the architecture the current on-disk .trt engine was built for.
-    # A refit is only valid when architecture is unchanged; first iteration
-    # has to do a full build since any engine from a prior process may be
-    # stale (different weights dtype, different ONNX opset, etc.).
-    trt_engine_arch: tuple[int, int] | None = None
-
     for gen in range(start_gen, end_gen + 1):
         gen_start = time.time()
 
@@ -1236,7 +1445,7 @@ def training_loop(
             scheduler = _build_warmup_scheduler(optimizer, milestones=lr_milestones, gamma=lr_gamma)
             if use_swa:
                 from torch.optim.swa_utils import AveragedModel
-                swa_model = AveragedModel(model)
+                swa_model = AveragedModel(model, use_buffers=True)
             blocks, filters = target_blocks, target_filters
 
             # Warm-up: train the new (random) net on prior-gen data before
@@ -1275,10 +1484,6 @@ def training_loop(
         # Always export from the base model (SWA wrapper lacks .config)
         cpp_model_path = os.path.join(checkpoint_dir, 'selfplay_model.pt')
         trt_engine_path = ""
-        # Refit is valid iff the on-disk engine is for the same architecture.
-        # Tier transition rebuilt the model this iteration, so force a full
-        # build when the tracked arch doesn't match the current config.
-        can_refit = trt_engine_arch == (config.num_blocks, config.num_filters)
 
         if swa_model is not None and gen > 1:
             # Copy SWA params into base model temporarily for export
@@ -1287,19 +1492,12 @@ def training_loop(
             model.load_state_dict(swa_state)
             export_torchscript(model, cpp_model_path, device=device)
             if use_trt:
-                trt_engine_path = _build_trt_engine_for_self_play(
-                    model, cpp_model_path, can_refit=can_refit,
-                )
+                trt_engine_path = _build_trt_engine_for_self_play(model, cpp_model_path)
             model.load_state_dict(orig_state)
         else:
             export_torchscript(model, cpp_model_path, device=device)
             if use_trt:
-                trt_engine_path = _build_trt_engine_for_self_play(
-                    model, cpp_model_path, can_refit=can_refit,
-                )
-
-        if use_trt:
-            trt_engine_arch = (config.num_blocks, config.num_filters)
+                trt_engine_path = _build_trt_engine_for_self_play(model, cpp_model_path)
 
         num_positions = generate_games(
             play_model, gen_games, data_path,
@@ -1325,7 +1523,11 @@ def training_loop(
             model, optimizer, dataloader, device, train_epochs, scheduler,
         )
 
-        # Update SWA model after training
+        # Update SWA model after training. use_buffers=True (set at SWA
+        # construction) means BN running stats are EMA-averaged alongside
+        # parameters, which keeps them in sync with the averaged weights
+        # without the instability of the full update_bn reset-and-recompute
+        # at low n_averaged (which produced NaN-adjacent BN stats early on).
         if swa_model is not None:
             swa_model.update_parameters(model)
 
@@ -1349,14 +1551,19 @@ def training_loop(
             'parallel_games': parallel_games,
             'use_trt': use_trt,
         }
-        torch.save({
+        ckpt_payload = {
             'generation': gen,
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict() if scheduler is not None else None,
             'config': config,
             'network_schedule': network_schedule,
             'run_params': run_params,
-        }, checkpoint_path)
+        }
+        if swa_model is not None:
+            ckpt_payload['swa_state_dict'] = swa_model.state_dict()
+            ckpt_payload['swa_n_averaged'] = int(swa_model.n_averaged.item())
+        torch.save(ckpt_payload, checkpoint_path)
 
         # 5. Print per-generation stats
         gen_time = time.time() - gen_start

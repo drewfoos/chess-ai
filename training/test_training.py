@@ -2486,3 +2486,114 @@ class TestTieredNetworkSchedule:
         assert model.config.num_blocks == 6
         assert model.config.num_filters == 64
         assert start_gen == 4
+
+
+
+
+# ---------------------------------------------------------------------------
+# Stage 2 (Lc0-parity self-play refactor): GameLoopManager tests.
+# ---------------------------------------------------------------------------
+
+def _make_fake_game_manager(num_games):
+    """In-memory fake GameManager that returns deterministic uniform RootStats."""
+    class FakeStats:
+        def __init__(self):
+            self.game_complete = False
+            self.terminal_status = 0
+            self.n_legal = 4
+            self.visits = [10, 8, 6, 4]
+            self.q_per_child = [0.1, 0.0, -0.1, 0.0]
+            self.best_child_idx = 0
+            self.root_wdl = (0.4, 0.3, 0.3)
+            self.raw_nn_policy = [0.0] * 1858
+            self.raw_nn_value = (0.4, 0.3, 0.3)
+            self.raw_nn_mlh = 20.0
+            self.legal_moves_uci = ["e2e4", "d2d4", "g1f3", "c2c4"]
+            self.sims_done = 64
+
+    class FakeGM:
+        def __init__(self, n):
+            self.n = n
+            self.plies = [0] * n
+            self.fens = ["rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"] * n
+
+        def step_stats(self, targets):
+            return [FakeStats() for _ in range(self.n)]
+
+        def apply_move(self, idx, m):
+            self.plies[idx] += 1
+
+        def get_fen(self, idx):
+            return self.fens[idx]
+
+        def get_ply(self, idx):
+            return self.plies[idx]
+
+        def num_games(self):
+            return self.n
+
+    return FakeGM(num_games)
+
+
+def test_playout_cap_in_cpp_path(monkeypatch):
+    """C++ path now consults playout-cap because Python drives the per-step loop."""
+    from training.selfplay_loop import GameLoopManager
+    from training.config import SelfPlayConfig
+    cfg = SelfPlayConfig(
+        num_games=8, full_sims=64, quick_sims=16, playout_cap_p=0.25,
+        max_moves=10, max_ply=20,
+    )
+    fake_gm = _make_fake_game_manager(num_games=8)
+    loop = GameLoopManager(fake_gm, cfg, discard_pool=None, rng_seed=42)
+    games = loop.run_until_all_complete()
+    full_search_count = sum(1 for g in games for r in g.rows if r.is_full_search)
+    quick_search_count = sum(1 for g in games for r in g.rows if not r.is_full_search)
+    total = full_search_count + quick_search_count
+    assert total > 0
+    assert 0.05 <= quick_search_count / total <= 0.55
+
+
+def test_kld_adaptive_in_cpp_path():
+    from training.selfplay_loop import GameLoopManager
+    from training.config import SelfPlayConfig
+
+    cfg = SelfPlayConfig(num_games=1, full_sims=400, quick_sims=100, min_sims=80,
+                         playout_cap_p=0.0, kld_threshold=0.05, use_kld_adaptive=True,
+                         max_moves=2, max_ply=2)
+
+    class HighKldGM:
+        def __init__(self):
+            self.plies = [0]
+            self._call = 0
+
+        def num_games(self):
+            return 1
+
+        def step_stats(self, targets):
+            class S:
+                terminal_status = 0
+                n_legal = 4
+                visits = [100, 0, 0, 0]
+                q_per_child = [0.5, 0, 0, 0]
+                best_child_idx = 0
+                root_wdl = (0.7, 0.2, 0.1)
+                raw_nn_policy = [0.25, 0.25, 0.25, 0.25] + [0.0] * 1854
+                raw_nn_value = (0.6, 0.3, 0.1)
+                raw_nn_mlh = 30.0
+                legal_moves_uci = ["a", "b", "c", "d"]
+                sims_done = 400
+            return [S()]
+
+        def apply_move(self, i, m):
+            self.plies[i] += 1
+
+        def get_fen(self, i):
+            return "x"
+
+        def get_ply(self, i):
+            return self.plies[i]
+
+    loop = GameLoopManager(HighKldGM(), cfg, rng_seed=0)
+    loop.step_once()  # full search; computes KLD
+    # Next target should be > min_sims (KLD between uniform raw and one-hot visits is high)
+    assert loop._target_sims[0] > cfg.min_sims
