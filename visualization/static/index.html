@@ -449,6 +449,12 @@ const lossChart = new Chart(lossCtx, {
                 borderWidth: 2, pointRadius: 3, pointHoverRadius: 5,
                 pointBackgroundColor: '#4ecdc4', tension: 0.3, fill: false
             },
+            {
+                label: 'MLH Loss', data: [],
+                borderColor: '#ffb84d', backgroundColor: 'rgba(255, 184, 77, 0.05)',
+                borderWidth: 2, pointRadius: 3, pointHoverRadius: 5,
+                pointBackgroundColor: '#ffb84d', tension: 0.3, fill: false
+            },
         ]
     },
     options: {
@@ -667,8 +673,8 @@ function buildLossText(gens) {
     var recent = gens.slice(-N);
     var startIdx = gens.length - N;
     var lines = [
-        '| Gen | Network | Games | Total | Policy | Value | Event |',
-        '|-----|---------|-------|-------|--------|-------|-------|'
+        '| Gen | Network | Games | Total | Policy | Value | MLH | Event |',
+        '|-----|---------|-------|-------|--------|-------|-----|-------|'
     ];
     recent.forEach(function(g, i) {
         var absIdx = startIdx + i;
@@ -687,6 +693,7 @@ function buildLossText(gens) {
             ' | ' + t.total_loss.toFixed(3) +
             ' | ' + t.policy_loss.toFixed(3) +
             ' | ' + t.value_loss.toFixed(3) +
+            ' | ' + (t.mlh_loss || 0).toFixed(3) +
             ' | ' + (events.join(', ') || '') + ' |');
     });
     if (gens.length > N) lines.unshift('(showing last ' + N + ' of ' + gens.length + ' generations)\n');
@@ -785,6 +792,7 @@ function updateDashboard(data) {
     lossChart.data.datasets[0].data = gens.map(function(g) { return g.training.total_loss; });
     lossChart.data.datasets[1].data = gens.map(function(g) { return g.training.policy_loss; });
     lossChart.data.datasets[2].data = gens.map(function(g) { return g.training.value_loss; });
+    lossChart.data.datasets[3].data = gens.map(function(g) { return g.training.mlh_loss || 0; });
 
     // Event markers: tier transitions (network size changed from prior gen)
     // and resumes (first gen after a --resume-from). Drawn as dashed vertical

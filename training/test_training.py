@@ -1157,7 +1157,7 @@ def test_policy_mask_in_loss():
     policy_target = torch.softmax(torch.randn(B, 1858), dim=1)
     value_target = torch.softmax(torch.randn(B, 3), dim=1)
     mask = torch.tensor([True, False, True, False])
-    total, p_loss, v_loss, sp_loss = compute_loss(
+    total, p_loss, v_loss, sp_loss, mlh_loss = compute_loss(
         policy_logits, value_logits, policy_target, value_target, policy_mask=mask,
     )
     # Policy loss should only be from positions 0 and 2
@@ -1232,12 +1232,12 @@ def test_soft_policy_loss():
     value_target[:, 0] = 1.0  # all wins
 
     # Without soft policy
-    loss_no_soft, p_no_soft, v1, sp_no = compute_loss(
+    loss_no_soft, p_no_soft, v1, sp_no, mlh1 = compute_loss(
         policy_logits, value_logits, policy_target, value_target,
         soft_policy_weight=0.0,
     )
     # With soft policy
-    loss_soft, p_soft, v2, sp_yes = compute_loss(
+    loss_soft, p_soft, v2, sp_yes, mlh2 = compute_loss(
         policy_logits, value_logits, policy_target, value_target,
         soft_policy_weight=2.0, soft_policy_temperature=4.0,
     )

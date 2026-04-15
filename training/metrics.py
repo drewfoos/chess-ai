@@ -28,6 +28,10 @@ class TrainingMetrics:
     # Auxiliary KataGo-style soft-policy CE, tracked separately so dashboards
     # don't conflate it with the hard policy CE in `policy_loss`.
     soft_policy_loss: float = 0.0
+    # Moves-left Huber loss (Lc0 convention: /20). Separated from `total_loss`
+    # so the dashboard can show how much of the total the MLH head owns — it
+    # can dwarf policy+value when targets aren't clamped.
+    mlh_loss: float = 0.0
 
 
 class MetricsLogger:

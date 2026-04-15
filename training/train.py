@@ -48,13 +48,15 @@ def compute_loss(
     soft_policy_weight: float = 0.2,
     soft_policy_temperature: float = 4.0,
     wdl_label_smoothing: float = 0.05,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    mlh_target_clamp: float = 150.0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Compute combined policy + value + moves-left + soft policy loss.
 
     Returns:
-        (total_loss, hard_policy_ce, value_loss, soft_policy_ce).
-        total_loss includes the soft-policy term weighted; hard_policy_ce and
-        soft_policy_ce are reported separately so metrics don't conflate them.
+        (total_loss, hard_policy_ce, value_loss, soft_policy_ce, mlh_loss).
+        total_loss includes the soft-policy and MLH terms. The sub-losses are
+        returned separately so metrics/dashboards don't conflate them. When
+        mlh_pred/mlh_target are omitted, mlh_loss is a zero scalar.
     """
     # Hard policy loss: cross-entropy against MCTS visit distribution.
     log_probs = F.log_softmax(policy_logits, dim=1)
@@ -88,12 +90,17 @@ def compute_loss(
 
     total = policy_loss + soft_policy_weight * soft_policy_loss + value_loss
 
-    # Moves-left loss: Huber loss (delta=10), scaled by 1/20 (Lc0 convention)
+    # Moves-left loss: Huber loss (delta=10), scaled by 1/20 (Lc0 convention).
+    # Clamp target at `mlh_target_clamp` (Lc0 ~150 plies): adjudicated draws
+    # can inflate targets to 1000+ plies, which makes the Huber term dwarf
+    # policy/value and forces the net to fit a cap artifact.
+    mlh_loss = torch.zeros((), device=policy_logits.device, dtype=policy_loss.dtype)
     if mlh_pred is not None and mlh_target is not None:
-        mlh_loss = F.huber_loss(mlh_pred, mlh_target, delta=10.0) / 20.0
+        mlh_target_clamped = mlh_target.clamp(max=mlh_target_clamp)
+        mlh_loss = F.huber_loss(mlh_pred, mlh_target_clamped, delta=10.0) / 20.0
         total = total + mlh_loss
 
-    return total, policy_loss, value_loss, soft_policy_loss
+    return total, policy_loss, value_loss, soft_policy_loss, mlh_loss
 
 
 def create_optimizer(
@@ -123,7 +130,7 @@ def train_step(
     optimizer.zero_grad()
 
     policy_logits, value_logits, _ = model(planes)
-    loss, _, _, _ = compute_loss(policy_logits, value_logits, policy_target, value_target)
+    loss, _, _, _, _ = compute_loss(policy_logits, value_logits, policy_target, value_target)
 
     loss.backward()
     optimizer.step()
@@ -195,7 +202,7 @@ def train(
 
             with torch.amp.autocast(device_type=device, enabled=use_amp):
                 policy_logits, value_logits, mlh_pred = model(planes)
-                loss, p_loss, v_loss, _sp_loss = compute_loss(
+                loss, p_loss, v_loss, _sp_loss, _mlh_loss = compute_loss(
                     policy_logits, value_logits, policies, values,
                     mlh_pred, mlh_target,
                 )

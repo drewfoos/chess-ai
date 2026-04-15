@@ -516,7 +516,7 @@ def play_games_batched(
     use_trt: bool = False,
     trt_engine_path: str = "",
     discard_pool=None,
-    continuous_flow: bool = False,
+    continuous_flow: bool = True,
 ) -> list[GameRecord]:
     """Play num_games concurrently using chess_mcts.GameManager + GameLoopManager.
 
@@ -825,7 +825,7 @@ def generate_games(
     use_trt: bool = False,
     trt_engine_path: str = "",
     discard_pool=None,
-    continuous_flow: bool = False,
+    continuous_flow: bool = True,
 ) -> int:
     """Generate self-play games and save as .npz file.
 
@@ -1173,6 +1173,7 @@ def _train_one_cycle(model, optimizer, dataloader, device, train_epochs, schedul
     policy_loss_sum = 0.0
     value_loss_sum = 0.0
     soft_policy_loss_sum = 0.0
+    mlh_loss_sum = 0.0
     num_batches = 0
 
     use_amp = (device == 'cuda')
@@ -1197,7 +1198,7 @@ def _train_one_cycle(model, optimizer, dataloader, device, train_epochs, schedul
             optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast(device_type=device, enabled=use_amp):
                 policy_logits, value_logits, mlh_pred = model(planes)
-                total_loss, policy_loss, value_loss, soft_policy_loss = compute_loss(
+                total_loss, policy_loss, value_loss, soft_policy_loss, mlh_loss = compute_loss(
                     policy_logits, value_logits, policy_target, value_target,
                     mlh_pred, mlh_target, policy_mask,
                 )
@@ -1218,9 +1219,13 @@ def _train_one_cycle(model, optimizer, dataloader, device, train_epochs, schedul
             policy_loss_sum += policy_loss.item()
             value_loss_sum += value_loss.item()
             soft_policy_loss_sum += soft_policy_loss.item()
+            mlh_loss_sum += mlh_loss.item()
             num_batches += 1
 
-    return total_loss_sum, policy_loss_sum, value_loss_sum, soft_policy_loss_sum, num_batches
+    return (
+        total_loss_sum, policy_loss_sum, value_loss_sum,
+        soft_policy_loss_sum, mlh_loss_sum, num_batches,
+    )
 
 
 def _derive_adjudication_rate(shard_path: str) -> float:
@@ -1335,7 +1340,7 @@ def training_loop(
     lr_milestones: list[int] | None = None,
     lr_gamma: float = 0.1,
     mcts_batch_size: int | None = None,
-    continuous_flow: bool = False,
+    continuous_flow: bool = True,
 ):
     """Full reinforcement learning training loop.
 
@@ -1699,7 +1704,7 @@ def training_loop(
 
         # 3. Train for train_epochs epochs (with mixed precision on CUDA)
         (total_loss_sum, policy_loss_sum, value_loss_sum,
-         soft_policy_loss_sum, num_batches) = _train_one_cycle(
+         soft_policy_loss_sum, mlh_loss_sum, num_batches) = _train_one_cycle(
             model, optimizer, dataloader, device, train_epochs, scheduler,
         )
 
@@ -1747,10 +1752,12 @@ def training_loop(
         avg_policy = policy_loss_sum / max(num_batches, 1)
         avg_value = value_loss_sum / max(num_batches, 1)
         avg_soft = soft_policy_loss_sum / max(num_batches, 1)
+        avg_mlh = mlh_loss_sum / max(num_batches, 1)
         print(f"Gen {gen} complete: {num_positions} positions, "
               f"{len(dataset)} training samples (window {window_start}-{gen})")
         print(f"  Loss: total={avg_total:.4f}, policy={avg_policy:.4f},"
-              f" value={avg_value:.4f}, soft_policy={avg_soft:.4f}")
+              f" value={avg_value:.4f}, soft_policy={avg_soft:.4f},"
+              f" mlh={avg_mlh:.4f}")
         print(f"  Time: {gen_time:.1f}s, Checkpoint: {checkpoint_path}")
         training_metrics = TrainingMetrics(
             total_loss=avg_total,
@@ -1759,6 +1766,7 @@ def training_loop(
             num_batches=num_batches,
             learning_rate=optimizer.param_groups[0]['lr'],
             soft_policy_loss=avg_soft,
+            mlh_loss=avg_mlh,
         )
         # Stage 10: operational metrics for the dashboard. Pool size reads 0
         # until a training_loop-owned DiscardPool is wired (future work);
@@ -1833,10 +1841,14 @@ def main():
                                   'TRT engine max_batch auto-scales to match.')
     loop_parser.add_argument(
         '--continuous-flow', dest='continuous_flow', action='store_true',
-        default=False,
-        help='Enable continuous-flow self-play: slots respawn as games '
-             'finish, eliminating batch-boundary tail latency. Default off '
-             'for initial rollout; flip to default once stable.',
+        default=True,
+        help='Continuous-flow self-play: slots respawn as games finish, '
+             'eliminating batch-boundary tail latency. (default: on)',
+    )
+    loop_parser.add_argument(
+        '--no-continuous-flow', dest='continuous_flow', action='store_false',
+        help='Legacy batch-boundary mode: wait for all slots to finish '
+             'before starting the next batch of games.',
     )
     loop_parser.add_argument('--use-trt', dest='use_trt', action='store_true', default=argparse.SUPPRESS, help='Export ONNX + build TensorRT engine per generation and run self-play through the TRT backend (default: on)')
     loop_parser.add_argument('--no-use-trt', dest='use_trt', action='store_false', default=argparse.SUPPRESS, help='Disable TensorRT backend (use LibTorch only)')
@@ -1938,7 +1950,7 @@ def main():
             lr_milestones=lr_milestones,
             lr_gamma=getattr(args, 'lr_gamma', 0.1),
             mcts_batch_size=getattr(args, 'mcts_batch_size', None),
-            continuous_flow=getattr(args, 'continuous_flow', False),
+            continuous_flow=getattr(args, 'continuous_flow', True),
         )
 
 

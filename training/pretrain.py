@@ -203,7 +203,7 @@ def pretrain(
 
         with torch.amp.autocast(device_type=device, enabled=use_amp):
             policy_logits, value_logits, mlh_pred = model(planes)
-            loss, p_loss, v_loss, _sp = compute_loss(
+            loss, p_loss, v_loss, _sp, _mlh = compute_loss(
                 policy_logits, value_logits, policies, values,
                 mlh_pred, mlh_target,
                 soft_policy_weight=soft_policy_weight,
