@@ -14,7 +14,7 @@ constexpr int PACKED_PLANES = 104;  // 8 history steps × 13 planes
 // Planes 0-103 : 8 time steps × 13 planes each
 //   0-5   : current player's pieces (pawn, knight, bishop, rook, queen, king)
 //   6-11  : opponent's pieces (same order)
-//   12    : repetition count (placeholder, always 0)
+//   12    : repetition indicator (1.0 if 2-fold repetition, else 0.0)
 // Planes 104-111 : constant feature planes
 //   104  : side to move (1.0 = white, 0.0 = black)
 //   105  : fullmove number / 200

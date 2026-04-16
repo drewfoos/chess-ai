@@ -38,6 +38,11 @@ public:
     bool in_check() const;
     Bitboard attackers_to(Square s, Bitboard occ) const;
 
+    // FIDE 5.2.2 (9.3 automatic): insufficient material to force mate. Covers
+    // K-K, K-K+minor, K+B-K+B with same-colored bishops. Does NOT include the
+    // K+N-K+N "only by helpmate" case (FIDE treats it as playable).
+    bool is_insufficient_material() const;
+
     void make_move(Move m, UndoInfo& undo);
     void unmake_move(Move m, const UndoInfo& undo);
 

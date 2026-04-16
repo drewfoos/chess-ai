@@ -130,6 +130,30 @@ void GameManager::expand_root(GameState& game) {
         return;
     }
 
+    // Non-mate draw conditions: insufficient material (FIDE 5.2.2) and
+    // 50-move rule (FIDE 9.3). Both stamp terminal_status=2 without NN eval.
+    // Without these, K-K and late-endgame shuffles just burn plies until
+    // the ply-cap adjudicates, producing garbage training data.
+    if (root_pos.is_insufficient_material() || root_pos.halfmove_clock() >= 100) {
+        game.search_complete = true;
+        game.raw_value = 0.0f;
+        game.root->set_terminal_status(2);
+        game.root_expanded = true;
+        return;
+    }
+
+    // Root-level repetition: if apply_move landed us in a 2-fold (game-level
+    // 3-fold), short-circuit before spending a search on a draw. Tree descent
+    // catches this mid-search (see is_two_fold_repetition below), but only
+    // after expand_root has already burned a full NN eval + simulation budget.
+    if (params_.two_fold_draw && game.history.is_repetition(2)) {
+        game.search_complete = true;
+        game.raw_value = 0.0f;
+        game.root->set_terminal_status(2);
+        game.root_expanded = true;
+        return;
+    }
+
     // Encode and evaluate root
     std::vector<float> encode_buf(neural::TENSOR_SIZE);
     neural::encode_position(game.history, encode_buf.data());
@@ -492,6 +516,14 @@ void GameManager::expand_node(Node* node, const Position& pos, const EvalResult&
         } else {
             node->set_terminal_status(2);
         }
+        return;
+    }
+
+    // Non-mate draws detected at leaf expansion so MCTS stops exploring past
+    // known-drawn subtrees. terminal_status=1 on the child means "STM loses"
+    // from the parent's perspective, which is wrong here — we want a draw.
+    if (pos.is_insufficient_material() || pos.halfmove_clock() >= 100) {
+        node->set_terminal_status(2);
         return;
     }
 
@@ -1005,16 +1037,17 @@ RootStats GameManager::build_root_stats(int idx) const {
     s.raw_nn_policy.assign(g.raw_policy.begin(), g.raw_policy.end());
     s.raw_nn_mlh = g.raw_mlh;
 
-    // Raw NN root value is scalar in [-1,+1] from current evaluator interface.
-    // Convert to a WDL placeholder with d=0 until the NN backend exposes true
-    // WDL head outputs through RawBatchEvaluator.
+    // Raw NN root value: synthesize WDL with draw probability (same
+    // formula as root_wdl below — see comment there for rationale).
     {
         float v = g.raw_value;
-        float w = 0.5f * (1.0f + v);
-        float l = 0.5f * (1.0f - v);
-        w = std::max(0.0f, std::min(1.0f, w));
-        l = std::max(0.0f, std::min(1.0f, l));
-        s.raw_nn_value = {w, 0.0f, l};
+        v = std::max(-1.0f, std::min(1.0f, v));
+        float w_raw = 0.5f * (1.0f + v);
+        float l_raw = 0.5f * (1.0f - v);
+        constexpr float k = 0.5f;
+        float d = k * (1.0f - v * v);
+        float scale = 1.0f - d;
+        s.raw_nn_value = {scale * w_raw, d, scale * l_raw};
     }
 
     if (!g.root) return s;
@@ -1048,16 +1081,26 @@ RootStats GameManager::build_root_stats(int idx) const {
     }
     s.best_child_idx = best_idx;
 
-    // Post-search root WDL placeholder: derive from root mean_value(). Same
-    // d=0 caveat as raw_nn_value above. When WDL head is wired through to
-    // RawBatchEvaluator, aggregate visit-weighted child WDL here instead.
+    // Post-search root WDL: synthesize draw probability from scalar Q.
+    // Without a real WDL head, d=0 pushes all mass to W/L extremes and
+    // makes WDL resign thresholds (resign_w=0.02, resign_l=0.98) fire
+    // on mildly negative evals. Fix: use Q^2 as "decisiveness" and
+    // allocate the remainder to draw, then rescale W/L proportionally.
+    // At Q=0 → d=0.5 (uncertain), at Q=±1 → d=0 (decisive).
+    // Resign fires at ~Q<-0.96, comparable to legacy threshold of -0.95.
     {
         float rq = g.root->mean_value();
-        float w = 0.5f * (1.0f + rq);
-        float l = 0.5f * (1.0f - rq);
-        w = std::max(0.0f, std::min(1.0f, w));
-        l = std::max(0.0f, std::min(1.0f, l));
-        s.root_wdl = {w, 0.0f, l};
+        rq = std::max(-1.0f, std::min(1.0f, rq));
+        float w_raw = 0.5f * (1.0f + rq);
+        float l_raw = 0.5f * (1.0f - rq);
+        // k=0.5: moderate draw synthesis. Equal positions get d≈0.5,
+        // clearly won/lost positions get d≈0.
+        constexpr float k = 0.5f;
+        float d = k * (1.0f - rq * rq);
+        float scale = 1.0f - d;
+        float w = scale * w_raw;
+        float l = scale * l_raw;
+        s.root_wdl = {w, d, l};
     }
 
     return s;

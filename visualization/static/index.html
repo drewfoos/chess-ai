@@ -607,7 +607,7 @@ async function loadGeneration() {
     data.games.forEach(function(g, i) {
         var opt = document.createElement('option');
         opt.value = i;
-        opt.textContent = 'Game ' + g.game_num + ': ' + g.result + ' (' + g.num_moves + ' moves)';
+        opt.textContent = 'Game ' + g.game_num + ': ' + g.result + ' (' + g.num_moves + ' plies)';
         gameSelect.appendChild(opt);
     });
     if (data.games.length > 0) loadGame();
@@ -627,7 +627,7 @@ function loadGame() {
     chess.reset();
     board.position('start');
     document.getElementById('game-info').textContent =
-        game.result + '  \u2014  ' + game.num_moves + ' moves  \u2014  ' + game.duration_s.toFixed(1) + 's';
+        game.result + '  \u2014  ' + game.num_moves + ' plies  \u2014  ' + game.duration_s.toFixed(1) + 's';
 
     if (playInterval) {
         clearInterval(playInterval);

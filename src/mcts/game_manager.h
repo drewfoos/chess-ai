@@ -25,8 +25,8 @@ namespace mcts {
 // Conventions:
 //  - q_per_child[i] is parent-POV (already flipped from the child's stored Q,
 //    which is from the child side-to-move's perspective).
-//  - root_wdl is parent-POV and derived from the root node's mean_value() (a
-//    placeholder until WDL flows through RawBatchEvaluator end-to-end).
+//  - root_wdl is parent-POV, synthesized from root mean_value() with draw
+//    probability d = 0.5*(1 - Q^2). Upgrade to true WDL head when available.
 //  - terminal_status: 0=ongoing, 1=win-for-side-to-move, -1=loss-for-stm, 2=draw.
 struct RootStats {
     int game_idx = 0;

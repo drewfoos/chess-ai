@@ -54,7 +54,7 @@ class SelfPlayConfig:
     kld_max_sims: int = 800                 # Maximum simulations (used when KLD is high)
     kld_threshold: float = 0.5              # KLD above this gets max sims
     syzygy_path: str | None = None          # Path to Syzygy tablebase files (None = disabled)
-    random_opening_fraction: float = 0.05   # Fraction of games with random openings
+    random_opening_fraction: float = 0.0    # Disabled for pretrained networks
     random_opening_moves: int = 8           # Max random moves for opening randomization
     opening_book_path: str | None = None    # File of starting FENs, one per line (None = disabled)
     opening_book_fraction: float = 0.5      # Fraction of games seeded from book FENs
@@ -70,6 +70,7 @@ class SelfPlayConfig:
     temp_floor: float = 0.4
     temp_decay_plies: int = 30
     use_kld_adaptive: bool = True
+    kld_max_sims: int = 800                  # Upper bound for KLD-adaptive visit count
     max_ply: int = 450
 
     # --- Stage 4 (Lc0-parity): WDL-aware resign + ply-cap adjudication ---

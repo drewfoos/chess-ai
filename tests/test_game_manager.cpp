@@ -69,9 +69,10 @@ TEST_F(GameManagerRootStats, StepStatsPopulatesFields) {
         EXPECT_LT(s.best_child_idx, s.n_legal);
         EXPECT_GT(s.sims_done, 0);
         EXPECT_EQ(static_cast<int>(s.raw_nn_policy.size()), neural::POLICY_SIZE);
-        // Raw NN value placeholder: value=0 -> (w=0.5, d=0, l=0.5).
-        EXPECT_NEAR(s.raw_nn_value[0], 0.5f, 1e-5f);
-        EXPECT_NEAR(s.raw_nn_value[2], 0.5f, 1e-5f);
+        // Raw NN value: value=0 -> (w=0.25, d=0.5, l=0.25) with draw synthesis.
+        EXPECT_NEAR(s.raw_nn_value[0], 0.25f, 1e-5f);
+        EXPECT_NEAR(s.raw_nn_value[1], 0.5f, 1e-5f);
+        EXPECT_NEAR(s.raw_nn_value[2], 0.25f, 1e-5f);
         // Stub returns mlh=20.
         EXPECT_NEAR(s.raw_nn_mlh, 20.0f, 1e-5f);
     }

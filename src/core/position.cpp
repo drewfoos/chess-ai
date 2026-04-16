@@ -193,6 +193,42 @@ bool Position::in_check() const {
     return is_attacked(king_square(side_to_move_), ~side_to_move_);
 }
 
+bool Position::is_insufficient_material() const {
+    // Any pawn, rook, or queen on either side → sufficient material.
+    if (bb_pieces_[WHITE][PAWN]   | bb_pieces_[BLACK][PAWN]
+      | bb_pieces_[WHITE][ROOK]   | bb_pieces_[BLACK][ROOK]
+      | bb_pieces_[WHITE][QUEEN]  | bb_pieces_[BLACK][QUEEN]) {
+        return false;
+    }
+
+    const int wn = popcount(bb_pieces_[WHITE][KNIGHT]);
+    const int bn = popcount(bb_pieces_[BLACK][KNIGHT]);
+    const int wb = popcount(bb_pieces_[WHITE][BISHOP]);
+    const int bb = popcount(bb_pieces_[BLACK][BISHOP]);
+    const int minors = wn + bn + wb + bb;
+
+    // K vs K.
+    if (minors == 0) return true;
+
+    // K+minor vs K (single knight or single bishop, either side).
+    if (minors == 1) return true;
+
+    // K+B vs K+B — draw only when both bishops sit on the same color complex.
+    if (wn == 0 && bn == 0 && wb == 1 && bb == 1) {
+        // Square color = (file + rank) & 1. lsb() picks the sole bishop.
+        Square ws = lsb(bb_pieces_[WHITE][BISHOP]);
+        Square bs = lsb(bb_pieces_[BLACK][BISHOP]);
+        int wc = (file_of(ws) + rank_of(ws)) & 1;
+        int bc = (file_of(bs) + rank_of(bs)) & 1;
+        return wc == bc;
+    }
+
+    // K+N+N vs K is technically drawable (can't be forced), but FIDE allows
+    // play to continue since mate is possible via opponent blundering. Leave
+    // it as non-terminal to match python-chess / stockfish behavior.
+    return false;
+}
+
 void Position::make_move(Move m, UndoInfo& undo) {
     // Save undo state
     undo.castling = castling_;

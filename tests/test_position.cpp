@@ -154,3 +154,61 @@ TEST_F(PositionTest, MakeUnmakePromotion) {
     pos.unmake_move(m, undo);
     EXPECT_EQ(pos.to_fen(), original_fen);
 }
+
+TEST_F(PositionTest, InsufficientMaterial_KvK) {
+    Position pos;
+    pos.set_fen("8/8/8/4k3/8/8/8/4K3 w - - 0 1");
+    EXPECT_TRUE(pos.is_insufficient_material());
+}
+
+TEST_F(PositionTest, InsufficientMaterial_KBvK) {
+    Position pos;
+    pos.set_fen("8/8/8/4k3/8/8/8/3BK3 w - - 0 1");
+    EXPECT_TRUE(pos.is_insufficient_material());
+}
+
+TEST_F(PositionTest, InsufficientMaterial_KNvK) {
+    Position pos;
+    pos.set_fen("8/8/8/4k3/8/8/8/3NK3 w - - 0 1");
+    EXPECT_TRUE(pos.is_insufficient_material());
+}
+
+TEST_F(PositionTest, InsufficientMaterial_KBvKB_SameColor) {
+    // Both bishops on light squares (c1 and f8 are both light... actually
+    // c1 = (2+0)=2 even=dark; f8 = (5+7)=12 even=dark. Both dark → draw).
+    Position pos;
+    pos.set_fen("5b2/8/8/4k3/8/8/8/2B1K3 w - - 0 1");
+    EXPECT_TRUE(pos.is_insufficient_material());
+}
+
+TEST_F(PositionTest, InsufficientMaterial_KBvKB_DifferentColor) {
+    // Bishops on opposite colors: c1 dark, f1 light. Not an automatic draw.
+    Position pos;
+    pos.set_fen("8/8/8/4k3/8/8/8/2b1KB2 w - - 0 1");
+    EXPECT_FALSE(pos.is_insufficient_material());
+}
+
+TEST_F(PositionTest, InsufficientMaterial_Pawns) {
+    Position pos;
+    pos.set_fen("8/8/8/4k3/8/4P3/8/4K3 w - - 0 1");
+    EXPECT_FALSE(pos.is_insufficient_material());
+}
+
+TEST_F(PositionTest, InsufficientMaterial_RookPresent) {
+    Position pos;
+    pos.set_fen("8/8/8/4k3/8/8/8/R3K3 w - - 0 1");
+    EXPECT_FALSE(pos.is_insufficient_material());
+}
+
+TEST_F(PositionTest, InsufficientMaterial_StartingPosition) {
+    Position pos;
+    pos.set_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+    EXPECT_FALSE(pos.is_insufficient_material());
+}
+
+TEST_F(PositionTest, InsufficientMaterial_TwoKnightsVsK) {
+    // K+N+N vs K: not forceable, but FIDE lets play continue.
+    Position pos;
+    pos.set_fen("8/8/8/4k3/8/8/8/2NNK3 w - - 0 1");
+    EXPECT_FALSE(pos.is_insufficient_material());
+}

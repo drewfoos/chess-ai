@@ -66,6 +66,7 @@ class _CppMCTSConfig:
             'mlh_weight': getattr(cfg, 'mlh_weight', 0.0),
             'mlh_cap': getattr(cfg, 'mlh_cap', 10.0),
             'mlh_q_threshold': getattr(cfg, 'mlh_q_threshold', 0.6),
+            'use_syzygy': True,
         }
 
 
@@ -132,25 +133,23 @@ SelfPlayConfig = _SelfPlayConfigBase
 class AdaptiveConfig:
     """Auto-tune sims/max_moves/games per generation for faster early training.
 
-    Defaults are tuned for RTX 3080 (10GB) + 8-core/16-thread CPU + 32GB RAM,
-    where self-play is NN-bound and the GPU can sustain cross-game batching
-    at ~120+ games/gen. On slower hardware, drop `full_games` toward 50.
+    Defaults are tuned for RTX 3080 (10GB) + 8-core/16-thread CPU + 32GB RAM
+    with a pretrained network (~1600 Elo from human games). The pretrained
+    network already plays reasonable chess, so early sims can be higher than
+    train-from-scratch settings to avoid garbage data.
     """
     enabled: bool = True
     early_until: int = 5       # Generations 1..early_until use early settings
-    mid_until: int = 20        # Generations (early_until+1)..mid_until interpolate
-    early_sims: int = 100
-    mid_sims: int = 200
+    mid_until: int = 15        # Generations (early_until+1)..mid_until interpolate
+    early_sims: int = 400
+    mid_sims: int = 400
     full_sims: int = 400
-    early_max_moves: int = 150
-    mid_max_moves: int = 300
+    early_max_moves: int = 300
+    mid_max_moves: int = 400
     full_max_moves: int = 512
-    # Games/gen stays high at full strength: training (~2-3 min/gen) is the
-    # bottleneck, not self-play (~90s for 120 games on RTX 3080), so extra
-    # games are nearly free and keep the sliding window full of fresh data.
-    early_games: int = 300
-    mid_games: int = 200
-    full_games: int = 150
+    early_games: int = 512
+    mid_games: int = 512
+    full_games: int = 512
 
 
 def get_gen_settings(gen: int, adaptive: AdaptiveConfig) -> tuple[int, int, int]:
@@ -570,6 +569,7 @@ def play_games_batched(
     # Plies per full move ≈ 2 * moves for temperature schedule (temperature_moves
     # is moves-based; opening_temp_plies is ply-based).
     opening_temp_plies = max(1, selfplay_config.temperature_moves * 2)
+    kld_max = max(1, min(selfplay_config.kld_max_sims, full_sims))
     loop_cfg = _replace_selfplay_cfg(
         selfplay_config,
         num_games=parallel_games,
@@ -577,18 +577,22 @@ def play_games_batched(
         quick_sims=quick_sims,
         min_sims=min_sims,
         playout_cap_p=playout_cap_p,
-        opening_temp=1.0,
-        opening_temp_plies=opening_temp_plies,
-        temp_floor=0.01,            # match legacy late-game quasi-greedy
-        temp_decay_plies=1,         # effectively hard cutoff at opening_temp_plies
+        opening_temp=0.6,
+        opening_temp_plies=16,      # ~8 moves of exploration, then decay
+        temp_floor=0.1,
+        temp_decay_plies=10,        # smooth decay over 5 moves after opening
         use_kld_adaptive=selfplay_config.kld_adaptive,
         kld_threshold=selfplay_config.kld_threshold,
+        kld_max_sims=kld_max,
         # max_ply converts from move-count to ply-count.
         max_ply=max(1, selfplay_config.max_moves * 2),
     )
 
     parallel_games = max(1, min(parallel_games, num_games))
     completed: list[GameRecord] = []
+
+    # Load opening book FENs once for all games (shared by both flow modes).
+    book_fens = _load_opening_book(selfplay_config.opening_book_path)
 
     if continuous_flow:
         # Continuous-flow mode: one manager, one pool, slots respawn as games
@@ -599,6 +603,7 @@ def play_games_batched(
         pool_cfg = _replace_selfplay_cfg(loop_cfg, num_games=parallel_games)
         pool = GamePoolManager(
             manager, pool_cfg, discard_pool=discard_pool, rng_seed=None,
+            opening_book_fens=book_fens,
         )
         pool_start = time.time()
 
@@ -629,7 +634,8 @@ def play_games_batched(
 
             # Rebind the loop cfg to match the actual game count in this batch.
             batch_cfg = _replace_selfplay_cfg(loop_cfg, num_games=batch)
-            loop = GameLoopManager(manager, batch_cfg, discard_pool=discard_pool, rng_seed=None)
+            loop = GameLoopManager(manager, batch_cfg, discard_pool=discard_pool, rng_seed=None,
+                                   opening_book_fens=book_fens)
             start_times = [time.time()] * batch
             loop_records: list[LoopGameRecord] = loop.run_until_all_complete()
 
@@ -892,7 +898,7 @@ def generate_games(
             all_game_lengths.append(len(record.planes))
             print(
                 f"  Game {completed_count}/{num_games}: "
-                f"{record.num_moves} moves, {record.result}, "
+                f"{record.num_moves} plies, {record.result}, "
                 f"{duration:.1f}s ({len(all_planes)} positions total)"
             )
 
@@ -942,7 +948,7 @@ def generate_games(
             total_positions = len(all_planes)
             print(
                 f"  Game {game_num + 1}/{num_games}: "
-                f"{record.num_moves} moves, {record.result}, "
+                f"{record.num_moves} plies, {record.result}, "
                 f"{game_time:.1f}s ({total_positions} positions total)"
             )
 
@@ -1121,6 +1127,7 @@ def _build_window_dataloader(
     window_start: int,
     window_end: int,
     batch_size: int,
+    adjudicated_weight: float = 0.5,
 ):
     """Build a DataLoader over gen_{start..end}.npz with diff-focus sampling.
 
@@ -1137,7 +1144,7 @@ def _build_window_dataloader(
     npz_paths = [p for p in npz_paths if os.path.exists(p)]
     if not npz_paths:
         return None, None
-    dataset = ChessDataset(npz_paths, mirror=True)
+    dataset = ChessDataset(npz_paths, mirror=True, adjudicated_weight=adjudicated_weight)
     # CPU-side bitboard unpack + plane assembly is the self-play loop's main
     # data-prep cost. With num_workers=0 the GPU sat idle between batches
     # (CPU at ~6% on a 16-thread box). 4 workers parallelize unpacking,
@@ -1538,6 +1545,9 @@ def training_loop(
     #   the game. Disabled until MLH outputs diverge (which requires training signal).
     _mcts_kwargs = dict(
         num_simulations=num_simulations,
+        policy_softmax_temperature=1.0,
+        dirichlet_alpha=0.3,
+        dirichlet_epsilon=0.15,     # lower noise for pretrained net (was 0.25)
         fpu_absolute_root=True,
         fpu_absolute_root_value=1.0,
         mlh_weight=0.03,
@@ -1567,18 +1577,19 @@ def training_loop(
         except Exception as e:
             print(f"[syzygy] in-search init failed ({e}); using Python rescore only")
 
-    # Opening book is plumbed through SelfPlayConfig but `play_games_batched`
-    # explicitly drops it on the C++ self-play path (Stage 6 hasn't restored it
-    # to GameLoopManager yet). Warn loudly so a `--opening-book` user knows the
-    # flag is currently a no-op rather than silently doing nothing.
     if opening_book_path:
-        print(f"[warn] --opening-book {opening_book_path} is currently a no-op on the "
-              "C++ self-play path (pending Stage-6 restore in selfplay_loop.py).")
+        fens = _load_opening_book(opening_book_path)
+        print(f"[opening-book] loaded {len(fens)} FENs from {opening_book_path}")
 
     # Default adaptive config if not provided
     if adaptive is None:
         adaptive = AdaptiveConfig(enabled=False, full_sims=num_simulations,
                                    full_max_moves=max_moves, full_games=games_per_gen)
+
+    # Stage 6: discard pool — positions rejected by the min-visit floor are
+    # pushed here and can seed future games for diversity.
+    from training.discard_pool import DiscardPool
+    discard_pool = DiscardPool(cap=10000, persist_path=os.path.join(output_dir, 'discard_pool.json'))
 
     # Stage 7: EMA-auto-tune the resign threshold from playthrough shards.
     # `selfplay_config.resign_w` is overwritten after each generation.
@@ -1683,6 +1694,7 @@ def training_loop(
             parallel_games=parallel_games,
             use_trt=use_trt,
             trt_engine_path=trt_engine_path,
+            discard_pool=discard_pool,
             continuous_flow=continuous_flow,
         )
 
@@ -1777,7 +1789,7 @@ def training_loop(
             if resign_calibrator.last_fp_rate is not None
             else 0.0
         )
-        pool_size = 0  # placeholder until training_loop owns a DiscardPool
+        pool_size = discard_pool.size() if discard_pool is not None else 0
         metrics_logger.save_generation(
             generation=gen,
             num_positions=num_positions,
@@ -1813,26 +1825,29 @@ def main():
 
     # Loop subcommand
     loop_parser = subparsers.add_parser('loop', help='Run full RL training loop')
-    loop_parser.add_argument('--generations', type=int, default=10)
+    loop_parser.add_argument('--generations', type=int, default=100)
     loop_parser.add_argument('--games-per-gen', type=int, default=512)
-    loop_parser.add_argument('--train-epochs', type=int, default=2)
+    loop_parser.add_argument('--train-epochs', type=int, default=1)
     loop_parser.add_argument('--batch-size', type=int, default=2048)
-    loop_parser.add_argument('--lr', type=float, default=1e-3)
-    loop_parser.add_argument('--simulations', type=int, default=400)
+    loop_parser.add_argument('--lr', type=float, default=2e-3)
+    loop_parser.add_argument('--weight-decay', type=float, default=1e-4)
+    loop_parser.add_argument('--simulations', type=int, default=600)
     loop_parser.add_argument('--blocks', type=int, default=10)
     loop_parser.add_argument('--filters', type=int, default=128)
     loop_parser.add_argument('--window-size', type=int, default=5)
     loop_parser.add_argument('--output-dir', type=str, default='models/current_run')
     loop_parser.add_argument('--device', type=str, default='auto')
     loop_parser.add_argument('--max-moves', type=int, default=512)
+    loop_parser.add_argument('--resign-threshold', type=float, default=-0.95,
+                             help='Legacy scalar resign threshold (Python MCTS fallback path)')
     loop_parser.add_argument('--syzygy', type=str, default=None, help='Path to Syzygy tablebase files')
     loop_parser.add_argument('--opening-book', type=str, default=None, help='Path to opening book FEN file (one FEN per line)')
     loop_parser.add_argument('--opening-book-fraction', type=float, default=0.5, help='Fraction of games seeded from book')
     loop_parser.add_argument('--adaptive', action='store_true', default=argparse.SUPPRESS, help='Enable adaptive settings per generation')
     loop_parser.add_argument('--no-adaptive', dest='adaptive', action='store_false', default=argparse.SUPPRESS)
-    loop_parser.add_argument('--early-sims', type=int, default=100, help='Simulations for early generations')
-    loop_parser.add_argument('--early-max-moves', type=int, default=150, help='Max moves for early generations')
-    loop_parser.add_argument('--early-games', type=int, default=200, help='Games per early generation')
+    loop_parser.add_argument('--early-sims', type=int, default=400, help='Simulations for early generations')
+    loop_parser.add_argument('--early-max-moves', type=int, default=300, help='Max moves for early generations')
+    loop_parser.add_argument('--early-games', type=int, default=512, help='Games per early generation')
     loop_parser.add_argument('--resume-from', type=str, default=None, help='Resume from a checkpoint file (e.g. selfplay_output/checkpoints/model_gen_5.pt)')
     loop_parser.add_argument('--parallel-games', type=int, default=128, help='Concurrent self-play games (C++ GameManager cross-game batching)')
     loop_parser.add_argument('--mcts-batch-size', type=int, default=256,
@@ -1931,6 +1946,7 @@ def main():
             train_epochs=args.train_epochs,
             batch_size=args.batch_size,
             lr=args.lr,
+            weight_decay=getattr(args, 'weight_decay', 1e-4),
             num_simulations=args.simulations,
             blocks=args.blocks,
             filters=args.filters,
@@ -1938,6 +1954,7 @@ def main():
             output_dir=args.output_dir,
             device=args.device,
             max_moves=args.max_moves,
+            resign_threshold=getattr(args, 'resign_threshold', -0.95),
             syzygy_path=getattr(args, 'syzygy', None),
             opening_book_path=getattr(args, 'opening_book', None),
             opening_book_fraction=getattr(args, 'opening_book_fraction', 0.5),

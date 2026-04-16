@@ -89,6 +89,22 @@ def _apply_uci_to_fen(fen, uci_move):
         return None
 
 
+def _random_opening_moves(max_moves, rng):
+    """Generate a short sequence of random legal moves from startpos."""
+    import chess
+    board = chess.Board()
+    moves = []
+    n = rng.randint(1, max_moves)
+    for _ in range(n):
+        legal = list(board.legal_moves)
+        if not legal:
+            break
+        m = rng.choice(legal)
+        moves.append(m.uci())
+        board.push(m)
+    return moves
+
+
 def _resign_check(cfg, root_wdl, ply, is_playthrough):
     """Decide whether to resign based on root WDL.
 
@@ -135,10 +151,12 @@ class GamePoolManager:
         waste at batch boundaries.
     """
 
-    def __init__(self, game_manager, cfg, discard_pool=None, rng_seed=None):
+    def __init__(self, game_manager, cfg, discard_pool=None, rng_seed=None,
+                 opening_book_fens=None):
         self.gm = game_manager
         self.cfg = cfg
         self.discard_pool = discard_pool
+        self.opening_book_fens = opening_book_fens or []
         self.rng = random.Random(rng_seed)
         self.n = game_manager.num_games()
         self._records = [GameRecord() for _ in range(self.n)]
@@ -166,7 +184,8 @@ class GamePoolManager:
         if cfg.use_kld_adaptive and last_was_full:
             kld = self._last_kld[game_idx]
             ratio = max(0.0, min(1.0, kld / cfg.kld_threshold))
-            return int(cfg.min_sims + ratio * (cfg.full_sims - cfg.min_sims))
+            max_sims = getattr(cfg, 'kld_max_sims', cfg.full_sims)
+            return int(cfg.min_sims + ratio * (max_sims - cfg.min_sims))
         return cfg.full_sims
 
     def _min_visit_floor(self, i):
@@ -321,6 +340,12 @@ class GamePoolManager:
         completed flag, and the per-slot GameRecord. Uses
         chess_mcts.GameManager.init_game_from_fen which allocates a fresh
         root Node for this slot without resetting the shared NodePool.
+
+        Starting FEN selection priority:
+          1. Discard pool (cfg.discarded_start_chance)
+          2. Opening book (if provided)
+          3. Random opening (cfg.random_opening_fraction)
+          4. Standard startpos
         """
         cfg = self.cfg
         self._records[i] = GameRecord()
@@ -331,7 +356,27 @@ class GamePoolManager:
         self._records[i].was_playthrough = (
             self.rng.random() < pt_frac if pt_frac > 0 else False
         )
-        self.gm.init_game_from_fen(i, _STARTPOS_FEN, [], cfg.full_sims)
+        # Pick starting FEN: discard pool → opening book → random opening → startpos
+        fen = _STARTPOS_FEN
+        moves: list[str] = []
+        disc_chance = float(getattr(cfg, "discarded_start_chance", 0.0) or 0.0)
+        if self.discard_pool is not None and disc_chance > 0 and self.rng.random() < disc_chance:
+            min_pieces = int(getattr(cfg, "discarded_min_pieces", 16))
+            for _ in range(3):
+                candidate = self.discard_pool.pop()
+                if candidate is None:
+                    break
+                piece_count = sum(1 for ch in candidate.split()[0] if ch.isalpha())
+                if piece_count >= min_pieces:
+                    fen = candidate
+                    break
+        if fen == _STARTPOS_FEN and self.opening_book_fens:
+            fen = self.rng.choice(self.opening_book_fens)
+        rand_frac = float(getattr(cfg, "random_opening_fraction", 0.0) or 0.0)
+        if fen == _STARTPOS_FEN and rand_frac > 0 and self.rng.random() < rand_frac:
+            rand_moves = int(getattr(cfg, "random_opening_moves", 8))
+            moves = _random_opening_moves(rand_moves, self.rng)
+        self.gm.init_game_from_fen(i, fen, moves, cfg.full_sims)
 
     def _finalize_game(self, i, terminal_status, adjudicated):
         rec = self._records[i]
