@@ -526,12 +526,19 @@ def _normalize(visits):
 # behavior-preserving contract and will be swapped for true WDL in the
 # schema-v2 writer.
 def _q_to_wdl(q):
-    """Approximate WDL from scalar Q in [-1, 1]."""
+    """Approximate WDL from scalar Q in [-1, 1].
+
+    Uses the same draw-synthesis formula as C++ game_manager.cpp:
+    d = 0.5*(1-Q²), then W and L are scaled proportionally.
+    This keeps Python-side played_eval/best_eval consistent with
+    root_wdl from C++, which the resign calibrator depends on.
+    """
     q = max(-1.0, min(1.0, q))
-    w = max(0.0, q)
-    l = max(0.0, -q)
-    d = 1.0 - w - l
-    return (w, d, l)
+    w_raw = 0.5 * (1.0 + q)
+    l_raw = 0.5 * (1.0 - q)
+    d = 0.5 * (1.0 - q * q)
+    scale = 1.0 - d
+    return (scale * w_raw, d, scale * l_raw)
 
 
 # Backward-compatibility alias. Existing callers (tests, play_games_batched's
