@@ -112,22 +112,39 @@ def export_onnx(
             model.train()
 
 
-def export_from_checkpoint(checkpoint_path: str, output_path: str):
-    """Load a training checkpoint and export to TorchScript."""
+def export_from_checkpoint(checkpoint_path: str, output_path: str, fmt: str = 'torchscript'):
+    """Load a training checkpoint and export to TorchScript or ONNX.
+
+    Handles both pretrain (`step`/`pretrain`) and RL (`epoch`/`loss`/`generation`)
+    checkpoint formats.
+    """
     checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
     config = checkpoint['config']
     model = ChessNetwork(config)
     model.load_state_dict(checkpoint['model_state_dict'])
 
-    export_torchscript(model, output_path)
+    if fmt == 'onnx':
+        export_onnx(model, output_path)
+        print(f"Exported ONNX model to {output_path}")
+    else:
+        export_torchscript(model, output_path)
     print(f"  Config: {config.num_blocks} blocks, {config.num_filters} filters")
-    print(f"  Epoch: {checkpoint['epoch']}, Loss: {checkpoint['loss']:.4f}")
+    if 'step' in checkpoint:
+        print(f"  Pretrain step: {checkpoint['step']}")
+    if 'epoch' in checkpoint:
+        print(f"  Epoch: {checkpoint['epoch']}")
+    if 'loss' in checkpoint:
+        print(f"  Loss: {checkpoint['loss']:.4f}")
+    if 'generation' in checkpoint:
+        print(f"  Generation: {checkpoint['generation']}")
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Export chess network to TorchScript')
+    parser = argparse.ArgumentParser(description='Export chess network to TorchScript or ONNX')
     parser.add_argument('--checkpoint', required=True, help='Training checkpoint .pt file')
-    parser.add_argument('--output', required=True, help='Output TorchScript .pt file')
+    parser.add_argument('--output', required=True, help='Output file (.pt for torchscript, .onnx for onnx)')
+    parser.add_argument('--format', choices=['torchscript', 'onnx'], default='torchscript',
+                        help='Export format (default: torchscript)')
     args = parser.parse_args()
 
-    export_from_checkpoint(args.checkpoint, args.output)
+    export_from_checkpoint(args.checkpoint, args.output, fmt=args.format)

@@ -3,8 +3,8 @@ from dataclasses import dataclass
 
 @dataclass
 class NetworkConfig:
-    num_blocks: int = 10
-    num_filters: int = 128
+    num_blocks: int = 20
+    num_filters: int = 256
     se_ratio: int = 4
     input_planes: int = 112
     policy_size: int = 1858

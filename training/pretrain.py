@@ -88,9 +88,10 @@ def pretrain(
     filters: int = 192,
     epochs: int = 1,
     batch_size: int = 1024,
-    lr: float = 1e-3,
+    lr: float = 5e-4,
     weight_decay: float = 1e-4,
-    warmup_steps: int = 500,
+    warmup_steps: int = 1000,
+    grad_clip: float = 1.0,
     lr_milestones: list[int] | None = None,
     lr_gamma: float = 0.1,
     shards_per_group: int = 4,
@@ -104,7 +105,12 @@ def pretrain(
     """Run supervised pretraining over every `shard_*.npz` under `shard_dir`."""
     if device == 'auto':
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    # BF16 AMP (not FP16): the attention policy head can produce logits
+    # exceeding FP16's 65504 ceiling mid-training, which turns log_softmax
+    # into NaN. BF16 has FP32's exponent range, same tensor-core speed on
+    # Ampere (RTX 3080), and doesn't need GradScaler.
     use_amp = (device == 'cuda')
+    amp_dtype = torch.bfloat16
 
     # Recursive so Phase B's orchestrator layout (part_NN/shard_*.npz) works
     # alongside Phase A's flat layout.
@@ -150,7 +156,6 @@ def pretrain(
         scheduler = warmup
         print(f"LR: warmup {warmup_steps} steps (no step decay)")
 
-    scaler = torch.amp.GradScaler(enabled=use_amp)
     os.makedirs(os.path.dirname(out_checkpoint) or '.', exist_ok=True)
 
     streaming = StreamingShardDataset(
@@ -201,7 +206,7 @@ def pretrain(
         model.train()
         optimizer.zero_grad(set_to_none=True)
 
-        with torch.amp.autocast(device_type=device, enabled=use_amp):
+        with torch.amp.autocast(device_type=device, dtype=amp_dtype, enabled=use_amp):
             policy_logits, value_logits, mlh_pred = model(planes)
             loss, p_loss, v_loss, _sp, _mlh = compute_loss(
                 policy_logits, value_logits, policies, values,
@@ -209,17 +214,10 @@ def pretrain(
                 soft_policy_weight=soft_policy_weight,
             )
 
-        scaler.scale(loss).backward()
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
-        prev_scale = scaler.get_scale()
-        scaler.step(optimizer)
-        scaler.update()
-        # Only advance the LR scheduler if the optimizer actually stepped —
-        # GradScaler skips the step on the very first batch (no scale yet) and
-        # on inf/nan gradients, lowering the scale.
-        if scaler.get_scale() >= prev_scale:
-            scheduler.step()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
+        optimizer.step()
+        scheduler.step()
 
         step += 1
         running_loss += loss.item()
@@ -262,13 +260,17 @@ def main():
     parser = argparse.ArgumentParser(description='Supervised pretraining on .npz shards')
     parser.add_argument('--shard-dir', required=True, help='Directory of shard_*.npz files')
     parser.add_argument('--out', required=True, help='Output checkpoint path (.pt)')
-    parser.add_argument('--blocks', type=int, default=14)
-    parser.add_argument('--filters', type=int, default=192)
+    parser.add_argument('--blocks', type=int, default=20)
+    parser.add_argument('--filters', type=int, default=256)
     parser.add_argument('--epochs', type=int, default=1)
     parser.add_argument('--batch-size', type=int, default=1024)
-    parser.add_argument('--lr', type=float, default=1e-3)
+    parser.add_argument('--lr', type=float, default=5e-4)
     parser.add_argument('--weight-decay', type=float, default=1e-4)
-    parser.add_argument('--warmup-steps', type=int, default=500)
+    parser.add_argument('--warmup-steps', type=int, default=1000)
+    parser.add_argument('--grad-clip', type=float, default=1.0,
+                        help='Max gradient norm. Lower = more stable under AMP/FP16, '
+                             'but slower to converge. 1.0 is the standard AdamW default; '
+                             'raise to 5.0-10.0 if you see the grad scaler warning a lot.')
     parser.add_argument('--lr-milestones', type=str, default='',
                         help='Comma-separated step numbers for LR decay, e.g. "50000,100000"')
     parser.add_argument('--lr-gamma', type=float, default=0.1)
@@ -297,6 +299,7 @@ def main():
         lr=args.lr,
         weight_decay=args.weight_decay,
         warmup_steps=args.warmup_steps,
+        grad_clip=args.grad_clip,
         lr_milestones=milestones,
         lr_gamma=args.lr_gamma,
         shards_per_group=args.shards_per_group,

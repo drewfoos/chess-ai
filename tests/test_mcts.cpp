@@ -98,8 +98,12 @@ TEST_F(MCTSTest, PUCTSelectsHighPriorUnvisited) {
 
 TEST_F(MCTSTest, PUCTBalancesExplorationExploitation) {
     mcts::Node root;
+    // 3 root visits. PUCT numerator is sqrt(max(N-1, 1)) = sqrt(2) — the
+    // "minus one" matches Lc0's formula (search.cc:1720) and dampens early
+    // exploration bonuses.
     root.update(0.0f);
-    root.update(0.0f); // 2 root visits
+    root.update(0.0f);
+    root.update(0.0f);
 
     Move moves[] = {Move(E2, E4, FLAG_DOUBLE_PUSH), Move(D2, D4, FLAG_DOUBLE_PUSH)};
     float priors[] = {0.5f, 0.5f};
@@ -117,7 +121,7 @@ TEST_F(MCTSTest, PUCTBalancesExplorationExploitation) {
     float fpu = 0.0f;
     mcts::Node* selected = root.select_child(c_puct, fpu);
 
-    // With c_puct=2.5, root_visits=2, sqrt(2)=1.414:
+    // With c_puct=2.5, root_visits=3, sqrt(3-1)=1.414:
     // E4: Q=0.8 + 2.5 * 0.5 * 1.414 / (1+1) = 0.8 + 0.884 = 1.684
     // D4: Q=0.0 + 2.5 * 0.5 * 1.414 / (1+0) = 0.0 + 1.768 = 1.768
     // D4 wins — unvisited node gets explored

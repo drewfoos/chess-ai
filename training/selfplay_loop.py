@@ -49,7 +49,7 @@ class GameRecord:
     final_wdl: tuple = (0.0, 0.0, 0.0)  # stamped at game end
     adjudicated: bool = False
     was_playthrough: bool = False
-    # Terminal status from the C++ side (+1 = STM wins, -1 = STM loses, 2 = draw,
+    # Terminal status from the C++ side (+1 = STM loses, -1 = STM wins, 2 = draw,
     # 0 = still running when finalize was called without a real terminal).
     terminal_status: int = 0
 
@@ -74,6 +74,9 @@ def _temperature_sample(visits, tau, rng):
 def _apply_uci_to_fen(fen, uci_move):
     """Return the FEN that results from playing `uci_move` in `fen`, or None.
 
+    Rejects positions that are terminal or near-terminal (fewer than 5 legal
+    moves) so the discard pool doesn't seed games that end immediately.
+
     Tolerant of malformed inputs — returns None rather than raising so the
     discard-pool push is best-effort and never breaks the self-play loop.
     """
@@ -84,6 +87,12 @@ def _apply_uci_to_fen(fen, uci_move):
     try:
         b = chess.Board(fen)
         b.push_uci(uci_move)
+        if b.is_game_over(claim_draw=True):
+            return None
+        # Reject near-terminal positions — too few legal moves to produce a
+        # meaningful game.
+        if len(list(b.legal_moves)) < 5:
+            return None
         return b.fen()
     except Exception:
         return None
@@ -401,13 +410,15 @@ class GamePoolManager:
             else:
                 rec.final_wdl = (0.0, 1.0, 0.0)
         else:
-            # Real terminal (STM perspective at the terminal position).
+            # Real terminal. Convention: +1 = STM loses, -1 = STM wins.
             if terminal_status == 2:
                 rec.final_wdl = (0.0, 1.0, 0.0)
             elif terminal_status == 1:
-                rec.final_wdl = (1.0, 0.0, 0.0)
-            else:
+                # STM at terminal loses.
                 rec.final_wdl = (0.0, 0.0, 1.0)
+            else:
+                # STM at terminal wins (or resign: resigning side loses).
+                rec.final_wdl = (1.0, 0.0, 0.0)
         self._completed[i] = True
 
     def run_until_all_complete(self):

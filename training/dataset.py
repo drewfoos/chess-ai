@@ -72,6 +72,30 @@ def _build_byte_bitreverse_table() -> np.ndarray:
 _BYTE_REVERSE = _build_byte_bitreverse_table()
 
 
+def packed_to_dense_112(bb, stm, castling: int, rule50: int, fullmove: int) -> np.ndarray:
+    """Expand a C++ ``chess_mcts.encode_packed`` tuple into the dense (112, 8, 8)
+    tensor produced by ``encode_board``.
+
+    This is the single projection that glues the C++ encoder (self-play
+    inference, shard production) to the dense format the legacy Python shard
+    writer consumes. Parity with ``encode_board`` is enforced by
+    ``test_encoder_parity_*`` — if you change either side, update the other or
+    the contract tests will fail.
+    """
+    dense = np.zeros((112, 8, 8), dtype=np.float32)
+    dense[:104] = unpack_bitboards(np.asarray(bb, dtype=np.uint64))
+    if stm:
+        dense[104] = 1.0
+    dense[105] = float(fullmove) / 200.0
+    if castling & 0x1: dense[106] = 1.0
+    if castling & 0x2: dense[107] = 1.0
+    if castling & 0x4: dense[108] = 1.0
+    if castling & 0x8: dense[109] = 1.0
+    dense[110] = float(rule50) / 100.0
+    dense[111] = 1.0
+    return dense
+
+
 def unpack_bitboards(bb: np.ndarray) -> np.ndarray:
     """Expand 104 uint64 bitboards into a dense (104, 8, 8) float32 tensor.
 

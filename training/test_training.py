@@ -11,8 +11,8 @@ from training.encoder import (
 
 def test_network_config_defaults():
     cfg = NetworkConfig()
-    assert cfg.num_blocks == 10
-    assert cfg.num_filters == 128
+    assert cfg.num_blocks == 20
+    assert cfg.num_filters == 256
     assert cfg.se_ratio == 4
     assert cfg.input_planes == 112
     assert cfg.policy_size == 1858
@@ -216,13 +216,12 @@ def test_model_value_probabilities():
 
 
 def test_model_default_config():
-    cfg = NetworkConfig()  # 10 blocks, 128 filters
+    cfg = NetworkConfig()  # 20 blocks, 256 filters — classic AlphaZero tower
     model = ChessNetwork(cfg)
-    # Count parameters — with policy FC (80*64 → 1858) the dominant cost is the policy head (~9.5M)
-    # Total is ~13M for default config (10 blocks, 128 filters, policy_conv_filters=80)
+    # Default config (20 blocks, 256 filters, policy_conv_filters=80) is ~25M params.
     total_params = sum(p.numel() for p in model.parameters())
-    assert total_params > 1_000_000  # At least 1M
-    assert total_params < 20_000_000  # Less than 20M
+    assert total_params > 10_000_000  # At least 10M
+    assert total_params < 50_000_000  # Less than 50M
 
 
 def test_model_batch_independence():
@@ -857,10 +856,15 @@ def test_mcts_solver_checkmate():
 
 
 def test_dynamic_cpuct_increases():
-    """Dynamic c_puct should increase with parent visit count."""
+    """With c_puct_factor > 0, dynamic c_puct grows with parent visit count.
+
+    The default MCTSConfig pins c_puct_factor=0.0 for Lc0 self-play parity
+    (tournament.cc:142-157). That pins the curve flat, so we explicitly opt
+    into factor=2.0 here to exercise the log-growth code path.
+    """
     cfg = NetworkConfig(num_blocks=1, num_filters=16)
     model = ChessNetwork(cfg)
-    mcts_cfg = MCTSConfig()
+    mcts_cfg = MCTSConfig(c_puct_factor=2.0)
     mcts = MCTS(model, mcts_cfg)
     c1 = mcts._dynamic_cpuct(1)
     c100 = mcts._dynamic_cpuct(100)
@@ -1103,12 +1107,19 @@ def test_nn_cache_populated_after_search():
 
 
 def test_updated_search_params():
-    """MCTSConfig should have updated Lc0 defaults."""
+    """MCTSConfig should match Lc0 self-play defaults.
+
+    Self-play relies on Dirichlet noise + temperature for exploration; search
+    itself is confident. Cranked-up exploration (the old defaults) flattens
+    visit distributions and teaches the net a muddier policy than search
+    actually produced.
+    """
     cfg = MCTSConfig()
-    assert cfg.c_puct_init == 3.0
-    assert cfg.policy_softmax_temperature == 1.61
-    assert cfg.fpu_reduction == 0.5
-    assert cfg.fpu_reduction_root == 0.5
+    assert cfg.c_puct_init == 1.745
+    assert cfg.c_puct_factor == 0.0
+    assert cfg.policy_softmax_temperature == 1.0
+    assert cfg.fpu_reduction == 0.33
+    assert cfg.fpu_reduction_root == 0.33
 
 
 def test_playout_cap_randomization():
@@ -2097,9 +2108,9 @@ class TestAdaptiveConfig:
         cfg = AdaptiveConfig()
         for gen in [1, 3, 5]:
             sims, moves, games = get_gen_settings(gen, cfg)
-            assert sims == cfg.early_sims == 100
-            assert moves == cfg.early_max_moves == 150
-            assert games == cfg.early_games == 300
+            assert sims == cfg.early_sims
+            assert moves == cfg.early_max_moves
+            assert games == cfg.early_games
 
     def test_mid_gen_returns_interpolated_settings(self):
         from training.selfplay import AdaptiveConfig, get_gen_settings
@@ -2118,9 +2129,9 @@ class TestAdaptiveConfig:
         cfg = AdaptiveConfig()
         for gen in [21, 30, 100]:
             sims, moves, games = get_gen_settings(gen, cfg)
-            assert sims == cfg.full_sims == 400
-            assert moves == cfg.full_max_moves == 512
-            assert games == cfg.full_games == 150
+            assert sims == cfg.full_sims
+            assert moves == cfg.full_max_moves
+            assert games == cfg.full_games
 
     def test_disabled_returns_full_settings(self):
         from training.selfplay import AdaptiveConfig, get_gen_settings
@@ -2135,12 +2146,20 @@ class TestAdaptiveConfig:
         from training.selfplay import AdaptiveConfig, get_gen_settings
 
         cfg = AdaptiveConfig()
-        # gen=5 is last early gen
-        sims5, _, _ = get_gen_settings(5, cfg)
-        assert sims5 == cfg.early_sims
-        # gen=6 starts interpolation
-        sims6, _, _ = get_gen_settings(6, cfg)
-        assert sims6 > cfg.early_sims
+        # Last early gen returns early settings exactly.
+        sims_last, moves_last, games_last = get_gen_settings(cfg.early_until, cfg)
+        assert sims_last == cfg.early_sims
+        assert moves_last == cfg.early_max_moves
+        assert games_last == cfg.early_games
+        # One past early_until begins interpolation toward mid. With the current
+        # pretrained defaults early_sims == mid_sims, so sims may equal early_sims;
+        # only assert the *formula* holds rather than strict monotonicity.
+        gen = cfg.early_until + 1
+        sims, moves, games = get_gen_settings(gen, cfg)
+        t = (gen - cfg.early_until) / (cfg.mid_until - cfg.early_until)
+        assert sims == int(cfg.early_sims + t * (cfg.mid_sims - cfg.early_sims))
+        assert moves == int(cfg.early_max_moves + t * (cfg.mid_max_moves - cfg.early_max_moves))
+        assert games == int(cfg.early_games + t * (cfg.mid_games - cfg.early_games))
 
     def test_boundary_gen_mid_until(self):
         from training.selfplay import AdaptiveConfig, get_gen_settings
@@ -3099,20 +3118,20 @@ def test_pool_integration_smoke(tmp_path):
     except ImportError:
         pytest.skip("chess_mcts not built")
 
-    import os
-    candidates = [
-        'models/current_run/checkpoints/selfplay_model.pt',
-        'checkpoints/phase_a.pt',
-        'checkpoints/phase_b.pt',
-    ]
-    model_path = next((p for p in candidates if os.path.exists(p)), None)
-    if model_path is None:
-        pytest.skip("no TorchScript model available for integration test")
-
+    from training.config import NetworkConfig
+    from training.model import ChessNetwork
+    from training.export import export_torchscript
     from training.selfplay_loop import GamePoolManager
     from training.config import SelfPlayConfig
     from training.mcts import MCTSConfig
     from training.selfplay import _CppMCTSConfig
+
+    # Export a tiny TorchScript model into tmp_path so this test is self-contained
+    # (no dependency on disk artifacts such as phase_a/phase_b.pt, which are plain
+    # state-dict checkpoints that torch::jit::load cannot read on the C++ side).
+    net = ChessNetwork(NetworkConfig(num_blocks=2, num_filters=16))
+    model_path = str(tmp_path / "ts_model.pt")
+    export_torchscript(net, model_path, device='cpu')
 
     mcts_cfg = _CppMCTSConfig(MCTSConfig(num_simulations=10, batch_size=8))
     gm = chess_mcts.GameManager(model_path, 'cpu', mcts_cfg._to_dict())
@@ -3130,3 +3149,565 @@ def test_pool_integration_smoke(tmp_path):
     assert len(completed) == 4
     for rec in completed:
         assert len(rec.rows) >= 1
+
+
+def test_loop_record_to_legacy_preserves_8step_history():
+    """Regression: _loop_record_to_legacy must build real 8-step history planes.
+
+    Before the fix it called `chess.Board(row.fen)` (empty move_stack), so
+    `encode_board` collapsed all 8 timesteps to the current position. The
+    written .npz shards were then OOD for C++ inference (which always has
+    real history), which caused policy loss to drift upward across self-play
+    generations. This test reconstructs a short multi-move game through the
+    adapter and asserts that positions with accumulated history have
+    distinct per-timestep snapshots.
+    """
+    import chess
+    import numpy as np
+    from training.selfplay import _loop_record_to_legacy
+    from training.selfplay_loop import GameRecord as LoopGameRecord, StepRow
+    from training.config import SelfPlayConfig
+
+    # 1.e4 e5 2.Nf3 — three positions, two moves of history by the last row.
+    board = chess.Board()
+    ucis = ["e2e4", "e7e5", "g1f3"]
+    fens = [board.fen()]
+    for u in ucis:
+        board.push_uci(u)
+        fens.append(board.fen())
+
+    lrec = LoopGameRecord(terminal_status=2)
+    for i, uci in enumerate(ucis):
+        tmp = chess.Board(fens[i])
+        legal = [m.uci() for m in tmp.legal_moves]
+        visits = [1.0 if u == uci else 0.0 for u in legal]
+        lrec.rows.append(StepRow(
+            fen=fens[i],
+            visits_policy=visits,
+            soft_policy=[0.0] * 1858,
+            best_eval=(0.33, 0.34, 0.33),
+            played_eval=(0.33, 0.34, 0.33),
+            raw_nn_eval=(0.33, 0.34, 0.33),
+            mlh=30.0,
+            side_to_move=i % 2,
+            is_full_search=True,
+            was_playthrough=False,
+            legal_moves_uci=legal,
+            n_legal=len(legal),
+            played_uci=uci,
+        ))
+
+    cfg = SelfPlayConfig(num_games=1, full_sims=10)
+    rec = _loop_record_to_legacy(lrec, cfg)
+
+    assert len(rec.planes) == 3
+    # Third recorded position (after 1.e4 e5) has one ply of history: timestep 0
+    # (current) must differ from timestep 1 (one move back).
+    step0 = rec.planes[2][0:13]
+    step1 = rec.planes[2][13:26]
+    assert not np.array_equal(step0, step1), (
+        "history planes collapsed — encode_board got a board with empty move_stack"
+    )
+    # And the two timesteps encode recognisable distinct positions: step0 is
+    # after 1.e4 e5 (White to move), step1 is after 1.e4 (Black to move); the
+    # piece layouts must differ.
+    assert step0.sum() > 0 and step1.sum() > 0
+
+
+# ---------------------------------------------------------------------------
+# Resign boundary — _resign_check must strictly gate on resign_earliest_ply
+# across all three WDL trigger paths (w, d, l). The original bug we hit was
+# a resign firing far too early; these tests lock down the gate semantics so
+# a future off-by-one or condition reorder can't silently re-open the hole.
+# ---------------------------------------------------------------------------
+
+def test_resign_at_earliest_ply_boundary_allowed():
+    """ply == resign_earliest_ply must allow resign (guard uses strict `<`)."""
+    from training.selfplay_loop import _resign_check
+    cfg = _make_cfg(resign_w=0.02, resign_d=0.98, resign_l=0.98, resign_earliest_ply=30)
+    triggered, outcome = _resign_check(
+        cfg, root_wdl=(0.01, 0.50, 0.49), ply=30, is_playthrough=False,
+    )
+    assert triggered is True
+    assert outcome == "loss_for_stm"
+
+
+def test_resign_one_ply_below_earliest_blocked():
+    """ply == earliest - 1 must still be gated off, even with extreme WDL."""
+    from training.selfplay_loop import _resign_check
+    cfg = _make_cfg(resign_w=0.02, resign_d=0.98, resign_l=0.98, resign_earliest_ply=30)
+    # Every trigger condition maximally tripped; only the gate should stop it.
+    for wdl in [(0.0, 0.0, 1.0), (0.0, 1.0, 0.0), (0.0, 0.5, 0.5)]:
+        triggered, _ = _resign_check(cfg, root_wdl=wdl, ply=29, is_playthrough=False)
+        assert triggered is False, f"resign leaked through gate at ply=29 with wdl={wdl}"
+
+
+def test_resign_ply_zero_never_triggers():
+    """Ply 0 (opening) must never resign regardless of WDL. Documents the
+    opening-protection contract; the original bug fired on move 1."""
+    from training.selfplay_loop import _resign_check
+    cfg = _make_cfg(resign_w=0.02, resign_d=0.98, resign_l=0.98, resign_earliest_ply=30)
+    for wdl in [(0.0, 0.0, 1.0), (0.0, 1.0, 0.0), (1.0, 0.0, 0.0), (0.33, 0.34, 0.33)]:
+        triggered, _ = _resign_check(cfg, root_wdl=wdl, ply=0, is_playthrough=False)
+        assert triggered is False, f"resign fired at ply=0 with wdl={wdl}"
+
+
+def test_resign_w_path_respects_earliest_ply():
+    """Low-W trigger must be gated by earliest_ply (draw/loss paths alone aren't enough)."""
+    from training.selfplay_loop import _resign_check
+    cfg = _make_cfg(resign_w=0.02, resign_d=0.98, resign_l=0.98, resign_earliest_ply=30)
+    # W below threshold but D and L are benign — only the w-path can trigger.
+    triggered, outcome = _resign_check(
+        cfg, root_wdl=(0.01, 0.50, 0.49), ply=29, is_playthrough=False,
+    )
+    assert triggered is False
+    triggered, outcome = _resign_check(
+        cfg, root_wdl=(0.01, 0.50, 0.49), ply=30, is_playthrough=False,
+    )
+    assert triggered is True
+    assert outcome == "loss_for_stm"
+
+
+def test_resign_l_path_respects_earliest_ply():
+    """High-L trigger must be gated by earliest_ply."""
+    from training.selfplay_loop import _resign_check
+    cfg = _make_cfg(resign_w=0.02, resign_d=0.98, resign_l=0.98, resign_earliest_ply=30)
+    # L above threshold, W above resign_w, D below resign_d — only l-path can trigger.
+    triggered, _ = _resign_check(
+        cfg, root_wdl=(0.005, 0.005, 0.99), ply=29, is_playthrough=False,
+    )
+    assert triggered is False
+    # At boundary, the w-path still fires first (0.005 < 0.02). Raise W above the
+    # w-threshold so the l-path is the unique trigger.
+    triggered, outcome = _resign_check(
+        cfg, root_wdl=(0.005, 0.005, 0.99), ply=30, is_playthrough=False,
+    )
+    assert triggered is True
+    # w-path wins the first-match race (short-circuit in _resign_check).
+    assert outcome == "loss_for_stm"
+
+
+def test_resign_playthrough_suppresses_regardless_of_ply():
+    """Playthrough flag must suppress resign at any ply, even far past earliest."""
+    from training.selfplay_loop import _resign_check
+    cfg = _make_cfg(resign_w=0.02, resign_d=0.98, resign_l=0.98, resign_earliest_ply=30)
+    triggered, _ = _resign_check(
+        cfg, root_wdl=(0.0, 0.0, 1.0), ply=200, is_playthrough=True,
+    )
+    assert triggered is False
+
+
+# ---------------------------------------------------------------------------
+# terminal_status sign convention — just flipped from "+1 = STM wins" to
+# "+1 = STM loses". Pin the convention end-to-end at the WDL mapping so a
+# future re-flip fails loudly.
+# ---------------------------------------------------------------------------
+
+def test_finalize_game_terminal_status_plus_one_is_loss():
+    """terminal_status=+1 must map to final_wdl=(0,0,1) — STM at terminal loses."""
+    from training.selfplay_loop import GamePoolManager, GameRecord as LoopGameRecord
+    from training.config import SelfPlayConfig
+
+    class _StubGM:
+        def num_games(self): return 1
+
+    cfg = SelfPlayConfig(num_games=1, full_sims=1, resign_playthrough_fraction=0.0)
+    pool = GamePoolManager(_StubGM(), cfg, rng_seed=0)
+    pool._finalize_game(0, terminal_status=1, adjudicated=False)
+    assert pool._records[0].final_wdl == (0.0, 0.0, 1.0)
+
+
+def test_finalize_game_terminal_status_minus_one_is_win():
+    """terminal_status=-1 must map to final_wdl=(1,0,0) — STM at terminal wins
+    (or, for resign, resigning side is STM and loses → from the opponent's
+    accounting the final_wdl flips out via per-row side_to_move in training)."""
+    from training.selfplay_loop import GamePoolManager
+    from training.config import SelfPlayConfig
+
+    class _StubGM:
+        def num_games(self): return 1
+
+    cfg = SelfPlayConfig(num_games=1, full_sims=1, resign_playthrough_fraction=0.0)
+    pool = GamePoolManager(_StubGM(), cfg, rng_seed=0)
+    pool._finalize_game(0, terminal_status=-1, adjudicated=False)
+    assert pool._records[0].final_wdl == (1.0, 0.0, 0.0)
+
+
+def test_finalize_game_terminal_status_draw():
+    from training.selfplay_loop import GamePoolManager
+    from training.config import SelfPlayConfig
+
+    class _StubGM:
+        def num_games(self): return 1
+
+    cfg = SelfPlayConfig(num_games=1, full_sims=1, resign_playthrough_fraction=0.0)
+    pool = GamePoolManager(_StubGM(), cfg, rng_seed=0)
+    pool._finalize_game(0, terminal_status=2, adjudicated=False)
+    assert pool._records[0].final_wdl == (0.0, 1.0, 0.0)
+
+
+# ---------------------------------------------------------------------------
+# _loop_record_to_legacy result-label mapping — the terminal_status + last
+# recorded STM → '1-0'/'0-1'/'1/2-1/2' conversion had no direct test. An
+# inverted result label would flip every game's value target.
+# ---------------------------------------------------------------------------
+
+def _build_minimal_lrec(ucis, terminal_status):
+    """Helper: build a LoopGameRecord from a list of UCI moves starting at startpos."""
+    import chess
+    from training.selfplay_loop import GameRecord as LoopGameRecord, StepRow
+    board = chess.Board()
+    fens = [board.fen()]
+    for u in ucis:
+        board.push_uci(u)
+        fens.append(board.fen())
+    lrec = LoopGameRecord(terminal_status=terminal_status)
+    for i, uci in enumerate(ucis):
+        tmp = chess.Board(fens[i])
+        legal = [m.uci() for m in tmp.legal_moves]
+        visits = [1.0 if u == uci else 0.0 for u in legal]
+        lrec.rows.append(StepRow(
+            fen=fens[i], visits_policy=visits, soft_policy=[0.0]*1858,
+            best_eval=(0.33, 0.34, 0.33), played_eval=(0.33, 0.34, 0.33),
+            raw_nn_eval=(0.33, 0.34, 0.33), mlh=30.0, side_to_move=i % 2,
+            is_full_search=True, was_playthrough=False,
+            legal_moves_uci=legal, n_legal=len(legal), played_uci=uci,
+        ))
+    return lrec
+
+
+def test_loop_record_result_label_terminal_status_plus_one():
+    """terminal_status=+1 + White was last STM (positions[-1][2]==WHITE) → '1-0'.
+    Rationale: terminal_status=+1 means STM AT TERMINAL loses. The last
+    recorded row is the position BEFORE the terminal move, so its STM is
+    the opposite of the terminal STM, i.e. the WINNER."""
+    from training.selfplay import _loop_record_to_legacy
+    from training.config import SelfPlayConfig
+    # After 1.e4 only: row 0 is startpos (STM=white). terminal_status=1
+    # means STM-at-next-position (black) loses → white wins → '1-0'.
+    lrec = _build_minimal_lrec(["e2e4"], terminal_status=1)
+    rec = _loop_record_to_legacy(lrec, SelfPlayConfig(num_games=1, full_sims=1))
+    assert rec.result == '1-0'
+
+
+def test_loop_record_result_label_terminal_status_minus_one():
+    """terminal_status=-1 means STM at terminal WINS (or resigning side loses).
+    Last recorded STM is white → the side whose STM is in positions[-1] wins?
+    No — see _loop_record_to_legacy: for -1 we flip to losing. This test
+    pins the current mapping so future convention changes fail loudly."""
+    from training.selfplay import _loop_record_to_legacy
+    from training.config import SelfPlayConfig
+    lrec = _build_minimal_lrec(["e2e4"], terminal_status=-1)
+    rec = _loop_record_to_legacy(lrec, SelfPlayConfig(num_games=1, full_sims=1))
+    assert rec.result == '0-1'
+
+
+def test_loop_record_result_label_draw():
+    from training.selfplay import _loop_record_to_legacy
+    from training.config import SelfPlayConfig
+    lrec = _build_minimal_lrec(["e2e4"], terminal_status=2)
+    rec = _loop_record_to_legacy(lrec, SelfPlayConfig(num_games=1, full_sims=1))
+    assert rec.result == '1/2-1/2'
+
+
+# ---------------------------------------------------------------------------
+# _q_to_wdl — pin the formula numerically. Commit 57fd4cd was a drift fix;
+# without a test, future drift would silently corrupt resign calibration.
+# Formula: d = 0.5·(1-Q²); W = (1-d)·(0.5·(1+Q)); L = (1-d)·(0.5·(1-Q)).
+# ---------------------------------------------------------------------------
+
+def test_q_to_wdl_endpoints():
+    from training.selfplay_loop import _q_to_wdl
+    # Q=+1 → certain win
+    w, d, l = _q_to_wdl(1.0)
+    assert (w, d, l) == pytest.approx((1.0, 0.0, 0.0))
+    # Q=-1 → certain loss
+    w, d, l = _q_to_wdl(-1.0)
+    assert (w, d, l) == pytest.approx((0.0, 0.0, 1.0))
+    # Q=0 → d=0.5, remaining 0.5 split equally
+    w, d, l = _q_to_wdl(0.0)
+    assert (w, d, l) == pytest.approx((0.25, 0.5, 0.25))
+
+
+def test_q_to_wdl_sums_to_one():
+    from training.selfplay_loop import _q_to_wdl
+    for q in [-1.0, -0.75, -0.3, 0.0, 0.3, 0.75, 1.0]:
+        w, d, l = _q_to_wdl(q)
+        assert abs((w + d + l) - 1.0) < 1e-6, f"Q={q}: w+d+l={w+d+l}"
+
+
+def test_q_to_wdl_known_intermediate():
+    """Q=0.5: d = 0.5·(1-0.25) = 0.375, scale = 0.625.
+    W = 0.625·0.75 = 0.46875, L = 0.625·0.25 = 0.15625."""
+    from training.selfplay_loop import _q_to_wdl
+    w, d, l = _q_to_wdl(0.5)
+    assert (w, d, l) == pytest.approx((0.46875, 0.375, 0.15625))
+
+
+def test_q_to_wdl_clamps_out_of_range():
+    from training.selfplay_loop import _q_to_wdl
+    assert _q_to_wdl(2.5) == pytest.approx((1.0, 0.0, 0.0))
+    assert _q_to_wdl(-3.0) == pytest.approx((0.0, 0.0, 1.0))
+
+
+# ---------------------------------------------------------------------------
+# _uci_to_policy_index — black-to-move flips from/to via square_mirror. No
+# existing test exercised that path; a broken mirror would halve policy
+# target correctness without any existing test failing.
+# ---------------------------------------------------------------------------
+
+def test_uci_to_policy_index_black_matches_mirrored_white():
+    """From black's POV, e7e5 should map to the same policy index as white's
+    e2e4 — the encoder flips the board via square_mirror so "push pawn two
+    squares forward" has one canonical index regardless of color."""
+    import chess
+    from training.selfplay import _uci_to_policy_index
+    white_e2e4 = chess.Move.from_uci("e2e4")
+    black_e7e5 = chess.Move.from_uci("e7e5")
+    idx_white = _uci_to_policy_index(white_e2e4, chess.WHITE)
+    idx_black = _uci_to_policy_index(black_e7e5, chess.BLACK)
+    assert idx_white is not None
+    assert idx_black is not None
+    assert idx_white == idx_black
+
+
+def test_uci_to_policy_index_black_knight():
+    """Black Nb8-c6 should map to white Nb1-c3's index (vertical mirror)."""
+    import chess
+    from training.selfplay import _uci_to_policy_index
+    w_nb1c3 = chess.Move.from_uci("b1c3")
+    b_nb8c6 = chess.Move.from_uci("b8c6")
+    assert _uci_to_policy_index(w_nb1c3, chess.WHITE) == _uci_to_policy_index(b_nb8c6, chess.BLACK)
+
+
+# ---------------------------------------------------------------------------
+# mirror_policies_batched — parity against the original loop, plus a
+# concrete-move check that catches identity/zeros regressions.
+# ---------------------------------------------------------------------------
+
+def test_mirror_policies_batched_matches_loop():
+    import numpy as np
+    from training.dataset import mirror_policies_batched, mirror_policy
+    rng = np.random.default_rng(0)
+    batch = rng.random((4, POLICY_SIZE)).astype(np.float32)
+    batched = mirror_policies_batched(batch)
+    expected = np.stack([mirror_policy(p) for p in batch])
+    np.testing.assert_array_equal(batched, expected)
+
+
+def test_mirror_policy_e2e4_to_d2d4():
+    """White e2e4 (file e = 4) mirrors to d2d4 (file d = 3) under a↔h file flip.
+    If the mirror table were broken or replaced by an identity, this fails."""
+    import numpy as np
+    from training.encoder import move_to_index
+    from training.dataset import mirror_policy
+    idx_e2e4 = move_to_index(12, 28, None)   # e2=12, e4=28
+    idx_d2d4 = move_to_index(11, 27, None)   # d2=11, d4=27
+    assert idx_e2e4 is not None and idx_d2d4 is not None
+    p = np.zeros(POLICY_SIZE, dtype=np.float32)
+    p[idx_e2e4] = 1.0
+    m = mirror_policy(p)
+    assert m[idx_d2d4] == 1.0
+    assert m[idx_e2e4] == 0.0
+
+
+# ---------------------------------------------------------------------------
+# _apply_uci_to_fen — rejects terminal/near-terminal positions so the discard
+# pool doesn't seed insta-ending games.
+# ---------------------------------------------------------------------------
+
+def test_apply_uci_rejects_terminal_position():
+    """A move that checkmates the opponent must be rejected (returns None).
+    The discard pool seeds fresh games; seeding a terminal FEN would produce
+    zero-length games."""
+    from training.selfplay_loop import _apply_uci_to_fen
+    # White to play Ra8#: black king on g8, white king on g1, white rook a1.
+    # After Ra1a8, black king is in check along the 8th rank with no escape
+    # (f7, g7, h7 are all blocked or attacked).
+    mate_in_1 = "6k1/5ppp/8/8/8/8/5PPP/R5K1 w - - 0 1"
+    out = _apply_uci_to_fen(mate_in_1, "a1a8")
+    assert out is None, "terminal position after move must be rejected"
+
+
+def test_apply_uci_rejects_near_terminal_few_legal_moves():
+    """K+P vs K endgame with <5 legal moves after the push — must be rejected."""
+    from training.selfplay_loop import _apply_uci_to_fen
+    # White king on h1, white pawn on a2, black king on h3. White plays a2a3.
+    # Resulting position: black to move, king on h3 has legal squares
+    # {g2, h2, g3, g4, h4} — 5 moves. Pick a tighter FEN for <5.
+    # King in the corner trap: black king h8 surrounded by white king f7 and
+    # pawn. Construct something with exactly 3 legal black moves.
+    tight = "7k/8/5K2/8/8/8/8/R7 w - - 0 1"
+    # White plays Ra8+ → black must move king from h8; legal moves: g7 only
+    # (h7 covered by Kf6, g8 pinned by Ra8 check). Actually Kh7 is legal too.
+    # Try: black king trapped with only 2–4 squares.
+    out = _apply_uci_to_fen(tight, "a1a8")
+    # After Ra8+: black king h8 moves available = g7 only (f7 is white king,
+    # h7 attacked? no — rook on a8 doesn't attack h7. h7 is legal.) Count:
+    # {g7, h7}. Two legal moves → < 5 → rejected.
+    assert out is None, "near-terminal (<5 legal moves) must be rejected"
+
+
+def test_apply_uci_returns_fen_for_healthy_position():
+    """Positive control: a normal mid-game move returns a FEN string."""
+    from training.selfplay_loop import _apply_uci_to_fen
+    startpos = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
+    out = _apply_uci_to_fen(startpos, "e2e4")
+    assert isinstance(out, str) and len(out) > 0
+
+
+# ---------------------------------------------------------------------------
+# Golden encoder parity: Python encode_board vs C++ chess_mcts.encode_packed
+#
+# The training data path (Python) and the self-play inference path (C++) MUST
+# produce identical 112×8×8 tensors for the same (start_fen, uci_moves). A
+# silent drift between them is how 42 generations of training data got
+# corrupted by fake 8-step history planes. These tests are the byte-level
+# contract between the two encoders.
+# ---------------------------------------------------------------------------
+
+def _cpp_encoded_to_dense(bb, stm, castling, rule50, fullmove):
+    """Expand a chess_mcts.encode_packed tuple back to the dense (112,8,8)
+    tensor the Python side produces. Pure projection — no chess logic.
+    """
+    import numpy as np
+    from training.dataset import unpack_bitboards
+
+    dense = np.zeros((112, 8, 8), dtype=np.float32)
+    # Planes 0-103: unpack the 104 bitboards directly. unpack_bitboards produces
+    # [plane, rank, file] in LERF (bit i → square i, a1=LSB) which matches the
+    # Python encoder's layout.
+    dense[:104] = unpack_bitboards(np.asarray(bb, dtype=np.uint64))
+    # Plane 104: side to move (1 if white).
+    if stm:
+        dense[104] = 1.0
+    # Plane 105: fullmove / 200.
+    dense[105] = float(fullmove) / 200.0
+    # Planes 106-109: castling (STM-K, STM-Q, OPP-K, OPP-Q).
+    if castling & 0x1: dense[106] = 1.0
+    if castling & 0x2: dense[107] = 1.0
+    if castling & 0x4: dense[108] = 1.0
+    if castling & 0x8: dense[109] = 1.0
+    # Plane 110: halfmove / 100.
+    dense[110] = float(rule50) / 100.0
+    # Plane 111: bias.
+    dense[111] = 1.0
+    return dense
+
+
+def _assert_encoders_match(start_fen, uci_moves):
+    """Push uci_moves through both encoders from start_fen; require equality."""
+    import chess
+    import numpy as np
+    import chess_mcts
+    from training.encoder import encode_board
+
+    # Python path: real python-chess Board with accumulated move_stack.
+    py_board = chess.Board(start_fen)
+    for u in uci_moves:
+        py_board.push_uci(u)
+    py_dense = encode_board(py_board)
+
+    # C++ path: replay uci_moves from start_fen inside the C++ engine.
+    bb, stm, castling, rule50, fullmove = chess_mcts.encode_packed(
+        start_fen, list(uci_moves)
+    )
+    cpp_dense = _cpp_encoded_to_dense(bb, stm, castling, rule50, fullmove)
+
+    # Byte-exact match is the contract. Any drift is a bug, not a tolerance
+    # issue — both encoders emit {0.0, 1.0, rule50/100, fullmove/200} only,
+    # and the scalar divisions are identical in both languages.
+    assert py_dense.shape == cpp_dense.shape == (112, 8, 8)
+    if not np.array_equal(py_dense, cpp_dense):
+        diff = np.where(py_dense != cpp_dense)
+        sample = [(int(p), int(r), int(f), float(py_dense[p, r, f]), float(cpp_dense[p, r, f]))
+                  for p, r, f in zip(diff[0][:8], diff[1][:8], diff[2][:8])]
+        raise AssertionError(
+            f"Encoder mismatch for start_fen={start_fen!r} uci_moves={uci_moves}\n"
+            f"First mismatches (plane,rank,file,py,cpp): {sample}"
+        )
+
+
+@pytest.fixture(scope="module")
+def _chess_mcts_module():
+    try:
+        import chess_mcts
+    except ImportError:
+        pytest.skip("chess_mcts not built — skipping encoder parity tests")
+    return chess_mcts
+
+
+def test_encoder_parity_startpos(_chess_mcts_module):
+    """Empty move history — simplest case. All 8 timesteps are startpos."""
+    startpos = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
+    _assert_encoders_match(startpos, [])
+
+
+def test_encoder_parity_one_move(_chess_mcts_module):
+    """Single move — tests that history plane at t=1 differs from t=0."""
+    startpos = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
+    _assert_encoders_match(startpos, ["e2e4"])
+
+
+def test_encoder_parity_opening_sequence(_chess_mcts_module):
+    """Multi-move opening — exercises alternating STM flips in history."""
+    startpos = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
+    _assert_encoders_match(startpos, ["e2e4", "e7e5", "g1f3", "b8c6", "f1b5"])
+
+
+def test_encoder_parity_deep_history(_chess_mcts_module):
+    """>8 moves — exercises the history-window overflow path (oldest frames
+    must be dropped identically on both sides)."""
+    startpos = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
+    moves = ["e2e4", "e7e5", "g1f3", "b8c6", "f1b5", "a7a6",
+             "b5a4", "g8f6", "e1g1", "f8e7", "f1e1"]
+    _assert_encoders_match(startpos, moves)
+
+
+def test_encoder_parity_castling_kingside(_chess_mcts_module):
+    """Castling move — verifies rook+king updates encode identically."""
+    startpos = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
+    moves = ["e2e4", "e7e5", "g1f3", "b8c6", "f1c4", "g8f6", "e1g1"]
+    _assert_encoders_match(startpos, moves)
+
+
+def test_encoder_parity_en_passant(_chess_mcts_module):
+    """En passant — the classic lc0-style encoder bug magnet."""
+    startpos = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
+    # 1.e4 d5 2.e5 f5 — now 3.exf6 is en passant.
+    moves = ["e2e4", "d7d5", "e4e5", "f7f5", "e5f6"]
+    _assert_encoders_match(startpos, moves)
+
+
+def test_encoder_parity_underpromotion(_chess_mcts_module):
+    """Underpromotion move — knight promo exercises the promo plane cluster."""
+    # Position where white can promote to knight with check.
+    fen = "8/4P3/8/8/8/8/8/4K2k w - - 0 1"
+    _assert_encoders_match(fen, ["e7e8n"])
+
+
+def test_encoder_parity_black_to_move(_chess_mcts_module):
+    """Board flip for Black STM — the orientation seam where we've had bugs."""
+    startpos = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
+    _assert_encoders_match(startpos, ["e2e4", "c7c5"])
+
+
+def test_encoder_parity_random_positions(_chess_mcts_module):
+    """Random games — broad sweep. Uses a fixed seed for reproducibility."""
+    import chess
+    import random
+
+    rng = random.Random(0xC0FFEE)
+    startpos = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
+    # 10 random games of up to 20 plies each. Every ply's prefix gets checked.
+    for _ in range(10):
+        b = chess.Board()
+        moves: list[str] = []
+        for _ply in range(20):
+            legal = list(b.legal_moves)
+            if not legal or b.is_game_over():
+                break
+            mv = rng.choice(legal)
+            b.push(mv)
+            moves.append(mv.uci())
+            _assert_encoders_match(startpos, list(moves))

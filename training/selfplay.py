@@ -297,17 +297,15 @@ def rescore_with_tablebases(
         if tb_wdl[i] is not None:
             last_tb_wdl = tb_wdl[i]
             last_tb_stm = board_history[i].turn
+        planes, policy_target, side_to_move, root_q, raw_v, surprise, is_full = positions[i]
         if last_tb_wdl is not None:
-            planes, policy_target, side_to_move, root_q, surprise, is_full = positions[i]
-            # Adjust perspective if needed
             if side_to_move == last_tb_stm:
                 corrected = last_tb_wdl.copy()
             else:
                 corrected = last_tb_wdl[[2, 1, 0]].copy()  # flip win/loss
-            positions[i] = (planes, policy_target, side_to_move, root_q, surprise, is_full, corrected)
+            positions[i] = (planes, policy_target, side_to_move, root_q, raw_v, surprise, is_full, corrected)
         else:
-            planes, policy_target, side_to_move, root_q, surprise, is_full = positions[i]
-            positions[i] = (planes, policy_target, side_to_move, root_q, surprise, is_full, None)
+            positions[i] = (planes, policy_target, side_to_move, root_q, raw_v, surprise, is_full, None)
 
     return positions
 
@@ -346,7 +344,11 @@ def play_game(mcts, config: SelfPlayConfig) -> GameRecord:
             board.push(random.choice(legal))
             record.moves_uci.append(board.peek().uci())
 
-    positions = []  # (planes, policy_target, side_to_move, root_q, surprise, is_full)
+    # positions tuple: (planes, policy_target, side_to_move, root_q, raw_v, surprise, is_full[, tb_wdl])
+    # raw_v is the raw-NN scalar value at root (pre-search). Needed for the
+    # v2 decomposed eval schema: raw_nn_eval records pre-search NN opinion so
+    # the trainer can regularize on it via value_blend.raw_nn_eval.
+    positions = []
     board_history = []  # board snapshots for tablebase rescoring
     resign_count = 0
     full_sims = mcts.config.num_simulations
@@ -398,7 +400,8 @@ def play_game(mcts, config: SelfPlayConfig) -> GameRecord:
                 prev_kld = float((p[mask] * np.log(p[mask] / (q[mask] + 1e-8))).sum())
 
         planes = encode_board(board)
-        positions.append((planes, result.policy_target, board.turn, result.root_value, surprise, is_full_search))
+        positions.append((planes, result.policy_target, board.turn,
+                          result.root_value, result.raw_value, surprise, is_full_search))
         board_history.append(board.copy())
 
         # Check resign condition
@@ -450,10 +453,10 @@ def _finalize_record(
     q_ratio = config.q_ratio
 
     for i, pos_data in enumerate(positions):
-        if len(pos_data) == 7:
-            planes, policy_target, side_to_move, root_q, pos_surprise, is_full, tb_wdl = pos_data
+        if len(pos_data) == 8:
+            planes, policy_target, side_to_move, root_q, raw_v, pos_surprise, is_full, tb_wdl = pos_data
         else:
-            planes, policy_target, side_to_move, root_q, pos_surprise, is_full = pos_data
+            planes, policy_target, side_to_move, root_q, raw_v, pos_surprise, is_full = pos_data
             tb_wdl = None
 
         if tb_wdl is not None:
@@ -486,17 +489,27 @@ def _finalize_record(
         record.surprise.append(pos_surprise)
         record.moves_left.append(float(total_moves - i))
         record.use_policy.append(is_full)
-        # v2 decomposed signals (Python fallback): no real per-child/root WDL
-        # available, so approximate best/played/raw_nn from the same root_q
-        # used for q_wdl above. Trainer blend will converge on `game_result`
-        # weighting for this path unless/until we wire real WDLs through.
-        q_win = max(0.0, root_q)
-        q_loss = max(0.0, -root_q)
-        q_draw = 1.0 - q_win - q_loss
-        approx_wdl = np.array([q_win, q_draw, q_loss], dtype=np.float32)
-        record.best_eval.append(approx_wdl)
-        record.played_eval.append(approx_wdl)
-        record.raw_nn_eval.append(approx_wdl)
+        # v2 decomposed signals. Python MCTS exposes scalar Q only (no WDL
+        # head on this path), so synthesize (w,d,l) with the Lc0-style draw
+        # formula used on the C++ path: d = 0.5 * (1 - q^2), rescale W/L.
+        #   best_eval   → search-Q at the argmax-visit child (≈ root_q here,
+        #                 since we don't enumerate per-child Qs in _finalize).
+        #   played_eval → search-Q at the played child (also ≈ root_q).
+        #   raw_nn_eval → raw NN value before search (pre-search prior). This
+        #                 is the distinct, load-bearing signal — training on
+        #                 it at a modest weight via value_blend acts as a
+        #                 regularizer that anchors the value head to what the
+        #                 net itself predicted before MCTS shifted the Q.
+        def _q_to_wdl(q: float) -> np.ndarray:
+            q = float(max(-1.0, min(1.0, q)))
+            w_raw = 0.5 * (1.0 + q)
+            l_raw = 0.5 * (1.0 - q)
+            d = 0.5 * (1.0 - q * q)
+            scale = 1.0 - d
+            return np.array([scale * w_raw, d, scale * l_raw], dtype=np.float32)
+        record.best_eval.append(_q_to_wdl(root_q))
+        record.played_eval.append(_q_to_wdl(root_q))
+        record.raw_nn_eval.append(_q_to_wdl(raw_v))
         record.adjudicated.append(False)
         record.was_playthrough.append(False)
 
@@ -577,10 +590,10 @@ def play_games_batched(
         quick_sims=quick_sims,
         min_sims=min_sims,
         playout_cap_p=playout_cap_p,
-        opening_temp=0.6,
-        opening_temp_plies=16,      # ~8 moves of exploration, then decay
-        temp_floor=0.1,
-        temp_decay_plies=10,        # smooth decay over 5 moves after opening
+        opening_temp=1.0,
+        opening_temp_plies=30,      # ~15 moves of full exploration (Lc0 default)
+        temp_floor=0.05,
+        temp_decay_plies=10,        # decay to near-greedy after opening
         use_kld_adaptive=selfplay_config.kld_adaptive,
         kld_threshold=selfplay_config.kld_threshold,
         kld_max_sims=kld_max,
@@ -682,12 +695,72 @@ def _loop_record_to_legacy(
     loop_adjudicated: list[bool] = []
     loop_was_playthrough: list[bool] = []
 
-    for row in lrec.rows:
+    # Single source of truth: route plane encoding through the C++ encoder used
+    # during self-play inference. The Python path (encode_board) is kept as a
+    # fallback for environments where chess_mcts isn't built (isolated tests).
+    # Parity between the two encoders is enforced by test_encoder_parity_*.
+    try:
+        import chess_mcts as _chess_mcts
+        from training.dataset import packed_to_dense_112
+        _have_cpp_encoder = True
+    except ImportError:
+        _chess_mcts = None
+        _have_cpp_encoder = False
+
+    # C++ path state: accumulate uci_moves since `start_fen`. On desync (e.g.
+    # adjudication that injected a move we can't replay), restart from the
+    # current row's FEN with an empty history.
+    cpp_start_fen: str | None = None
+    cpp_uci_moves: list[str] = []
+
+    # Python fallback state (only used if chess_mcts is unavailable).
+    replay_board: chess.Board | None = None
+
+    for row_idx, row in enumerate(lrec.rows):
         try:
             board = chess.Board(row.fen)
         except ValueError:
+            replay_board = None
+            cpp_start_fen = None
+            cpp_uci_moves = []
             continue
-        planes = encode_board(board)
+
+        if _have_cpp_encoder:
+            # Extend history by the previous row's played move.
+            if cpp_start_fen is None:
+                cpp_start_fen = row.fen
+                cpp_uci_moves = []
+            elif row_idx > 0:
+                prev_uci = lrec.rows[row_idx - 1].played_uci
+                if prev_uci:
+                    cpp_uci_moves.append(prev_uci)
+            try:
+                bb, stm, castling, rule50, fullmove = _chess_mcts.encode_packed(
+                    cpp_start_fen, list(cpp_uci_moves)
+                )
+            except Exception:
+                # Replay desync (illegal move, bad FEN encountered by C++).
+                # Restart the history anchor at this row and try again.
+                cpp_start_fen = row.fen
+                cpp_uci_moves = []
+                bb, stm, castling, rule50, fullmove = _chess_mcts.encode_packed(
+                    cpp_start_fen, []
+                )
+            planes = packed_to_dense_112(bb, stm, castling, rule50, fullmove)
+        else:
+            # Python-only fallback path.
+            if replay_board is None:
+                replay_board = board.copy()
+            else:
+                prev_uci = lrec.rows[row_idx - 1].played_uci
+                if prev_uci:
+                    try:
+                        replay_board.push_uci(prev_uci)
+                    except (ValueError, chess.IllegalMoveError):
+                        replay_board = board.copy()
+                else:
+                    replay_board = board.copy()
+            planes = encode_board(replay_board)
 
         # Project visits (over row.legal_moves_uci) into 1858-dim policy space.
         policy_target = np.zeros(POLICY_SIZE, dtype=np.float32)
@@ -708,13 +781,18 @@ def _loop_record_to_legacy(
         # for legacy q-blend downstream; v2 fields below carry the real WDLs.
         w, _d, l = row.played_eval
         root_q = float(w - l)
+        # raw_v: pre-search NN Q (drives raw_nn_eval via _q_to_wdl in the
+        # Python fallback path; overwritten below by row.raw_nn_eval anyway,
+        # but still needed so the tuple matches _finalize_record's unpack).
+        rw, _rd, rl = row.raw_nn_eval
+        raw_v = float(rw - rl)
 
         # Surprise stamped 0.0 for Stage 2; Stage 3 will recompute from
         # soft-policy deltas.
         surprise = 0.0
         is_full = bool(row.is_full_search)
 
-        positions.append((planes, policy_target, board.turn, root_q, surprise, is_full))
+        positions.append((planes, policy_target, board.turn, root_q, raw_v, surprise, is_full))
         board_history.append(board.copy())
         record.moves_uci.append(row.played_uci or "")
         loop_best.append(np.asarray(row.best_eval, dtype=np.float32))
@@ -723,19 +801,22 @@ def _loop_record_to_legacy(
         loop_adjudicated.append(bool(getattr(row, "adjudicated", False)))
         loop_was_playthrough.append(bool(row.was_playthrough))
 
-    # Determine the final board state for result labeling. Replay moves
-    # forward from startpos? The loop doesn't give us the actual moves
-    # played, only FENs per position. For result determination we rely on
-    # terminal_status from the loop's finalize step:
+    # Determine the final board state for result labeling.
+    # terminal_status convention (matches C++ leaf/propagation):
+    #   +1 = STM at terminal position loses (checkmate, MCTS-solver proven loss)
+    #   -1 = STM at terminal wins (resign: resigning side is positions[-1] STM)
+    #    2 = draw
+    # For checkmate/solver (+1/-1): positions[-1] is the move BEFORE the
+    # terminal position, so its STM is the OPPOSITE of the terminal STM.
+    # For resign (-1): positions[-1] STM IS the resigning (losing) side.
+    # Both map correctly with the logic below.
     if lrec.terminal_status == 1:
-        # Side-to-move at terminal won; last recorded row's stm (if any)
-        # determines color perspective. But when adjudicated as draw, that's
-        # handled below. Map terminal_status=+1 to the color that moved last.
-        # Without move info, we derive from the last position's board.turn
-        # (which is the side to move at the terminal position).
+        # STM at terminal loses → the side that played the last recorded
+        # move (positions[-1] STM) wins.
         last_stm_white = (positions[-1][2] == chess.WHITE) if positions else True
         record.result = '1-0' if last_stm_white else '0-1'
     elif lrec.terminal_status == -1:
+        # STM at terminal wins, OR resign (positions[-1] STM is the loser).
         last_stm_white = (positions[-1][2] == chess.WHITE) if positions else True
         record.result = '0-1' if last_stm_white else '1-0'
     else:
@@ -1087,12 +1168,12 @@ def _build_trt_engine_for_self_play(
     timing_cache_path = os.path.join(
         os.path.dirname(os.path.abspath(trt_path)) or '.', 'trt_timing.cache',
     )
-    export_onnx(model, onnx_path)
-    # TRT builder kernel autotune probes many candidate allocations; on a 10GB
-    # GPU with training artifacts (optimizer states, SWA, cuDNN autotune cache)
-    # still resident, those probes OOM. Free as much as we can first. Moving
-    # the model to CPU during the build adds ~100MB of headroom; we restore
-    # it below (caller still holds the same Module reference).
+    # Move model to CPU and free GPU/system memory *before* ONNX export.
+    # The ONNX tracer builds a large in-memory graph; on a 20b256f network
+    # this can exceed available RAM if CUDA pinned buffers and training
+    # artifacts are still resident. export_onnx() moves to CPU internally,
+    # but doing it here first avoids a transient period where the model
+    # exists on both devices.
     orig_device = next(model.parameters()).device
     moved = False
     if _torch.cuda.is_available():
@@ -1101,6 +1182,7 @@ def _build_trt_engine_for_self_play(
             moved = True
         _gc.collect()
         _torch.cuda.empty_cache()
+    export_onnx(model, onnx_path)
     t0 = _time.time()
     # TRT max_batch must be >= the MCTS gather batch. opt_batch is set to half of
     # max so both small and large batches get decent kernels in one profile.
@@ -1122,12 +1204,26 @@ def _build_trt_engine_for_self_play(
     return trt_path
 
 
+# Default value_blend weights. game_result carries final-outcome noise but is
+# the only unbiased signal; played_eval (search Q at the played child) is a
+# lower-variance proxy; raw_nn_eval (raw-NN-before-search Q) regularizes the
+# value head toward what the net itself predicted, pulling hardest exactly
+# where search disagreed with the prior. Must sum to 1.0.
+DEFAULT_VALUE_BLEND = {
+    "game_result": 0.63,
+    "best_eval":   0.00,
+    "played_eval": 0.25,
+    "raw_nn_eval": 0.12,
+}
+
+
 def _build_window_dataloader(
     data_dir: str,
     window_start: int,
     window_end: int,
     batch_size: int,
     adjudicated_weight: float = 0.5,
+    value_blend: dict | None = None,
 ):
     """Build a DataLoader over gen_{start..end}.npz with diff-focus sampling.
 
@@ -1144,7 +1240,12 @@ def _build_window_dataloader(
     npz_paths = [p for p in npz_paths if os.path.exists(p)]
     if not npz_paths:
         return None, None
-    dataset = ChessDataset(npz_paths, mirror=True, adjudicated_weight=adjudicated_weight)
+    if value_blend is None:
+        value_blend = DEFAULT_VALUE_BLEND
+    dataset = ChessDataset(
+        npz_paths, mirror=True, adjudicated_weight=adjudicated_weight,
+        value_blend=value_blend,
+    )
     # CPU-side bitboard unpack + plane assembly is the self-play loop's main
     # data-prep cost. With num_workers=0 the GPU sat idle between batches
     # (CPU at ~6% on a 16-thread box). 4 workers parallelize unpacking,
@@ -1183,8 +1284,12 @@ def _train_one_cycle(model, optimizer, dataloader, device, train_epochs, schedul
     mlh_loss_sum = 0.0
     num_batches = 0
 
+    # BF16 AMP (not FP16): the attention policy head can produce logits
+    # exceeding FP16's 65504 ceiling, turning log_softmax into NaN. BF16
+    # has FP32's exponent range, same tensor-core speed on Ampere, and
+    # doesn't need GradScaler.
     use_amp = (device == 'cuda')
-    scaler = torch.amp.GradScaler(enabled=use_amp)
+    amp_dtype = torch.bfloat16
 
     nb = (device == 'cuda')  # non_blocking only meaningful when pin_memory=True
 
@@ -1203,23 +1308,16 @@ def _train_one_cycle(model, optimizer, dataloader, device, train_epochs, schedul
                 policy_mask = batch[bi].to(device, non_blocking=nb)
 
             optimizer.zero_grad(set_to_none=True)
-            with torch.amp.autocast(device_type=device, enabled=use_amp):
+            with torch.amp.autocast(device_type=device, dtype=amp_dtype, enabled=use_amp):
                 policy_logits, value_logits, mlh_pred = model(planes)
                 total_loss, policy_loss, value_loss, soft_policy_loss, mlh_loss = compute_loss(
                     policy_logits, value_logits, policy_target, value_target,
                     mlh_pred, mlh_target, policy_mask,
                 )
-            scaler.scale(total_loss).backward()
-            scaler.unscale_(optimizer)
+            total_loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
-            # AMP scaler may skip optimizer.step() on inf/nan gradients
-            # (common with FP16 on the first few batches). When skipped, the
-            # scaler reduces its scale by backoff_factor, so a drop in scale
-            # is the canonical signal that the step did NOT happen.
-            prev_scale = scaler.get_scale()
-            scaler.step(optimizer)
-            scaler.update()
-            if scheduler is not None and scaler.get_scale() >= prev_scale:
+            optimizer.step()
+            if scheduler is not None:
                 scheduler.step()
 
             total_loss_sum += total_loss.item()
@@ -1538,18 +1636,16 @@ def training_loop(
                 except (ValueError, KeyError, RuntimeError) as e:
                     print(f"  SWA state could not be restored ({e}); fresh SWA.")
 
-    # Enable Lc0-style search features for the training loop:
-    # - Absolute root FPU: unvisited root children treated as value=1.0 (pessimistic),
-    #   encouraging broader early root exploration.
-    # - MLH PUCT bonus: in winning/losing positions, prefer children that shorten/lengthen
-    #   the game. Disabled until MLH outputs diverge (which requires training signal).
+    # MLH PUCT bonus: in winning/losing positions, prefer children that
+    # shorten/lengthen the game. Disabled until MLH outputs diverge (which
+    # requires training signal). Search softmax/FPU/c_puct come from the
+    # Lc0-parity MCTSConfig defaults (c_puct_init=1.745, c_puct_factor=0.0,
+    # fpu_reduction[_root]=0.33, policy_softmax_temperature=1.0) — don't
+    # override them here.
     _mcts_kwargs = dict(
         num_simulations=num_simulations,
-        policy_softmax_temperature=1.0,
         dirichlet_alpha=0.3,
         dirichlet_epsilon=0.15,     # lower noise for pretrained net (was 0.25)
-        fpu_absolute_root=True,
-        fpu_absolute_root_value=1.0,
         mlh_weight=0.03,
         mlh_cap=8.0,
         mlh_q_threshold=0.6,
@@ -1671,6 +1767,7 @@ def training_loop(
             swa_state = swa_model.module.state_dict()
             orig_state = model.state_dict()
             model.load_state_dict(swa_state)
+            del swa_state  # free before export — ~200MB for 20b256f
             export_torchscript(model, cpp_model_path, device=device)
             if use_trt:
                 trt_engine_path = _build_trt_engine_for_self_play(

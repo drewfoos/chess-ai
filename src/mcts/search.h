@@ -56,12 +56,16 @@ public:
 struct SearchParams {
     int num_iterations = 800;
     // Dynamic c_puct: c_init + c_factor * log((N + c_base) / c_base)
-    // Lc0 current defaults
-    float c_puct_init = 3.0f;
+    // Lc0 self-play defaults (tournament.cc:142-157). Self-play already has
+    // Dirichlet noise + temperature randomization for exploration — search
+    // itself should be confident. Previous defaults (c_puct_init=3.0,
+    // c_puct_factor=2.0, fpu_reduction=0.5, policy_softmax_temp=2.2)
+    // over-explored, producing flatter visit distributions than warranted.
+    float c_puct_init = 1.745f;
     float c_puct_base = 19652.0f;
-    float c_puct_factor = 2.0f;
-    float fpu_reduction_root = 0.5f;
-    float fpu_reduction = 0.5f;
+    float c_puct_factor = 0.0f;     // dynamic c_puct disabled for self-play
+    float fpu_reduction_root = 0.33f;
+    float fpu_reduction = 0.33f;
     // Lc0 "FpuStrategyAtRoot=absolute": treat unvisited root children as if they
     // had a fixed value (typically ~1.0), forcing the search to touch every root
     // child at least once before exploiting. Overrides fpu_reduction_root at root.
@@ -70,7 +74,7 @@ struct SearchParams {
     float dirichlet_alpha = 0.3f;
     float dirichlet_epsilon = 0.25f;
     bool add_noise = true;    // Add Dirichlet noise at root (for self-play)
-    float policy_softmax_temp = 2.2f;  // Temperature applied to NN policy logits
+    float policy_softmax_temp = 1.0f;  // Temperature on NN policy logits; Lc0 self-play uses raw (=1.0)
 
     // Batched search config
     int batch_size = 128;
@@ -106,6 +110,11 @@ struct SearchResult {
     Move best_move;
     std::vector<Move> moves;           // Legal moves at root
     std::vector<int> visit_counts;     // Visit count per move
+    // Mean value per root child, from STM's perspective (+1 = STM winning).
+    // Same ordering as moves/visit_counts. 0.0 for children that were never
+    // visited. Populated unconditionally by build_result; MultiPV consumes it
+    // to emit score lines for alternative moves.
+    std::vector<float> child_q_values;
     float root_value;                  // Value estimate at root
     int total_nodes;                   // Total nodes in tree
 
@@ -113,6 +122,17 @@ struct SearchResult {
     std::array<float, neural::POLICY_SIZE> policy_target = {};   // Normalized visit distribution mapped to 1858 policy indices
     std::array<float, neural::POLICY_SIZE> raw_policy = {};      // NN policy before MCTS
     float raw_value = 0.0f;                                       // NN value before MCTS
+
+    // UCI reporting fields (populated by Search::run, consumed by uci.cpp).
+    // pv: visit-greedy walk from root; first entry is best_move when one exists.
+    // root_terminal_status: 0=ongoing, 1=STM loses (we're mated), -1=STM wins (we mate), 2=draw.
+    // mate_distance_plies: >0 = we mate in N plies, <0 = we get mated in |N| plies, 0 = no proven mate.
+    std::vector<Move> pv;
+    int8_t root_terminal_status = 0;
+    int mate_distance_plies = 0;
+    int seldepth = 0;
+    int tb_hits = 0;
+    int hashfull_permille = 0;
 };
 
 struct SearchInfo {
@@ -149,6 +169,12 @@ private:
     SearchParams params_;
     NNCache cache_;
     NodePool pool_;
+
+    // Per-search counters, reset at the start of each run().
+    // seldepth_: max depth reached in any descent (plies from root).
+    // tb_hits_: count of Syzygy WDL probes that returned a result this search.
+    int seldepth_ = 0;
+    int tb_hits_ = 0;
 
     // Batched search internals
     struct PendingEval {

@@ -27,9 +27,13 @@ const Position& PositionHistory::at(int steps_back) const {
 bool PositionHistory::is_repetition(int count) const {
     if (hashes_.empty()) return false;
     uint64_t current_hash = hashes_.back();
+    const Position& current_pos = positions_.back();
     int occurrences = 0;
+    // Hash is a 64-bit ad-hoc mix (not Zobrist), so collisions are rare but
+    // possible. Verify full Position equality on hash hit to prevent a false
+    // threefold-draw claim in MCTS from silently poisoning self-play data.
     for (size_t i = 0; i < hashes_.size(); i++) {
-        if (hashes_[i] == current_hash) {
+        if (hashes_[i] == current_hash && positions_[i] == current_pos) {
             occurrences++;
             if (occurrences >= count) return true;
         }

@@ -98,7 +98,7 @@ def compute_loss(
     if mlh_pred is not None and mlh_target is not None:
         mlh_target_clamped = mlh_target.clamp(max=mlh_target_clamp)
         mlh_loss = F.huber_loss(mlh_pred, mlh_target_clamped, delta=10.0) / 20.0
-        total = total + mlh_loss
+        total = total + 0.2 * mlh_loss
 
     return total, policy_loss, value_loss, soft_policy_loss, mlh_loss
 
@@ -181,8 +181,12 @@ def train(
 
     os.makedirs(checkpoint_dir, exist_ok=True)
 
+    # BF16 AMP (not FP16): the attention policy head can produce logits
+    # exceeding FP16's 65504 ceiling, turning log_softmax into NaN. BF16
+    # has FP32's exponent range, same tensor-core speed on Ampere, and
+    # doesn't need GradScaler.
     use_amp = (device == 'cuda')
-    scaler = torch.amp.GradScaler(enabled=use_amp)
+    amp_dtype = torch.bfloat16
 
     for epoch in range(epochs):
         epoch_loss = 0.0
@@ -200,24 +204,17 @@ def train(
             model.train()
             optimizer.zero_grad()
 
-            with torch.amp.autocast(device_type=device, enabled=use_amp):
+            with torch.amp.autocast(device_type=device, dtype=amp_dtype, enabled=use_amp):
                 policy_logits, value_logits, mlh_pred = model(planes)
                 loss, p_loss, v_loss, _sp_loss, _mlh_loss = compute_loss(
                     policy_logits, value_logits, policies, values,
                     mlh_pred, mlh_target,
                 )
 
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
+            loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
-            # AMP scaler may skip optimizer.step() on inf/nan gradients.
-            # When skipped, scaler.get_scale() drops, so a non-decreasing
-            # scale is the canonical signal that the step actually happened.
-            prev_scale = scaler.get_scale()
-            scaler.step(optimizer)
-            scaler.update()
-            if scaler.get_scale() >= prev_scale:
-                scheduler.step()
+            optimizer.step()
+            scheduler.step()
 
             epoch_loss += loss.item()
             epoch_policy_loss += p_loss.item()

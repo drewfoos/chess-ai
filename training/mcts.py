@@ -19,21 +19,20 @@ from training.encoder import encode_board, move_to_index, mirror_move, POLICY_SI
 @dataclass
 class MCTSConfig:
     num_simulations: int = 400
-    # Dynamic c_puct: c_init + c_factor * log((N + c_base) / c_base)
-    # Dynamic c_puct — Lc0 current defaults
-    c_puct_init: float = 3.0
+    # Lc0 self-play defaults. Noise + temperature already randomize self-play —
+    # search should be confident. The pre-parity defaults (c_puct_init=3.0,
+    # c_puct_factor=2.0, fpu_reduction=0.5, policy_softmax_temperature=1.61)
+    # over-explored on all four axes simultaneously, teaching the net a muddier
+    # policy than the search actually produced.
+    c_puct_init: float = 1.745
     c_puct_base: float = 19652.0
-    c_puct_factor: float = 2.0
-    # Lc0 current defaults: non-root ~0.5 (FpuValue), root overridden by absolute
-    # strategy (fpu_absolute_root). Lowering non-root from the old 1.2 reduces
-    # over-pessimism on unvisited children, letting the tree commit visits to
-    # promising moves sooner.
-    fpu_reduction: float = 0.5
-    fpu_reduction_root: float = 0.5
+    c_puct_factor: float = 0.0       # dynamic c_puct disabled for self-play
+    fpu_reduction: float = 0.33
+    fpu_reduction_root: float = 0.33
     dirichlet_alpha: float = 0.3
     dirichlet_epsilon: float = 0.25
     temperature: float = 1.0
-    policy_softmax_temperature: float = 1.61
+    policy_softmax_temperature: float = 1.0  # raw NN policy (Lc0 parity)
     batch_size: int = 16          # leaves gathered before one GPU forward pass
     nn_cache_size: int = 20000    # max cached evaluations (0 = disabled)
     smart_pruning: bool = True    # stop early if best move can't be overtaken
@@ -98,8 +97,13 @@ class Node:
         return max(0.0, mean_sq - mean * mean)
 
     def puct_score(self, parent_visits: int, c_puct: float) -> float:
-        """PUCT score using pre-computed dynamic c_puct."""
-        exploration = c_puct * self.prior * math.sqrt(parent_visits) / (1 + self.visit_count)
+        """PUCT score using pre-computed dynamic c_puct.
+
+        Numerator follows Lc0 (search.cc:1720): sqrt(max(N-1, 1)). The -1
+        matters at low parent visits (N=2 gives 1 instead of 1.41), nudging
+        the tree to touch unvisited children before revisiting.
+        """
+        exploration = c_puct * self.prior * math.sqrt(max(parent_visits - 1, 1)) / (1 + self.visit_count)
         return self.value() + exploration
 
     def is_expanded(self) -> bool:
@@ -350,13 +354,19 @@ class MCTS:
         best_child = None
 
         fpu_red = self.config.fpu_reduction_root if is_root else self.config.fpu_reduction
-        fpu_value = node.value() - fpu_red
+        # Lc0-style visited-policy-mass FPU scaling (search.cc:430-446): fpu
+        # gets less pessimistic as more prior mass becomes visited.
+        visited_mass = sum(c.prior for c in node.children.values() if c.visit_count > 0)
+        fpu_value = node.value() - fpu_red * math.sqrt(visited_mass)
         c_puct = self._dynamic_cpuct(node.visit_count)
 
         # Variance-scaled cPUCT: scale exploration by parent value variance
         if self.config.variance_scaling and node.visit_count > 1:
             variance_scale = max(0.5, min(2.0, math.sqrt(node.value_variance()) / 0.5))
             c_puct *= variance_scale
+
+        # Lc0 PUCT numerator: sqrt(max(N-1, 1)) (search.cc:1720).
+        sqrt_parent = math.sqrt(max(node.visit_count - 1, 1))
 
         for move, child in node.children.items():
             # MCTS-solver: child.terminal_status is from child's STM (opponent).
@@ -368,7 +378,7 @@ class MCTS:
                 continue
 
             if child.visit_count == 0:
-                score = fpu_value + c_puct * child.prior * math.sqrt(node.visit_count)
+                score = fpu_value + c_puct * child.prior * sqrt_parent
             else:
                 score = child.puct_score(node.visit_count, c_puct)
                 if self.config.uncertainty_weight > 0:
