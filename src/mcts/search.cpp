@@ -98,20 +98,28 @@ void Search::propagate_terminal(Node* node) {
         bool any_draw = false;
         bool found_child_loss = false; // child loses = we win
 
+        // Scan ALL children: a proven-losing-for-them child resolves us
+        // immediately, even if other children are unexpanded. Breaking early
+        // on the first nullptr or cs==0 would miss the win — which is the
+        // difference between propagating a mate up to the root and letting
+        // MCTS dribble visits into a position it's already solved.
         for (int i = 0; i < cur->num_edges(); i++) {
             Node* child = cur->child_node(i);
             if (!child) {
                 all_resolved = false;
-                break;
+                continue;
             }
             int8_t cs = child->terminal_status();
             if (cs == 0) {
                 all_resolved = false;
-                break;
+                continue;
             }
             if (cs == 1) {
-                // Child loses (from child's perspective) = we win
+                // Child loses (from child's perspective) = we win. One is
+                // enough to resolve us; the rest of the scan is only useful
+                // for the all-draws / all-losses case below.
                 found_child_loss = true;
+                break;
             }
             if (cs == 2) {
                 any_draw = true;
@@ -140,9 +148,21 @@ Node* Search::select_child_advanced(Node* node, bool is_root) {
 
     bool absolute_fpu_at_root = is_root && params_.fpu_absolute_root;
     float fpu_red = is_root ? params_.fpu_reduction_root : params_.fpu_reduction;
+
+    // Lc0-style visited-policy-mass FPU scaling: FPU gets less pessimistic
+    // as more prior mass becomes visited. See game_manager.cpp for rationale.
+    float visited_mass = 0.0f;
+    if (!absolute_fpu_at_root) {
+        for (int i = 0; i < node->num_edges(); i++) {
+            Node* child = node->child_node(i);
+            if (child && child->visit_count() > 0) {
+                visited_mass += node->edge(i).prior();
+            }
+        }
+    }
     float fpu_value = absolute_fpu_at_root
         ? params_.fpu_absolute_root_value
-        : node->mean_value() - fpu_red;
+        : node->mean_value() - fpu_red * std::sqrt(visited_mass);
     float c_puct = dynamic_cpuct(node->visit_count());
 
     // Variance-scaled cPUCT
@@ -153,7 +173,8 @@ Node* Search::select_child_advanced(Node* node, bool is_root) {
         c_puct *= scale;
     }
 
-    float sqrt_parent = std::sqrt(static_cast<float>(node->visit_count()));
+    // Lc0 PUCT numerator: sqrt(max(N-1, 1)) (search.cc:1720).
+    float sqrt_parent = std::sqrt(static_cast<float>(std::max(1, node->visit_count() - 1)));
 
     // Sibling blending: compute average value of visited siblings for FPU
     // (disabled at root when absolute-FPU is on — see game_manager.cpp for rationale).
@@ -337,6 +358,9 @@ void Search::gather_leaf(Node* root, const neural::PositionHistory& history,
     }
 
     // current_pos is already the leaf position — no replay needed
+    if (static_cast<int>(path_moves.size()) > seldepth_) {
+        seldepth_ = static_cast<int>(path_moves.size());
+    }
 
     // Check if terminal (already visited leaf with no children = terminal)
     if (node->visit_count() > 0 && node->terminal_status() != 0) {
@@ -355,6 +379,7 @@ void Search::gather_leaf(Node* root, const neural::PositionHistory& history,
     if (params_.use_syzygy && syzygy::TableBase::ready()) {
         syzygy::ProbeResult tb = syzygy::TableBase::probe_wdl(current_pos);
         if (tb.hit) {
+            tb_hits_++;
             // Encoding (matches expand_node): status==1 → STM loses,
             // status==-1 → STM wins, status==2 → draw.
             int8_t status;
@@ -513,6 +538,11 @@ SearchResult Search::run(const neural::PositionHistory& history) {
     pool_.reset();
     Node* root = pool_.allocate();
     root->set_pool_managed(true);
+
+    // Reset per-search counters (seldepth is the deepest descent; tb_hits the
+    // Syzygy probe hit count for this search).
+    seldepth_ = 0;
+    tb_hits_ = 0;
 
     // Generate legal moves and evaluate root
     Move moves[MAX_MOVES];
@@ -679,6 +709,22 @@ SearchResult Search::build_result(Node* root, const Position& root_pos,
     result.raw_value = raw_value;
     result.raw_policy = raw_policy;
 
+    // When the root is a proven win (terminal_status == -1), prefer the
+    // actual mating move over the most-visited move: propagate_terminal can
+    // resolve the root before the winning branch accumulates the most visits,
+    // so visit-greedy would hand the GUI a non-mating reply even though the
+    // solver has already proven a forced win. A cs==1 child is a proven loss
+    // for the opponent = a forced win for us.
+    if (!root->is_leaf() && root->terminal_status() == -1) {
+        for (int i = 0; i < root->num_edges(); i++) {
+            Node* c = root->child_node(i);
+            if (c && c->terminal_status() == 1) {
+                result.best_move = root->edge(i).move();
+                break;
+            }
+        }
+    }
+
     // Apply contempt
     if (params_.contempt > 0.0f && std::abs(result.root_value) < 1.0f) {
         float sign = result.root_value >= 0.0f ? 1.0f : -1.0f;
@@ -689,6 +735,7 @@ SearchResult Search::build_result(Node* root, const Position& root_pos,
     int num_edges = root->num_edges();
     result.moves.resize(num_edges);
     result.visit_counts.resize(num_edges);
+    result.child_q_values.assign(num_edges, 0.0f);
 
     int total_child_visits = 0;
     Color stm = root_pos.side_to_move();
@@ -697,6 +744,13 @@ SearchResult Search::build_result(Node* root, const Position& root_pos,
         result.moves[i] = root->edge(i).move();
         Node* child = root->child_node(i);
         result.visit_counts[i] = child ? child->visit_count() : 0;
+        // Storage convention: each node's mean_value is the NEGATION of its
+        // own STM's perspective (backprop flips once per level). A root
+        // child's STM is the opponent, so child.mean_value() lands in the
+        // root STM's perspective directly — no additional negation needed
+        // here, unlike root.mean_value() which is in opponent POV and gets
+        // negated in uci.cpp::value_to_cp.
+        result.child_q_values[i] = child ? child->mean_value() : 0.0f;
         total_child_visits += result.visit_counts[i];
     }
 
@@ -714,6 +768,71 @@ SearchResult Search::build_result(Node* root, const Position& root_pos,
     }
 
     result.total_nodes = root->visit_count();
+
+    // Principal variation — greedy walk down the tree. Within a proven
+    // branch (current node resolves to a win for STM), prefer the actual
+    // proof child over the most-visited one. Outside proof branches, pick
+    // the most-visited child (standard MCTS PV).
+    {
+        const int PV_MAX = 64;
+        Node* cur = root;
+        for (int d = 0; d < PV_MAX; d++) {
+            if (cur->is_leaf()) break;
+
+            // Proof-aware: STM has a proven win → pick a child with
+            // terminal_status==1 (opponent proven lost there).
+            int best_idx = -1;
+            if (cur->terminal_status() == -1) {
+                for (int i = 0; i < cur->num_edges(); i++) {
+                    Node* c = cur->child_node(i);
+                    if (c && c->terminal_status() == 1) { best_idx = i; break; }
+                }
+            }
+
+            // Fallback: visit-greedy.
+            if (best_idx < 0) {
+                int best_vc = -1;
+                for (int i = 0; i < cur->num_edges(); i++) {
+                    Node* c = cur->child_node(i);
+                    int vc = c ? c->visit_count() : 0;
+                    if (vc > best_vc) { best_vc = vc; best_idx = i; }
+                }
+                if (best_idx < 0) break;
+                Node* c = cur->child_node(best_idx);
+                if (!c || c->visit_count() <= 0) break;
+            }
+
+            Node* c = cur->child_node(best_idx);
+            if (!c) break;
+            result.pv.push_back(cur->edge(best_idx).move());
+            cur = c;
+        }
+    }
+
+    // Mate reporting. The MCTS solver propagates terminal_status up the tree
+    // on proven wins/losses (see propagate_terminal). Encoding: at root,
+    //   -1 => side-to-move has a forced win  => we mate in |N| plies
+    //    1 => side-to-move has a forced loss => we get mated in |N| plies
+    //    2 => draw (not a mate — no score mate emission)
+    // Distance is approximated by the PV length (visit-greedy walk). This is
+    // exact when the PV descends into the proof tree; for unproven positions
+    // mate_distance_plies stays 0 and uci.cpp falls back to cp score.
+    result.root_terminal_status = root->terminal_status();
+    if (result.root_terminal_status == -1) {
+        result.mate_distance_plies =
+            std::max(1, static_cast<int>(result.pv.size()));
+    } else if (result.root_terminal_status == 1) {
+        result.mate_distance_plies =
+            -std::max(0, static_cast<int>(result.pv.size()));
+    }
+
+    // Per-search accumulators. hashfull is in per-mille (UCI convention).
+    result.seldepth = seldepth_;
+    result.tb_hits = tb_hits_;
+    const int cache_cap = std::max(1, params_.nn_cache_size);
+    long long fill = static_cast<long long>(cache_.size()) * 1000LL / cache_cap;
+    if (fill > 1000) fill = 1000;
+    result.hashfull_permille = static_cast<int>(fill);
 
     return result;
 }

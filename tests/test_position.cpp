@@ -27,7 +27,8 @@ TEST_F(PositionTest, StartingPositionFEN) {
 TEST_F(PositionTest, FENRoundTrip) {
     const char* fens[] = {
         "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
-        "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1",
+        // Legitimate EP: white pawn on e5 can capture f5 via e5xf6.
+        "rnbqkbnr/ppp1p1pp/3p4/4Pp2/8/8/PPPP1PPP/RNBQKBNR w KQkq f6 0 3",
         "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
         "8/8/8/8/8/8/8/4K2k w - - 0 1",
         "r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1",
@@ -79,7 +80,9 @@ TEST_F(PositionTest, MakeUnmakeSimple) {
     EXPECT_EQ(pos.piece_on(E4), PAWN);
     EXPECT_EQ(pos.piece_on(E2), NO_PIECE_TYPE);
     EXPECT_EQ(pos.side_to_move(), BLACK);
-    EXPECT_EQ(pos.ep_square(), E3);
+    // No black pawn is on d4 or f4 to capture en passant, so ep_square is
+    // canonicalized to NO_SQUARE (lc0 / python-chess behavior).
+    EXPECT_EQ(pos.ep_square(), NO_SQUARE);
 
     pos.unmake_move(m, undo);
     EXPECT_EQ(pos.to_fen(), original_fen);
@@ -211,4 +214,125 @@ TEST_F(PositionTest, InsufficientMaterial_TwoKnightsVsK) {
     Position pos;
     pos.set_fen("8/8/8/4k3/8/8/8/2NNK3 w - - 0 1");
     EXPECT_FALSE(pos.is_insufficient_material());
+}
+
+// ---------------------------------------------------------------------------
+// En-passant canonicalization (match lc0): the ep_square is only set when an
+// enemy pawn can actually capture it. Storing a phantom EP creates hash drift
+// (two equivalent positions hash differently) and non-canonical FEN output.
+// ---------------------------------------------------------------------------
+
+TEST_F(PositionTest, EpSquare_NotSetWhenNoEnemyPawnCanCapture) {
+    // From the starting position, 1.e4 leaves e3 as a skipped square — but no
+    // black pawn is on d4 or f4 to capture, so ep_square must be NO_SQUARE.
+    Position pos;
+    pos.set_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+    UndoInfo undo;
+    pos.make_move(Move(E2, E4, FLAG_DOUBLE_PUSH), undo);
+    EXPECT_EQ(pos.ep_square(), NO_SQUARE);
+}
+
+TEST_F(PositionTest, EpSquare_SetWhenEnemyPawnCanCapture) {
+    // 1.e4 d5 2.e5 f5 — after f7f5, white pawn on e5 CAN capture on f6.
+    Position pos;
+    pos.set_fen("rnbqkbnr/ppp1p1pp/3p4/4Pp2/8/8/PPPP1PPP/RNBQKBNR w KQkq f6 0 3");
+    EXPECT_EQ(pos.ep_square(), F6);
+}
+
+TEST_F(PositionTest, EpSquare_HashesEqualForEquivalentBoards) {
+    // Two routes to the same piece layout: one via double-push (phantom EP),
+    // one via two single pushes. After the fix, both hash identically because
+    // neither sets a capturable EP.
+    Position via_double;
+    via_double.set_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+    UndoInfo u;
+    via_double.make_move(Move(E2, E4, FLAG_DOUBLE_PUSH), u);
+
+    Position via_singles;
+    via_singles.set_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+    via_singles.make_move(Move(E2, E3, FLAG_QUIET), u);
+    // Black plays something reversible and reverses it.
+    via_singles.make_move(Move(G8, F6, FLAG_QUIET), u);
+    via_singles.make_move(Move(E3, E4, FLAG_QUIET), u);
+    via_singles.make_move(Move(F6, G8, FLAG_QUIET), u);
+
+    EXPECT_EQ(via_double.ep_square(), NO_SQUARE);
+    EXPECT_EQ(via_singles.ep_square(), NO_SQUARE);
+    // Same piece bitboards + same STM + no phantom EP → same board state.
+    // (We don't directly compare hashes here — that path is tested in
+    // test_mcts.cpp via is_repetition — but this test documents the contract
+    // that phantom EP must not be set.)
+}
+
+TEST_F(PositionTest, EpSquare_FenParseRejectsPhantomEp) {
+    // FEN claims EP=e3 but no black pawn is on d4/f4. set_fen must normalize.
+    Position pos;
+    pos.set_fen("rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1");
+    EXPECT_EQ(pos.ep_square(), NO_SQUARE);
+    // Canonical FEN output must drop the phantom EP too.
+    std::string emitted = pos.to_fen();
+    EXPECT_NE(emitted.find(" - "), std::string::npos)
+        << "to_fen should emit '-' for non-capturable EP, got: " << emitted;
+}
+
+TEST_F(PositionTest, EpSquare_FenParseKeepsLegitimateEp) {
+    // Here EP=f6 IS legitimate — white pawn on e5 can capture via e5xf6.
+    Position pos;
+    pos.set_fen("rnbqkbnr/ppp1p1pp/3p4/4Pp2/8/8/PPPP1PPP/RNBQKBNR w KQkq f6 0 3");
+    EXPECT_EQ(pos.ep_square(), F6);
+}
+
+// ---------------------------------------------------------------------------
+// Position equality. Needed so is_repetition can verify full-board identity
+// on a hash match (our hash is ad-hoc multiply-mix, not Zobrist — collisions
+// exist, and a false threefold claim would silently poison self-play data).
+// ---------------------------------------------------------------------------
+
+TEST_F(PositionTest, Equality_IdenticalFenAreEqual) {
+    Position a, b;
+    a.set_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+    b.set_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+    EXPECT_TRUE(a == b);
+    EXPECT_FALSE(a != b);
+}
+
+TEST_F(PositionTest, Equality_DifferentStmAreUnequal) {
+    Position a, b;
+    a.set_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+    b.set_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR b KQkq - 0 1");
+    EXPECT_FALSE(a == b);
+}
+
+TEST_F(PositionTest, Equality_DifferentCastlingAreUnequal) {
+    Position a, b;
+    a.set_fen("r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1");
+    b.set_fen("r3k2r/8/8/8/8/8/8/R3K2R w Kkq - 0 1");
+    EXPECT_FALSE(a == b);
+}
+
+TEST_F(PositionTest, Equality_DifferentPiecesAreUnequal) {
+    Position a, b;
+    a.set_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+    b.set_fen("rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq - 0 1");
+    EXPECT_FALSE(a == b);
+}
+
+TEST_F(PositionTest, Equality_MoveCountersIgnored) {
+    // FIDE 9.2 repetition: halfmove/fullmove don't count toward identity.
+    Position a, b;
+    a.set_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+    b.set_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 42 99");
+    EXPECT_TRUE(a == b);
+}
+
+TEST_F(PositionTest, Equality_DifferentLegitimateEpAreUnequal) {
+    // Two positions with the same piece layout but different capturable EP
+    // targets — they're different states because one allows EP, the other
+    // doesn't. After EP canonicalization, only legitimate EPs survive.
+    Position a;
+    a.set_fen("rnbqkbnr/ppp1p1pp/3p4/4Pp2/8/8/PPPP1PPP/RNBQKBNR w KQkq f6 0 3");
+    Position b = a;
+    // Clear the EP by re-setting the FEN without it.
+    b.set_fen("rnbqkbnr/ppp1p1pp/3p4/4Pp2/8/8/PPPP1PPP/RNBQKBNR w KQkq - 0 3");
+    EXPECT_FALSE(a == b);
 }

@@ -16,6 +16,8 @@ add_library(chess_core
     src/neural/encoder.cpp
     src/neural/position_history.cpp
     src/uci/uci.cpp
+    src/uci/stdout_responder.cpp
+    src/uci/safety_filter.cpp
 )
 target_include_directories(chess_core PUBLIC src)
 

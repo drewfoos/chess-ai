@@ -66,6 +66,9 @@ dashboard-*.png
 libtorch/
 libtorch.zip
 
+# Chess.com GM dataset archive (15GB CSV inside a 3GB zip)
+archive.zip
+
 # Lichess bot (cloned external repo)
 lichess-bot/
 

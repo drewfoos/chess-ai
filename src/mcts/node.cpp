@@ -77,7 +77,8 @@ Node* Node::select_child(float c_puct, float fpu_value) const {
     assert(!is_leaf());
 
     int parent_visits = visit_count_;
-    float sqrt_parent = std::sqrt(static_cast<float>(parent_visits));
+    // Lc0 PUCT numerator: sqrt(max(N-1, 1)).
+    float sqrt_parent = std::sqrt(static_cast<float>(std::max(1, parent_visits - 1)));
 
     int best_idx = -1;
     float best_score = -std::numeric_limits<float>::infinity();

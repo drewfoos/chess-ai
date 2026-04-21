@@ -46,6 +46,25 @@ public:
     void make_move(Move m, UndoInfo& undo);
     void unmake_move(Move m, const UndoInfo& undo);
 
+    // Byte-exact state comparison. Used to verify hash matches in repetition
+    // detection (hash is 64-bit with ad-hoc mixing, not Zobrist — collisions
+    // exist). Compares only what counts toward board identity per FIDE 9.2
+    // (same pieces, same STM, same castling rights, same EP). Halfmove clock
+    // and fullmove number are intentionally excluded — two positions that
+    // differ only in move counters are "the same" for repetition purposes.
+    bool operator==(const Position& other) const {
+        if (side_to_move_ != other.side_to_move_) return false;
+        if (castling_ != other.castling_) return false;
+        if (ep_square_ != other.ep_square_) return false;
+        for (int c = 0; c < NUM_COLORS; ++c) {
+            for (int pt = 0; pt < NUM_PIECE_TYPES; ++pt) {
+                if (bb_pieces_[c][pt] != other.bb_pieces_[c][pt]) return false;
+            }
+        }
+        return true;
+    }
+    bool operator!=(const Position& other) const { return !(*this == other); }
+
 private:
     Bitboard bb_pieces_[NUM_COLORS][NUM_PIECE_TYPES] = {};
     Bitboard bb_color_[NUM_COLORS] = {};

@@ -162,6 +162,18 @@ def _board_to_pieces(board_str: str):
 def encode_position(fen: str) -> np.ndarray:
     """Encode a chess position as a 112×8×8 float32 tensor.
 
+    .. deprecated::
+        This FEN-only variant has no move history, so it fills all 8 time steps
+        with duplicates of the current position — the distribution the network
+        does NOT see during self-play / inference (where the C++ encoder always
+        has real history). Using this on real training positions produces
+        out-of-distribution inputs and will corrupt training.
+
+        Use ``encode_board(python_chess.Board)`` with an intact move_stack, or
+        call ``chess_mcts.encode_packed(start_fen, uci_moves)`` — both produce
+        identical tensors (see ``test_encoder_parity_*``). Kept only for
+        isolated unit tests that encode a lone FEN with no history context.
+
     The board is always oriented from the side-to-move's perspective.
     When Black is to move, the board is flipped vertically.
 

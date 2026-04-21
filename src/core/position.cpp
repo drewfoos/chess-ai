@@ -112,7 +112,16 @@ void Position::set_fen(const std::string& fen) {
     if (ep != "-" && ep.size() == 2) {
         int f = ep[0] - 'a';
         int r = ep[1] - '1';
-        ep_square_ = make_square(f, r);
+        Square cand = make_square(f, r);
+        // Canonicalize: only keep the EP square if a pawn of the STM can
+        // actually capture onto it. Matches lc0 / python-chess behavior and
+        // avoids hash drift between semantically equivalent positions.
+        // Reciprocity: squares an enemy-colored pawn on `cand` would attack
+        // are exactly the squares our pawns could sit on to capture onto cand.
+        Color them = ~side_to_move_;
+        if (attacks::pawn(them, cand) & bb_pieces_[side_to_move_][PAWN]) {
+            ep_square_ = cand;
+        }
     }
 
     halfmove_clock_ = hmc;
@@ -276,9 +285,20 @@ void Position::make_move(Move m, UndoInfo& undo) {
         move_piece(rook_from, rook_to);
     }
 
-    // Update en passant square
+    // Update en passant square. Canonicalize: only set ep_square_ when an
+    // enemy pawn can actually capture it on the next move. Storing a phantom
+    // EP (lc0 calls this uncapturable) creates hash drift between positions
+    // that are semantically identical (reachable vs. unreachable via EP).
     if (flag == FLAG_DOUBLE_PUSH) {
-        ep_square_ = (us == WHITE) ? Square(from + 8) : Square(from - 8);
+        Square cand = (us == WHITE) ? Square(from + 8) : Square(from - 8);
+        // Reciprocity trick: `attacks::pawn(us, cand)` is the set of squares a
+        // pawn of OUR color on cand would attack — those are exactly the
+        // squares an enemy pawn could sit on to capture via EP onto cand.
+        if (attacks::pawn(us, cand) & bb_pieces_[them][PAWN]) {
+            ep_square_ = cand;
+        } else {
+            ep_square_ = NO_SQUARE;
+        }
     } else {
         ep_square_ = NO_SQUARE;
     }

@@ -114,14 +114,13 @@ void GameManager::expand_root(GameState& game) {
     int num_moves = generate_legal_moves(root_pos, moves);
 
     if (num_moves == 0) {
-        // Terminal root: checkmate (in check, STM loses → -1) or stalemate (draw → 2).
-        // Stamp terminal_status on the root so build_root_stats surfaces it and the
-        // Python driver routes the game through the terminal branch instead of
-        // trying to pick a move from an empty edge list.
+        // Terminal root: checkmate (in check, STM loses → +1) or stalemate (draw → 2).
+        // Convention: +1 = STM at this node loses, -1 = STM wins (same as leaf nodes
+        // and propagate_terminal). Stamp on the root so build_root_stats surfaces it.
         game.search_complete = true;
         if (root_pos.in_check()) {
             game.raw_value = -1.0f;
-            game.root->set_terminal_status(-1);
+            game.root->set_terminal_status(1);
         } else {
             game.raw_value = 0.0f;
             game.root->set_terminal_status(2);
@@ -280,9 +279,23 @@ Node* GameManager::select_child_advanced(Node* node, bool is_root, int* out_idx)
 
     bool absolute_fpu_at_root = is_root && params_.fpu_absolute_root;
     float fpu_red = is_root ? params_.fpu_reduction_root : params_.fpu_reduction;
+
+    // Lc0-style visited-policy-mass FPU scaling (search.cc:430-446): FPU is
+    // less pessimistic as more prior probability gets visited. visited_mass
+    // = sum of priors for children with at least one visit. At the start of
+    // search it's 0 (FPU = parent_Q), after exploration it grows toward 1.
+    float visited_mass = 0.0f;
+    if (!absolute_fpu_at_root) {
+        for (int i = 0; i < node->num_edges(); i++) {
+            Node* child = node->child_node(i);
+            if (child && child->visit_count() > 0) {
+                visited_mass += node->edge(i).prior();
+            }
+        }
+    }
     float fpu_value = absolute_fpu_at_root
         ? params_.fpu_absolute_root_value
-        : node->mean_value() - fpu_red;
+        : node->mean_value() - fpu_red * std::sqrt(visited_mass);
     float c_puct = dynamic_cpuct(node->visit_count());
 
     // Variance-scaled cPUCT
@@ -293,7 +306,11 @@ Node* GameManager::select_child_advanced(Node* node, bool is_root, int* out_idx)
         c_puct *= scale;
     }
 
-    float sqrt_parent = std::sqrt(static_cast<float>(node->visit_count()));
+    // Lc0 PUCT numerator (search.cc:1720): sqrt(max(N-1, 1)). The -1 matters
+    // at low visit counts — at N=2 the old sqrt(N) nearly halves selection
+    // ordering noise compared to sqrt(N-1)=1, encouraging unvisited children
+    // to get their first touch before the tree revisits.
+    float sqrt_parent = std::sqrt(static_cast<float>(std::max(1, node->visit_count() - 1)));
 
     // Sibling blending — skip at root when absolute-FPU is on: the whole point
     // is to force visiting every root child, which sibling blending would defeat.
@@ -401,7 +418,12 @@ int GameManager::compute_collapse_visits(Node* parent, int best_idx, bool is_roo
 
     // Recompute parent-level knobs (mirrors select_child_advanced but with +m visits on selected)
     float fpu_red = is_root ? params_.fpu_reduction_root : params_.fpu_reduction;
-    float fpu_value = parent->mean_value() - fpu_red;
+    float visited_mass = 0.0f;
+    for (int i = 0; i < parent->num_edges(); i++) {
+        Node* child = parent->child_node(i);
+        if (child && child->visit_count() > 0) visited_mass += parent->edge(i).prior();
+    }
+    float fpu_value = parent->mean_value() - fpu_red * std::sqrt(visited_mass);
 
     // Sibling blending FPU for unvisited siblings (computed from current state, doesn't change with m)
     float sibling_fpu = fpu_value;
@@ -432,7 +454,8 @@ int GameManager::compute_collapse_visits(Node* parent, int best_idx, bool is_roo
     int best_m = 1;
     for (int m = 2; m <= cap; m++) {
         int parent_N = parent_N_base + (m - 1); // (m-1) extra virtual losses beyond the one already applied
-        float sqrt_parent = std::sqrt(static_cast<float>(std::max(1, parent_N)));
+        // Lc0 PUCT: sqrt(max(parent_N - 1, 1)); keep the max-with-1 guard.
+        float sqrt_parent = std::sqrt(static_cast<float>(std::max(1, parent_N - 1)));
         float c_puct = params_.c_puct_init + params_.c_puct_factor * std::log(
             (parent_N + params_.c_puct_base) / params_.c_puct_base);
         if (params_.variance_scaling && parent_N > 1) {
